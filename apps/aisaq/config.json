@@ -1,0 +1,39 @@
+{
+    "ssds": [
+        {"id":0,"sn": "0000:01:00.0"},
+        {"id":1,"sn": "0000:02:00.0"}
+    ],
+    "schedulers": [
+        {
+            "core" : "0,2,4",
+            "nvme": {
+                "id": 0,
+                "qpair_count": 1,
+                "qpair_depth": 1024
+            },
+            "task": true
+        },
+        {
+            "core" : "3,5",
+            "nvme": {
+                "id": 0,
+                "qpair_count": 1,
+                "qpair_depth": 1024
+            },
+            "task": true
+        },
+        {
+            "core" : "1",
+            "nvme": {
+                "id": 1,
+                "qpair_count": 1,
+                "qpair_depth": 1024
+            },
+            "task": false
+        },
+        {
+            "core" : "16",
+            "task": false
+        }
+    ]
+}
