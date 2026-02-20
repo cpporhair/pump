@@ -70,9 +70,14 @@ namespace pump::sender {
         struct
         alignas(64)
         __ncp__(race_wrapper) {
-            // === hot path atomics (same cache line) ===
-            std::atomic_flag finished {};
-            std::atomic<int> ref_count;
+            // === packed state: bit 63 = finished flag, bits [0,62] = ref_count ===
+            // Merging finished + ref_count into a single atomic<uint64_t> eliminates
+            // any observation window between the two operations. For losers, a single
+            // fetch_sub is enough (finished bit is already set, ref_count decrements).
+            static constexpr uint64_t FINISHED_BIT = uint64_t(1) << 63;
+            static constexpr uint64_t REF_MASK    = ~FINISHED_BIT;
+
+            std::atomic<uint64_t> state;
 
             // === cold data (written once by winner, then read-only) ===
             uint32_t winner_index;
@@ -82,7 +87,7 @@ namespace pump::sender {
             parent_pusher_status_t parent_pusher_status;
 
             race_wrapper(uint32_t branch_count, parent_pusher_status_t&& p)
-                : ref_count(branch_count)
+                : state(uint64_t(branch_count))
                 , winner_index(0)
                 , parent_pusher_status(__fwd__(p)) {
             }
@@ -92,7 +97,7 @@ namespace pump::sender {
             inline
             void
             release_ref() {
-                if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) [[unlikely]] {
+                if ((state.fetch_sub(1, std::memory_order_acq_rel) & REF_MASK) == 1) [[unlikely]] {
                     delete this;
                 }
             }
@@ -101,7 +106,8 @@ namespace pump::sender {
             inline
             void
             set_value(value_t&& ...v) {
-                if (!finished.test_and_set(std::memory_order_acq_rel)) {
+                uint64_t old = state.fetch_or(FINISHED_BIT, std::memory_order_acq_rel);
+                if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     if constexpr (sizeof...(v) == 0)
                         result.template emplace<2>(nullptr);
@@ -125,7 +131,8 @@ namespace pump::sender {
             inline
             void
             set_error(std::exception_ptr e) {
-                if (!finished.test_and_set(std::memory_order_acq_rel)) {
+                uint64_t old = state.fetch_or(FINISHED_BIT, std::memory_order_acq_rel);
+                if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<1>(e);
                     core::op_pusher<
@@ -146,7 +153,8 @@ namespace pump::sender {
             inline
             void
             set_done() {
-                if (!finished.test_and_set(std::memory_order_acq_rel)) {
+                uint64_t old = state.fetch_or(FINISHED_BIT, std::memory_order_acq_rel);
+                if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<0>(std::monostate{});
                     core::op_pusher<
@@ -167,7 +175,8 @@ namespace pump::sender {
             inline
             void
             set_skip() {
-                if (!finished.test_and_set(std::memory_order_acq_rel)) {
+                uint64_t old = state.fetch_or(FINISHED_BIT, std::memory_order_acq_rel);
+                if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<0>(std::monostate{});
                     core::op_pusher<
