@@ -9,6 +9,8 @@ add_executable(apps.aisaq ./aisaq/main.cc)
 add_executable(apps.kv ./kv/main.cc)
 add_executable(test.sequential ./test/sequential_test.cc)
 target_link_libraries(test.sequential PRIVATE pthread numa)
+add_executable(test.when_any ./test/when_any_test.cc)
+target_link_libraries(test.when_any PRIVATE pthread numa)
 
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.share_nothing PRIVATE numa)

@@ -133,6 +133,7 @@ namespace pump::sender {
                         },
                         value_collector.values
                     );
+                    delete this;
                 }
             }
 
