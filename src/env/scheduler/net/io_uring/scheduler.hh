@@ -1,4 +1,5 @@
 
+
 #ifndef PUMP_NET_IOURING_SCHEDULER_HH
 #define PUMP_NET_IOURING_SCHEDULER_HH
 
@@ -20,6 +21,7 @@
 
 namespace pump::scheduler::net::io_uring {
 
+    // 6.1: unified session type - recv-only (io_uring manages sends via ring, no per-session send cache)
     using session_t = common::detail::internal_session<common::detail::recv_cache>;
 
     enum struct
@@ -43,9 +45,14 @@ namespace pump::scheduler::net::io_uring {
         int server_socket = -1;
         struct ::io_uring ring{};
         core::mpsc::queue<common::conn_req*, 2048> request_q;
-        core::mpmc::queue<uint64_t,2048> conn_fd_q;
+        // 6.3: use session_id_t instead of raw uint64_t
+        core::mpmc::queue<common::session_id_t, 2048> conn_fd_q;
+        size_t _recv_buffer_size = 4096;
+
+        // 6.4: shutdown flag
+        std::atomic<bool> _shutdown{false};
     private:
-        // 4.2: fix req leak when immediate connection available
+        // 4.2: fix req leak when immediate connection available; 6.3: use session_id_t
         auto
         schedule(common::conn_req* req) {
             if (const auto opt = conn_fd_q.try_dequeue(); opt) {
@@ -54,19 +61,21 @@ namespace pump::scheduler::net::io_uring {
             }
             else {
                 if (!request_q.try_enqueue(req)) {
-                    req->cb(0);
+                    req->cb(common::session_id_t{});
                     delete req;
                 }
             }
         }
 
+        // 6.3: encode session pointer as tagged session_id_t
         bool
         maybe_accept(const int fd) {
             if (const auto opt = request_q.try_dequeue(); opt) {
                 const int flags = fcntl(fd, F_GETFL, 0);
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-                auto s = new session_t(fd, new common::detail::recv_cache(4096));
-                opt.value()->cb(reinterpret_cast<uint64_t>(s));
+                auto s = new session_t(fd, new common::detail::recv_cache(_recv_buffer_size));
+                auto sid = common::session_id_t::encode(s);
+                opt.value()->cb(sid);
                 delete opt.value();
                 return true;
             }
@@ -91,6 +100,7 @@ namespace pump::scheduler::net::io_uring {
         }
 
         // 4.3: add break to prevent fallthrough; 4.4: fix new/free mismatch
+        // 6.3: encode accepted fd as session_id_t when no pending request
         auto
         handle_io_uring() {
             sockaddr_in client_addr{};
@@ -104,8 +114,12 @@ namespace pump::scheduler::net::io_uring {
 
                 switch (uring_req->event_type) {
                     case uring_event_type::accept:
-                        if (!maybe_accept(cqe->res))
-                            conn_fd_q.try_enqueue(cqe->res);
+                        if (!maybe_accept(cqe->res)) {
+                            const int flags = fcntl(cqe->res, F_GETFL, 0);
+                            fcntl(cqe->res, F_SETFL, flags | O_NONBLOCK);
+                            auto s = new session_t(cqe->res, new common::detail::recv_cache(_recv_buffer_size));
+                            conn_fd_q.try_enqueue(common::session_id_t::encode(s));
+                        }
                         delete uring_req;
                         break;
                     default:
@@ -117,8 +131,24 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
+        // 6.4: drain pending requests on shutdown
+        void
+        drain_on_shutdown() {
+            while (auto opt = request_q.try_dequeue()) {
+                opt.value()->cb(common::session_id_t{});
+                delete opt.value();
+            }
+        }
+
     public:
         accept_scheduler() = default;
+
+        // 6.2: unified init with scheduler_config
+        int
+        init(const common::scheduler_config& cfg) {
+            _recv_buffer_size = cfg.recv_buffer_size;
+            return init(cfg.address, cfg.port, cfg.queue_depth);
+        }
 
         // 4.1: server socket + ring initialization
         int
@@ -163,8 +193,18 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
+        // 6.4: graceful shutdown
+        void
+        shutdown() {
+            _shutdown.store(true, std::memory_order_release);
+        }
+
         auto
         advance() {
+            if (_shutdown.load(std::memory_order_acquire)) [[unlikely]] {
+                drain_on_shutdown();
+                return false;
+            }
             handle_io_uring();
             return true;
         }
@@ -194,11 +234,15 @@ namespace pump::scheduler::net::io_uring {
         core::mpsc::queue<common::stop_req*, 2048> stop_q;
         std::list<common::send_req*> send_list;
         struct ::io_uring ring{};
+
+        // 6.4: shutdown flag
+        std::atomic<bool> _shutdown{false};
     private:
+        // 6.1: named accessor
         static
         auto
         recv_cache(session_t* s) noexcept{
-            return std::get<0>(s->impls);
+            return s->get_recv_cache();
         }
 
         auto
@@ -226,11 +270,11 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
-        // 4.7: add return after exception path
+        // 4.7: add return after exception path; 6.3: use session_id_t::decode
         auto
         schedule(common::recv_req* req) {
-            auto* s = reinterpret_cast<session_t*>(req->session_id);
-            if (s->status.load() != common::detail::session_status::normal) [[unlikely]] {
+            auto* s = req->session_id.decode<session_t>();
+            if (!s || s->status.load() != common::detail::session_status::normal) [[unlikely]] {
                 req->cb(std::make_exception_ptr(common::session_closed_error()));
                 delete req;
                 return;
@@ -277,7 +321,7 @@ namespace pump::scheduler::net::io_uring {
             close_session(static_cast<session_t *>(iur->user_data));
         }
 
-        // 4.10: add break + delete for write case
+        // 4.10: add break + delete for write case; 6.3: use session_id_t::decode
         void
         process_err(::io_uring_cqe *cqe) {
             switch (auto *uring_req = reinterpret_cast<io_uring_request *>(cqe->user_data); uring_req->event_type) {
@@ -289,8 +333,8 @@ namespace pump::scheduler::net::io_uring {
                 }
                 case uring_event_type::write: {
                     auto r = static_cast<common::send_req*>(uring_req->user_data);
-                    auto s = reinterpret_cast<session_t*>(r->session_id);
-                    close_session(s);
+                    auto s = r->session_id.decode<session_t>();
+                    if (s) close_session(s);
                     r->cb(false);
                     delete r;
                     delete uring_req;
@@ -365,37 +409,50 @@ namespace pump::scheduler::net::io_uring {
             return submit_read(new io_uring_request, s);
         }
 
-        // 4.9: call join callback before delete
+        // 4.9: call join callback before delete; 6.3: use session_id_t::decode
         void
         handle_join_request() {
             while (auto opt = join_q.try_dequeue()) {
-                auto* s = reinterpret_cast<session_t*>(opt.value()->session_id);
+                auto* s = opt.value()->session_id.decode<session_t>();
+                if (!s) [[unlikely]] {
+                    opt.value()->cb(false);
+                    delete opt.value();
+                    continue;
+                }
                 submit_read(s);
                 opt.value()->cb(true);
                 delete opt.value();
             }
         }
 
-        // 4.8: handle stop requests asynchronously in advance
+        // 4.8: handle stop requests asynchronously in advance; 6.3: use session_id_t::decode
         void
         handle_stop_request() {
             while (auto opt = stop_q.try_dequeue()) {
-                auto* s = reinterpret_cast<session_t*>(opt.value()->session_id);
+                auto* s = opt.value()->session_id.decode<session_t>();
+                if (!s) [[unlikely]] {
+                    opt.value()->cb(false);
+                    delete opt.value();
+                    continue;
+                }
                 s->status.store(common::detail::session_status::closed);
-                close(s->fd);
+                ::close(s->fd);
                 opt.value()->cb(true);
                 delete opt.value();
             }
         }
 
+        // 6.3: use session_id_t::decode
         auto
         submit_write(::io_uring_sqe *sqe, common::send_req* req) {
-            const auto s = reinterpret_cast<session_t*>(req->session_id);
+            const auto s = req->session_id.decode<session_t>();
             auto *io_req = new io_uring_request;
             io_req->event_type = uring_event_type::write;
             io_req->user_data = req;
             ::io_uring_sqe_set_data(sqe, io_req);
-            ::io_uring_prep_writev(sqe, s->fd, req->vec, req->cnt, 0);
+            if (s) {
+                ::io_uring_prep_writev(sqe, s->fd, req->vec, req->cnt, 0);
+            }
         }
 
         // 4.12: add io_uring_submit after processing send requests
@@ -428,8 +485,36 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
+        // 6.4: drain all pending queues with error on shutdown
+        void
+        drain_on_shutdown() {
+            while (auto opt = join_q.try_dequeue()) {
+                opt.value()->cb(false);
+                delete opt.value();
+            }
+            while (auto opt = stop_q.try_dequeue()) {
+                opt.value()->cb(false);
+                delete opt.value();
+            }
+            while (auto opt = send_q.try_dequeue()) {
+                opt.value()->cb(false);
+                delete opt.value();
+            }
+            for (auto* req : send_list) {
+                req->cb(false);
+                delete req;
+            }
+            send_list.clear();
+        }
+
     public:
         session_scheduler() = default;
+
+        // 6.2: unified init with scheduler_config
+        int
+        init(const common::scheduler_config& cfg) {
+            return init(cfg.queue_depth);
+        }
 
         // 4.6: ring initialization
         int
@@ -441,8 +526,18 @@ namespace pump::scheduler::net::io_uring {
             ::io_uring_queue_exit(&ring);
         }
 
+        // 6.4: graceful shutdown
+        void
+        shutdown() {
+            _shutdown.store(true, std::memory_order_release);
+        }
+
         auto
         advance() {
+            if (_shutdown.load(std::memory_order_acquire)) [[unlikely]] {
+                drain_on_shutdown();
+                return false;
+            }
             handle_join_request();
             handle_stop_request();
             handle_send_request();

@@ -52,17 +52,17 @@ read_packet_coro(scheduler::net::common::packet_buffer* buf) -> coro::return_yie
 
 struct
 session_data {
-    uint64_t id;
+    scheduler::net::common::session_id_t id;
     session_scheduler_t* scheduler;
     std::atomic<bool> closed;
 
     session_data(session_data &&rhs) noexcept
-        : id(__fwd__(rhs.id))
-          , scheduler(__fwd__(rhs.scheduler))
+        : id(rhs.id)
+          , scheduler(rhs.scheduler)
           , closed(rhs.closed.load()) {
     }
 
-    session_data(uint64_t id, session_scheduler_t* scheduler)
+    session_data(scheduler::net::common::session_id_t id, session_scheduler_t* scheduler)
         : id(id)
         , scheduler(scheduler)
         , closed(false) {
@@ -89,9 +89,9 @@ create_runtime_schedulers() {
 }
 
 auto
-session_proc(const runtime_schedulers *rs, const uint64_t sid) {
-    return scheduler::net::join(rs->get_by_core<session_scheduler_t>(sid % 2), sid)
-        >> with_context(session_data(sid, rs->get_by_core<session_scheduler_t>(sid % 2)))([]() {
+session_proc(const runtime_schedulers *rs, const scheduler::net::common::session_id_t sid) {
+    return scheduler::net::join(rs->get_by_core<session_scheduler_t>(sid.raw() % 2), sid)
+        >> with_context(session_data(sid, rs->get_by_core<session_scheduler_t>(sid.raw() % 2)))([]() {
             return get_context<session_data>()
                 >> then([](const session_data &sd) {
                     return coro::make_view_able(check_session(sd));
@@ -133,7 +133,7 @@ main(int argc, char **argv) {
                 })
                 >> concurrent()
                 >> get_context<runtime_schedulers *>()
-                >> flat_map([](runtime_schedulers *r, uint64_t s) {
+                >> flat_map([](runtime_schedulers *r, scheduler::net::common::session_id_t s) {
                     return session_proc(r, s);
                 })
                 >> sequential()

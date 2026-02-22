@@ -122,24 +122,68 @@ namespace pump::scheduler::net::common::detail {
         errors
     };
 
-    // 1.10: internal_session is the unified session implementation
-    template <typename ...impl_t>
+    // 6.3: global generation counter for session tagged handles
+    inline std::atomic<uint16_t> _session_generation_counter{0};
+
+    // 6.1: unified session template with explicit recv_cache and optional send_cache
+    // Primary template: session with both recv and send cache
+    template <typename recv_cache_t, typename send_cache_t = void>
     struct
     internal_session {
         int fd;
+        uint16_t generation;
         std::atomic<session_status> status;
-        std::tuple<impl_t*...> impls;
+        recv_cache_t* _recv_cache;
+        send_cache_t* _send_cache;
 
         explicit
-        internal_session(const int _fd, impl_t* ...args)
-            : impls(args...)
-            , fd(_fd)
-            , status(session_status::normal) {
+        internal_session(const int _fd, recv_cache_t* rc, send_cache_t* sc)
+            : fd(_fd)
+            , generation(_session_generation_counter.fetch_add(1, std::memory_order_relaxed))
+            , status(session_status::normal)
+            , _recv_cache(rc)
+            , _send_cache(sc) {
         }
+
+        [[nodiscard]] auto* get_recv_cache() noexcept { return _recv_cache; }
+        [[nodiscard]] auto* get_send_cache() noexcept { return _send_cache; }
 
         auto
         release() {
-            std::apply([](impl_t *... impl) { (impl->release(), ...); }, impls);
+            _recv_cache->release();
+            _send_cache->release();
+        }
+
+        void
+        close() {
+            ::close(fd);
+            release();
+            status.store(session_status::closed);
+        }
+    };
+
+    // 6.1: specialization for recv-only session (io_uring - no per-session send cache)
+    template <typename recv_cache_t>
+    struct
+    internal_session<recv_cache_t, void> {
+        int fd;
+        uint16_t generation;
+        std::atomic<session_status> status;
+        recv_cache_t* _recv_cache;
+
+        explicit
+        internal_session(const int _fd, recv_cache_t* rc)
+            : fd(_fd)
+            , generation(_session_generation_counter.fetch_add(1, std::memory_order_relaxed))
+            , status(session_status::normal)
+            , _recv_cache(rc) {
+        }
+
+        [[nodiscard]] auto* get_recv_cache() noexcept { return _recv_cache; }
+
+        auto
+        release() {
+            _recv_cache->release();
         }
 
         void

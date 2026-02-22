@@ -158,20 +158,62 @@ namespace pump::scheduler::net::common {
         }
     };
 
+    // 6.3: tagged session handle - encodes pointer (low 48 bits) + generation (high 16 bits)
+    struct
+    session_id_t {
+        uint64_t _value;
+
+        constexpr session_id_t() : _value(0) {}
+        constexpr explicit session_id_t(uint64_t v) : _value(v) {}
+
+        template<typename session_t>
+        static session_id_t
+        encode(session_t* ptr) {
+            auto raw = reinterpret_cast<uintptr_t>(ptr);
+            return session_id_t{
+                (static_cast<uint64_t>(ptr->generation) << 48) | (raw & 0x0000FFFFFFFFFFFF)
+            };
+        }
+
+        template<typename session_t>
+        [[nodiscard]] session_t*
+        decode() const {
+            auto* ptr = reinterpret_cast<session_t*>(
+                static_cast<uintptr_t>(_value & 0x0000FFFFFFFFFFFF)
+            );
+            if (ptr && ptr->generation != static_cast<uint16_t>(_value >> 48))
+                return nullptr;
+            return ptr;
+        }
+
+        [[nodiscard]] uint64_t raw() const { return _value; }
+        bool operator==(const session_id_t&) const = default;
+        explicit operator bool() const { return _value != 0; }
+    };
+
+    // 6.2: unified scheduler configuration
+    struct
+    scheduler_config {
+        const char* address = "0.0.0.0";
+        uint16_t port = 8080;
+        unsigned queue_depth = 256;
+        size_t recv_buffer_size = 4096;
+    };
+
     struct
     conn_req {
-        std::move_only_function<void(uint64_t)> cb;
+        std::move_only_function<void(session_id_t)> cb;
     };
 
     struct
     recv_req {
-        uint64_t session_id;
+        session_id_t session_id;
         std::move_only_function<void(std::variant<packet_buffer*, std::exception_ptr>)> cb;
     };
 
     struct
     send_req {
-        uint64_t session_id;
+        session_id_t session_id;
         iovec* vec;
         size_t cnt;  // 2.2: unified to size_t
         std::move_only_function<void(bool)> cb;
@@ -179,13 +221,13 @@ namespace pump::scheduler::net::common {
 
     struct
     join_req {
-        uint64_t session_id;
+        session_id_t session_id;
         std::move_only_function<void(bool)> cb;
     };
 
     struct
     stop_req {
-        uint64_t session_id;
+        session_id_t session_id;
         std::move_only_function<void(bool)> cb;
     };
 
