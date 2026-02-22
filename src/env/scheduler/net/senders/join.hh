@@ -11,6 +11,7 @@
 #include "pump/core/compute_sender_type.hh"
 
 #include "../common/struct.hh"
+#include "../common/error.hh"
 namespace pump::scheduler::net::senders::join {
     template <typename scheduler_t>
     struct
@@ -40,7 +41,7 @@ namespace pump::scheduler::net::senders::join {
                             core::op_pusher<pos + 1, scope_t>::push_value(context, scope);
                         }
                         else {
-                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(std::logic_error("")));
+                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(common::join_failed_error()));
                         }
                     }
                 }
