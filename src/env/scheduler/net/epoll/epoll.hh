@@ -7,27 +7,32 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <array>
 
 namespace pump::scheduler::net::epoll::detail {
+
+    static constexpr int MAX_EVENTS = 16;
+
     struct
     poller_epoll {
     private:
         int epoll_fd;
         epoll_event ev;
     public:
-        epoll_event *events;
+        // 3.9: use std::array to avoid heap allocation and manual delete
+        std::array<epoll_event, MAX_EVENTS> events;
     public:
         poller_epoll()
             : epoll_fd(epoll_create1(EPOLL_CLOEXEC))
             , ev()
-            , events(new epoll_event[16]) {
+            , events{} {
         }
 
         explicit
         poller_epoll(int fd)
             : epoll_fd(fd)
             , ev()
-            , events(new epoll_event[16]) {
+            , events{} {
         }
 
         ~poller_epoll(){
@@ -36,17 +41,17 @@ namespace pump::scheduler::net::epoll::detail {
 
         int
         add_event(int fd, epoll_event* e) const {
-            return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, e->data.fd, e);
+            return epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, e);
         }
 
         int
         del_event(int fd, epoll_event* e) const {
-            return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, e->data.fd, e);
+            return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, e);
         }
 
         int
         mod_event(int fd, epoll_event* e) const {
-            return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, e->data.fd, e);
+            return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, e);
         }
 
         int
@@ -56,8 +61,8 @@ namespace pump::scheduler::net::epoll::detail {
 
         [[nodiscard]]
         int
-        wait_event(const int ms) const {
-            return epoll_wait(epoll_fd, events, 16, ms);
+        wait_event(const int ms) {
+            return epoll_wait(epoll_fd, events.data(), MAX_EVENTS, ms);
         }
     };
 }

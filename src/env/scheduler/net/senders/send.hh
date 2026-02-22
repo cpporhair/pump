@@ -15,9 +15,9 @@ namespace pump::scheduler::net::senders::send {
         scheduler_t* scheduler;
         uint64_t session_id;
         iovec* vec;
-        int cnt;
+        size_t cnt;
 
-        op(scheduler_t* s, uint64_t sid, iovec* vec, int cnt)
+        op(scheduler_t* s, uint64_t sid, iovec* vec, size_t cnt)
             : scheduler(s)
             , session_id(sid)
             , vec(vec)
@@ -59,9 +59,9 @@ namespace pump::scheduler::net::senders::send {
         scheduler_t* scheduler;
         uint64_t session_id;
         iovec* vec;
-        int cnt;
+        size_t cnt;
 
-        sender(scheduler_t* s, uint64_t sid, iovec* vec, int cnt)
+        sender(scheduler_t* s, uint64_t sid, iovec* vec, size_t cnt)
             : scheduler(s)
             , session_id(sid)
             , vec(vec)

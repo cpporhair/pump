@@ -3,7 +3,9 @@
 #define ENV_SCHEDULER_NET_COMMON_STRUCT_HH
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
+#include <algorithm>
 #include <bits/types/struct_iovec.h>
 
 #include "pump/core/meta.hh"
@@ -16,7 +18,7 @@ namespace pump::scheduler::net::common {
         void
         clear() const {
             if (data != nullptr)
-                delete data;
+                delete[] data;  // 1.1: fix delete -> delete[]
         }
     };
 
@@ -36,17 +38,24 @@ namespace pump::scheduler::net::common {
         }
     };
 
+    // SPSC (Single-Producer Single-Consumer) ring buffer.
+    // Producer: network IO write end (updates _tail)
+    // Consumer: data processing/read end (updates _head)
+    // No multi-producer or multi-consumer synchronization needed.
     struct
     packet_buffer {
         char *_data;
         size_t _size;
-        volatile size_t _head;
-        volatile size_t _tail;
+        // 1.2: volatile -> atomic with SPSC memory ordering
+        std::atomic<size_t> _head;
+        std::atomic<size_t> _tail;
+        // 1.4: pre-allocated iovec member to avoid heap allocation
+        iovec _iov[2];
 
         [[nodiscard]]
         size_t
         available() const {
-            return this->_size - (this->_tail - this->_head);
+            return this->_size - (this->_tail.load(std::memory_order_relaxed) - this->_head.load(std::memory_order_acquire));
         }
 
         [[nodiscard]]
@@ -58,28 +67,45 @@ namespace pump::scheduler::net::common {
         [[nodiscard]]
         size_t
         used() const {
-            return this->_tail - this->_head;
+            return this->_tail.load(std::memory_order_relaxed) - this->_head.load(std::memory_order_acquire);
         }
 
         [[nodiscard]]
         size_t
         head() const {
-            return _head & (_size - 1);
+            return _head.load(std::memory_order_relaxed) & (_size - 1);
         }
 
         [[nodiscard]]
         size_t
         tail() const {
-            return _tail & (_size - 1);
+            return _tail.load(std::memory_order_relaxed) & (_size - 1);
+        }
+
+        // 1.3 + 1.4: handle wrap-around, return iovec count, use member _iov
+        [[nodiscard]]
+        auto
+        make_iovec() {
+            const size_t t = tail();
+            const size_t avail = available();
+            const size_t first_len = _size - t;
+            if (avail <= first_len) {
+                _iov[0].iov_base = this->_data + t;
+                _iov[0].iov_len = avail;
+                return 1;
+            } else {
+                _iov[0].iov_base = this->_data + t;
+                _iov[0].iov_len = first_len;
+                _iov[1].iov_base = this->_data;
+                _iov[1].iov_len = avail - first_len;
+                return 2;
+            }
         }
 
         [[nodiscard]]
-        auto
-        make_iovec() const {
-            auto vec = new iovec[2];
-            vec[0].iov_base = this->_data + this->tail();
-            vec[0].iov_len = available();
-            return vec;
+        iovec*
+        iov() {
+            return _iov;
         }
 
         [[nodiscard]]
@@ -95,7 +121,8 @@ namespace pump::scheduler::net::common {
                 return f();
             if ((start + len) <= size())
                 return f(data(), len);
-            return f(data(), size() - head(), _data, (start + len));
+            // 1.6: fix wrap-around branch - fourth param should be wrap portion length
+            return f(data(), size() - head(), _data, len - (size() - head()));
         }
 
         template <typename func_t>
@@ -106,12 +133,14 @@ namespace pump::scheduler::net::common {
 
         void
         forward_head(const size_t len) {
-            _head += len;
+            // 1.2: use release for consumer updating _head
+            _head.store(_head.load(std::memory_order_relaxed) + len, std::memory_order_release);
         }
 
         void
         forward_tail(const size_t len) {
-            _tail += len;
+            // 1.2: use release for producer updating _tail
+            _tail.store(_tail.load(std::memory_order_relaxed) + len, std::memory_order_release);
         }
 
         explicit
@@ -119,7 +148,13 @@ namespace pump::scheduler::net::common {
             : _data(new char[_size])
             , _size(_size)
             , _head(0)
-            , _tail(0) {
+            , _tail(0)
+            , _iov{} {
+        }
+
+        // 1.5: add destructor to release _data
+        ~packet_buffer() {
+            delete[] _data;
         }
     };
 
@@ -138,7 +173,7 @@ namespace pump::scheduler::net::common {
     send_req {
         uint64_t session_id;
         iovec* vec;
-        int cnt;
+        size_t cnt;  // 2.2: unified to size_t
         std::move_only_function<void(bool)> cb;
     };
 

@@ -9,6 +9,7 @@
 #include "pump/core/compute_sender_type.hh"
 
 #include "../common/struct.hh"
+#include "../common/error.hh"
 
 namespace pump::scheduler::net::senders::stop {
     template <typename scheduler_t>
@@ -39,7 +40,7 @@ namespace pump::scheduler::net::senders::stop {
                             core::op_pusher<pos + 1, scope_t>::push_value(context, scope);
                         }
                         else {
-                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(std::logic_error("")));
+                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(common::stop_failed_error()));
                         }
                     }
                 }
@@ -96,12 +97,7 @@ namespace pump::core {
     compute_sender_type<context_t, scheduler::net::senders::stop::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
-            return 1;
-        }
-
-        consteval static auto
-        get_value_type_identity() {
-            return std::type_identity<bool>{};
+            return 0;
         }
     };
 
