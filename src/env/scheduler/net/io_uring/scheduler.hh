@@ -327,6 +327,11 @@ namespace pump::scheduler::net::io_uring {
             switch (auto *uring_req = reinterpret_cast<io_uring_request *>(cqe->user_data); uring_req->event_type) {
                 case uring_event_type::read: {
                     auto s = static_cast<session_t*>(uring_req->user_data);
+                    // notify pending recv callback before closing session
+                    if (auto* r = recv_cache(s)->req.exchange(nullptr); r != nullptr) {
+                        r->cb(std::make_exception_ptr(common::session_closed_error()));
+                        delete r;
+                    }
                     close_session(s);
                     delete uring_req;
                     break;
@@ -350,8 +355,18 @@ namespace pump::scheduler::net::io_uring {
         process_cqe(::io_uring_cqe *cqe) {
             switch (auto *uring_req = reinterpret_cast<io_uring_request *>(cqe->user_data); uring_req->event_type) {
                 case uring_event_type::read: {
-                    on_read_event(uring_req, cqe->res);
                     auto s = static_cast<session_t*>(uring_req->user_data);
+                    if (cqe->res == 0) [[unlikely]] {
+                        // EOF: client closed connection gracefully
+                        if (auto* r = recv_cache(s)->req.exchange(nullptr); r != nullptr) {
+                            r->cb(std::make_exception_ptr(common::session_closed_error()));
+                            delete r;
+                        }
+                        close_session(s);
+                        delete uring_req;
+                        break;
+                    }
+                    on_read_event(uring_req, cqe->res);
                     if (s->status.load() == common::detail::session_status::normal)[[likely]] {
                         submit_read(uring_req, s);
                     }
@@ -452,6 +467,9 @@ namespace pump::scheduler::net::io_uring {
             ::io_uring_sqe_set_data(sqe, io_req);
             if (s) {
                 ::io_uring_prep_writev(sqe, s->fd, req->vec, req->cnt, 0);
+            } else {
+                // session decode 失败，提交 NOP 避免未定义行为
+                ::io_uring_prep_nop(sqe);
             }
         }
 

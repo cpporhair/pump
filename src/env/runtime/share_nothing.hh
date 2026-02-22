@@ -62,7 +62,7 @@ namespace pump::env::runtime {
         scheduler_runner* this_core_runner =nullptr;
         for (scheduler_runner* runner : runners) {
             if (runner->core != this_core)
-                std::thread([runner](){runner->operator()();});
+                std::thread([runner](){(*runner)();}).detach();
             else
                 this_core_runner = runner ;
         }
