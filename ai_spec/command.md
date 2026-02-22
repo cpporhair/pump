@@ -1,366 +1,191 @@
-# 任务：实现 `when_any` Sender 算子
+# scheduler/net 代码审核：问题清单与修改计划
 
-## 0. 角色
+## 一、common/struct.hh
 
-你是一个非常资深的 C++ 开发者，对代码的质量和运行效率有非常极致的要求,对并发编程有深入理解，熟悉 PUMP 框架的设计和实现。你的任务是根据 `when_all` 算子的实现，设计并实现 `when_any` 算子，以满足特定的并发需求。  
+### 1.1 packet::clear() 内存释放错误
+- `delete data` 应为 `delete[] data`，`data` 是 `char*` 数组
 
-## 1. 概述
+### 1.2 packet_buffer 使用 volatile 而非 atomic
+- `_head` 和 `_tail` 声明为 `volatile size_t`，在多线程场景下不提供正确的内存序保证
+- 需要改为 `std::atomic<size_t>` 或在单线程场景下去掉 `volatile`
 
-参考已有的 `when_all` 算子（`src/pump/sender/when_all.hh`），实现 `when_any` 算子。
+### 1.3 packet_buffer::make_iovec() 只填充了 vec[0]
+- 分配了 `iovec[2]`，但只设置了 `vec[0]`（tail到末尾的部分），未处理环形缓冲区回绕到开头的 `vec[1]`
+- 且 `vec[0].iov_len` 设置为 `available()`（剩余可写空间），未处理回绕时需要拆分为两段的情况
 
-**语义差异**：
-- `when_all`：等待所有分支完成后，将全部结果聚合推给下游
-- `when_any`：任意一个分支完成（set_value/set_error/set_done）后，立即将该分支的结果推给下游，忽略后续到达的其他分支结果
+### 1.4 packet_buffer::make_iovec() 每次调用都 new iovec[2]
+- 每次读事件都会分配堆内存，对低延迟系统不可接受
+- 需要将 iovec 作为成员变量预分配，或使用栈上分配
 
-## 2. 文件位置
+### 1.5 packet_buffer 缺少析构函数
+- `_data` 在构造函数中 `new char[_size]`，但没有析构函数释放
+- 需要添加析构函数 `delete[] _data`
 
-- **实现文件**：`src/pump/sender/when_any.hh`
-- **测试文件**：`apps/test/when_any_test.cc`
-- **CMake**：在 `apps/CMakeLists.txt`（或对应的测试 CMakeLists）中添加 `when_any_test` 可执行目标
+### 1.6 handle_data 回绕分支参数错误
+- `handle_data(start, len, f)` 第三个分支调用 `f(data(), size() - head(), _data, (start + len))`，最后一个参数应该是回绕部分的长度，而非 `start + len`
+- 正确应为 `len - (size() - head())` 或类似计算
 
-## 3. 接口设计
+## 二、common/detail.hh
 
-### 3.1 用户层 API
+### 2.1 has_full_pkt() 逻辑反转
+- `if (len != 0xffff) return false`：当 `_read_pkt_len` 返回 `0xffff` 表示数据不足（无参重载），此处条件判断反了
+- 应为 `if (len == 0xffff) return false`
 
-```cpp
-// 管道风格（与 when_all 一致）
-just() >> when_any(sender1, sender2, sender3) >> then([](auto&& result) { ... })
+### 2.2 get_recv_pkt() 同样逻辑反转
+- 与 has_full_pkt 同样的问题，`if (len != 0xffff)` 应为 `if (len == 0xffff)`
 
-// when_any 接受 1 个或多个 sender 参数
-inline constexpr _when_any::fn1 when_any{};
-```
+### 2.3 recv_cache::release() 空实现
+- 函数体为空，需要实现资源释放逻辑（清理 buf、pending 的 req 等）
 
-### 3.2 输出类型
+### 2.4 两套 session 抽象共存
+- `internal_session<impl_t...>` 和 `session<reader_t>` 两种设计并存，职责重叠
+- epoll scheduler 的 handle_join_req / handle_stop_req 错误地将 session_id 转换为 `session<reader>`，但实际创建的是 `internal_session`
+- 需要统一为一套 session 抽象
 
-`when_any` 的输出为一个 `std::variant`，包含所有分支的可能结果类型：
+### 2.5 session::clear() 调用错误
+- `rdr.clear()` 后又 `rdr.release()`——对 `unique_ptr` 而言，没有 `clear()` 方法（这是 reader 的方法），且 release 后指针泄漏
+- 需要修正清理逻辑
 
-```cpp
-// 结果类型定义（与 when_all_res 同构，但独立定义以保持 namespace 隔离）
-template <typename ...value_t>
-struct when_any_res;
+### 2.6 _read_pkt_len 跨缓冲区读取实现错误
+- 三参数重载中 `uint08_t need[2]` 只有2字节，但 `memcpy(&need[0], d1, l1)` 和 `memcpy(&need[1], d2, l2)` 中 `&need[1]` 的偏移只有1字节，当 l1 > 1 时会溢出
 
-// 单值分支：variant<monostate, exception_ptr, value_t>
-template <typename value_t>
-struct when_any_res<value_t> {
-    using type = std::variant<std::monostate, std::exception_ptr, value_t>;
-};
+## 三、senders（conn / recv / send / join / stop）
 
-// void 分支：variant<monostate, exception_ptr, nullptr_t>
-template <>
-struct when_any_res<void> {
-    using type = std::variant<std::monostate, std::exception_ptr, nullptr_t>;
-};
-```
+### 3.1 所有 sender 的错误通知使用占位 logic_error
+- `std::make_exception_ptr(std::logic_error(""))` 作为错误信息无诊断价值
+- 需要定义 net 模块专用的异常类型，携带有意义的错误信息（如 session_closed、duplicate_recv 等）
 
-**输出值**：只输出首个完成分支对应的那一个 variant 值，同时输出一个 `uint32_t` 表示胜出分支的索引。
+### 3.2 send sender 的 cnt 参数类型不一致
+- net.hh 中 `send()` 接口参数为 `size_t cnt`，但 send_req / send op 内部使用 `int cnt`
+- 需要统一类型
 
-即下游收到两个参数：`(uint32_t winner_index, variant_result_t winner_value)`。
-
-**设计说明**：与 when_all 保持一致，所有信号（value/error/done）均包装为 variant 并通过 `push_value` 传递给下游。这意味着下游通过检查 variant 的 index 来判断胜出分支的完成状态（0=done/skip, 1=error, 2=value），而非通过 push_exception/push_done 通道。这保证了与 when_all 的语义一致性，下游可以用统一的模式处理两种算子的结果。
+### 3.3 stop sender 的 compute_sender_type 语义不一致
+- stop 操作成功不产生有意义的值，但 `count_value()` 返回 1，`get_value_type_identity` 返回 `bool`
+- join sender 的 `count_value()` 返回 0（无输出值），两者语义应一致——都是"加入/离开会话"，不产生数据
 
-## 4. 内部实现要求
+### 3.4 所有 sender op 的 new request 可能泄漏
+- `op::start` 中 `new common::xxx_req{...}` 后调用 `scheduler->schedule()`，如果 schedule 的 enqueue 失败（队列满），request 会泄漏且回调永远不被调用
+- 需要处理 enqueue 失败的情况
 
-### 4.1 整体结构（对照 when_all）
+## 四、epoll/scheduler.hh
 
-参照 `when_all.hh` 中的组件划分，`when_any` 需要实现以下对应组件（均在 `namespace pump::sender::_when_any` 中）：
+### 4.1 错误引入 liburing.h
+- epoll scheduler 包含了 `<liburing.h>`，这是 io_uring 的头文件，epoll 实现不应依赖它
 
-| when_all 组件 | when_any 对应组件 | 差异说明 |
-|---|---|---|
-| `value_collector` | 不需要 | when_any 无需收集所有值 |
-| `collector_wrapper` | `race_wrapper` | 用 `std::atomic_flag` 实现竞争；增加 `std::atomic<int>` 引用计数管理生命周期 |
-| `reducer` | `reducer` | 结构类似，但调用 race_wrapper 的竞争接口 |
-| `starter` | `starter` | 结构一致 |
-| `sender` | `sender` | 结构一致 |
-| `fn1` / `fn2` | `fn1` / `fn2` | 结构一致 |
+### 4.2 handle_join_req / handle_stop_req 使用错误的 session 类型
+- 将 `session_id` 转换为 `session<reader>*`，但 accept_scheduler 创建的是 `internal_session<recv_cache, epoll_send_cache>`（即 `session_t`）
+- 需要统一使用 `session_t`
 
-### 4.2 核心竞争逻辑：`race_wrapper`
+### 4.3 handle_read_event 中 readv 调用签名错误
+- 调用 `readv(s->fd, ..., 2, 0)` 传了4个参数，但 POSIX `readv` 只接受3个参数 `(fd, iov, iovcnt)`
+- 第4个参数 `0` 是多余的（可能混淆了 preadv）
 
-#### 4.2.1 数据布局（cache-friendly）
+### 4.4 handle_read_event 读取后未更新 packet_buffer 的 tail
+- 读取数据后需要调用 `forward_tail(res)` 更新写入位置，当前缺失
 
-```cpp
-template <uint32_t max, typename result_variant_t, typename parent_pusher_status_t>
-struct
-__ncp__(race_wrapper) {
-    // === 热路径原子变量（同一 cache line） ===
-    std::atomic_flag finished {};           // 竞争标志（guaranteed lock-free）
-    std::atomic<int> ref_count;             // 引用计数，初始值 = max
+### 4.5 handle_write_event 只处理一个请求
+- 每次写事件只从队列取一个 send_req，如果有多个待发送请求会积压
+- 且未检查 writev 返回值（部分写入、错误等）
 
-    // === 冷数据（winner 写入后只读） ===
-    uint32_t winner_index;                  // 胜出分支索引
-    result_variant_t result;                // 胜出分支结果
+### 4.6 accept_scheduler 缺少服务端 socket 初始化
+- 没有创建监听 socket、bind、listen 的逻辑
+- 没有将监听 socket 注册到 epoll
+- 需要提供初始化接口或构造参数
 
-    // === 构造时设置，之后只读 ===
-    parent_pusher_status_t parent_pusher_status;
+### 4.7 handle_stop_req 中 close_session 调用错误
+- `close_session` 方法接受 `epoll_event*` 参数，但传入的是 `session<reader>*`（类型错误）
+- 并且在 close_session 之前已经 del_event + delete event，close_session 内部又会 del_event，重复操作
 
-    // ... 构造函数、竞争方法 ...
-};
-```
+### 4.8 schedule(recv_req) 异常路径缺少 return
+- 当 session 状态非 normal 时，调用了 `req->cb(exception)` 但没有 return，继续执行后面的 has_full_pkt 检查
+- 需要在异常回调后 `delete req; return;`
 
-**布局说明**：
-- `atomic_flag` 和 `atomic<int>` 紧邻排列，位于同一 cache line。每个分支完成时都要访问这两个字段，将它们放在一起避免额外的 cache line fetch。
-- `winner_index` 和 `result` 只有 winner 写入一次，之后只被 `push_value` 读取（同一线程），无竞争。
-- `parent_pusher_status` 在构造时设置，后续只读。
-
-#### 4.2.2 竞争协议与内存序
+### 4.9 epoll events 数组大小硬编码为 16
+- `new epoll_event[16]` 硬编码且无析构释放
+- 需要可配置化或至少定义为常量，并在析构中释放
 
-```
-set_value<index>(value):
-    // 1. 竞争：test_and_set 使用 acq_rel
-    //    - acquire：确保看到对象的完整构造
-    //    - release：如果胜出，后续 result 写入对其他线程可见（用于 ref_count 释放路径）
-    if (!finished.test_and_set(std::memory_order_acq_rel)):
-        winner_index = index
-        result.template emplace<2>(fwd(value))
-        push_value 给 parent（传递 winner_index 和 result）
-    // 2. 无论胜败，递减引用计数
-    release_ref()
+### 4.10 close_session 中对 events 数组元素设置 ptr = nullptr
+- `close_session` 接收的是 events 数组中的指针，设置 `e->data.ptr = nullptr` 后又 `delete e`，但 e 是 new 出来的 epoll_event 而非数组元素，逻辑混乱
 
-set_error<index>(exception_ptr):
-    if (!finished.test_and_set(std::memory_order_acq_rel)):
-        winner_index = index
-        result.template emplace<1>(exception_ptr)
-        push_value 给 parent（传递 winner_index 和 result）
-    release_ref()
+## 五、io_uring/scheduler.hh
 
-set_done<index>():
-    if (!finished.test_and_set(std::memory_order_acq_rel)):
-        winner_index = index
-        result.template emplace<0>(std::monostate{})
-        push_value 给 parent（传递 winner_index 和 result）
-    release_ref()
+### 5.1 accept_scheduler 缺少服务端 socket 初始化
+- 与 epoll 同样问题：没有 socket 创建、bind、listen 逻辑
+- io_uring ring 没有初始化（缺少 `io_uring_queue_init`）
 
-set_skip<index>():
-    与 set_done 相同逻辑
-    release_ref()
-```
+### 5.2 accept_scheduler::schedule 中未 delete req
+- 当有现成连接时调用 `req->cb(opt.value())` 后没有 `delete req`，内存泄漏
 
-**关键点**：每个分支无论胜败，都必须调用 `release_ref()`。这保证了引用计数正确递减。
+### 5.3 accept_scheduler::handle_io_uring 中 switch case 缺少 break
+- `case uring_event_type::accept` 没有 break，会 fallthrough 到 default
+- 且 accept 分支有条件 delete uring_req，fallthrough 后又无条件 `free(uring_req)`，导致 double-free 或 delete+free 混用
 
-#### 4.2.3 引用计数释放协议
+### 5.4 accept_scheduler 中 new/free 混用
+- `io_uring_request` 用 `new` 分配，但用 `free()` 释放，属于未定义行为
+- 需要统一为 `new/delete`
 
-```cpp
-void release_ref() {
-    // 最后一个递减者需要 acquire，以确保看到所有分支
-    // 对 race_wrapper 的写入（包括 winner 的 result 存储）
-    // 非最后递减者用 release 即可
-    if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        delete this;
-    }
-}
-```
+### 5.5 accept_scheduler::advance 签名与 epoll 不一致
+- io_uring 版本为 `advance(const runtime_t& rt)`，epoll 版本为 `advance()` 无参
+- 需要统一 scheduler 的 advance 接口
 
-**内存序说明**：
-- `fetch_sub` 使用 `memory_order_acq_rel`：
-  - **release** 语义确保当前线程对 race_wrapper 的所有写入在 decrement 之前可见
-  - **acquire** 语义确保最后一个递减者（执行 delete 的线程）能看到所有其他线程的写入
-- 这是引用计数的标准模式（与 `shared_ptr` 的 control block 释放一致）
-- 注意：`delete this` 后不得再访问任何成员变量。`release_ref()` 应该是函数的最后一条调用
+### 5.6 session_scheduler 缺少 io_uring ring 初始化
+- 没有 `io_uring_queue_init` 调用，ring 成员只是零初始化
 
-**优化说明**：如果对延迟极度敏感，可以将非最后递减者的内存序放松为 `memory_order_release`，最后递减者额外加 `atomic_thread_fence(memory_order_acquire)`。但 `acq_rel` 在 x86 上几乎零额外开销（x86 的 `lock xadd` 本身就是 full barrier），仅在 ARM/RISC-V 等弱序架构上有差异。对于本框架，统一使用 `acq_rel` 是最佳性价比选择。
+### 5.7 session_scheduler::schedule(recv_req) 异常路径缺少 return
+- 与 epoll 同样问题：session 状态非 normal 时回调后未 return，继续执行后续逻辑
 
-#### 4.2.4 `delete this` 安全性
+### 5.8 session_scheduler::schedule(stop_req) 同步执行
+- 直接在 schedule 调用中关闭 fd 和回调，没有通过队列异步处理
+- 这违反了"schedule 只入队，advance 处理"的模式，且可能在非 scheduler 线程上执行
 
-使用 `delete this` 是 C++ 中管理引用计数对象的标准模式（COM、`shared_ptr` control block 等均使用此模式）。安全规则：
+### 5.9 handle_join_request 未调用 join 回调
+- 直接 delete req 而未调用 `req->cb(true)`，调用方永远收不到 join 完成的通知
 
-1. 对象必须通过 `new` 分配（不能是栈对象或数组元素）
-2. `delete this` 之后不得访问任何成员变量
-3. `release_ref()` 必须是调用链中的**最后一步**
+### 5.10 process_err 中 write case 缺少 break
+- `case uring_event_type::write` 没有 break，fallthrough 到 default
+- 且 write case 中 delete uring_req 缺失
 
-在 `set_value` / `set_error` / `set_done` / `set_skip` 中，push_value 必须在 `release_ref()` **之前**完成。
+### 5.11 submit_read 中 make_iovec 内存泄漏
+- 每次 submit_read 都调用 `recv_cache(s)->buf.make_iovec()` 分配新的 iovec 数组
+- io_uring 异步操作完成后没有释放这些 iovec
 
-### 4.3 内存管理
+### 5.12 handle_send_request 未调用 io_uring_submit
+- 准备了 SQE 但没有提交，写请求不会被内核处理
+- 需要在循环结束后调用 `io_uring_submit(&ring)`
 
-- `race_wrapper` 通过 `new` 在堆上分配（与 when_all 的 `collector_wrapper` 一致）
-- **引用计数生命周期管理**：初始值为分支数量 `max`，每个分支完成（无论胜败）都 `release_ref()`，最后一个递减者执行 `delete this`
+### 5.13 session_scheduler 使用 std::list 管理溢出的 send 请求
+- `std::list<common::send_req*>` 会频繁堆分配，不符合低延迟设计
+- 考虑使用固定容量的环形缓冲区
 
-**重要修复**：注意 when_all 的 `collector_wrapper` 存在内存泄漏——通过 `new` 分配但从未 `delete`。when_any 的 `race_wrapper` 通过引用计数正确管理生命周期。建议后续也为 when_all 的 `collector_wrapper` 加入相同的引用计数释放机制。
+## 六、net.hh（API 层）
 
-### 4.4 op_pusher 特化
+### 6.1 缺少 flat_map 风格的重载
+- `wait_connection()` 有无参的 flat_map 版本，但 `recv`、`send`、`join`、`stop` 没有
+- 需要补充一致的 API 风格，支持从 context 或上游值中获取 scheduler
 
-与 when_all 相同模式，在 `namespace pump::core` 中提供：
+### 6.2 send 接口直接传递裸指针
+- `send(scheduler, sid, iovec*, size_t)` 传递裸指针，调用方需要管理 iovec 生命周期
+- 容易导致悬挂指针（异步操作期间 iovec 可能被释放）
 
-1. **reducer 的 op_pusher 特化**：识别 `when_any_reducer` 标志，将 push_value/push_exception/push_skip/push_done 路由到 reducer
-2. **starter 的 op_pusher 特化**：识别 `when_any_starter` 标志，在收到 push_value 时调用 `starter::start()`
+## 七、整体架构问题
 
-标志命名：
-```cpp
-constexpr static bool when_any_reducer = true;  // 在 reducer 上
-constexpr static bool when_any_starter = true;  // 在 starter 上
-```
+### 7.1 epoll 和 io_uring 两套实现的 session 模型不统一
+- epoll 使用 `internal_session<recv_cache, epoll_send_cache>`
+- io_uring 使用 `internal_session<recv_cache>`（send 通过独立队列管理）
+- session 生命周期管理方式不同，需要统一抽象
 
-### 4.5 compute_sender_type 特化
+### 7.2 缺少 scheduler 的初始化/销毁接口
+- 两套 scheduler 都没有完整的构造/初始化/析构流程
+- 缺少 bind/listen 配置、ring 大小配置、buffer 大小配置等
 
-```cpp
-template<typename context_t, typename prev_t, typename ...sender_t>
-struct compute_sender_type<context_t, sender::_when_any::sender<prev_t, sender_t...>> {
-    // count_value() 返回 2（winner_index + result）
-    // value_type 为 std::tuple<uint32_t, common_result_variant_t>
-};
-```
+### 7.3 session_id 改为 tagged handle
+- 当前 `session_id` 是 `uint64_t`，直接存储 session 对象指针的 `reinterpret_cast`，缺乏类型安全，且 session 关闭后旧 session_id 会导致 use-after-free
+- 改为 tagged handle 方案：利用 x86-64 用户态地址只用低 48 位的特性，高 16 位编码 generation 计数器
+- 新增 `session_id_t` 类型，封装编码/解码逻辑（指针还原 + generation 提取），替代裸 `uint64_t`
+- session 对象内新增 `uint16_t generation` 字段，每次 close 时递增，使旧 handle 自动失效
+- scheduler 内部使用 session_id 时，还原指针后比较 generation，不匹配则回调异常并丢弃请求
+- 零查找开销不变（仍是指针还原），运行时仅多一次 `uint16_t` 比较
 
-其中 `common_result_variant_t` 需要将所有分支的 result variant 合并为一个统一的 variant 类型。
-
-**简化方案**：如果所有分支的 value_type 相同，输出 `std::tuple<uint32_t, when_any_res<T>::type>`；如果不同，输出所有可能类型的 variant 的 variant。
-
-推荐先实现**所有分支 value_type 相同**的情况，后续再扩展异构分支。
-
-### 4.6 单分支编译期优化
-
-当 `when_any` 只有一个分支时（`sizeof...(sender_t) == 1`），整个竞争机制可以退化：
-
-```cpp
-// 在 starter::start() 中：
-if constexpr (sizeof...(op_list_t) == 1) {
-    // 无需 new race_wrapper，无需原子操作
-    // 直接将唯一分支的结果作为 winner_index=0 推给下游
-    // 可通过一个轻量级的 single_reducer 实现
-}
-```
-
-这对于在循环或高频调用中使用 `when_any(single_sender)` 的场景可以完全消除原子操作和堆分配的开销。
-
-## 5. 关于取消（Cancellation）的说明
-
-当前设计中，winner 完成后其余分支仍会继续执行直到自然完成。这意味着：
-- 败者分支的计算资源被浪费
-- race_wrapper 的生命周期被延长到最慢分支完成
-
-**当前版本不实现取消机制**，原因：
-1. PUMP 框架当前没有通用的 cancellation token / stop_token 机制
-2. when_all 同样没有取消机制
-3. 引入取消需要在 sender/receiver 协议中增加 stop channel，属于框架级改动
-
-**未来优化方向**：
-- 引入 `stop_token` 传递给各分支 sender，winner 完成时触发 cancellation
-- 可参考 P2300（std::execution）的 `stop_token` 设计
-- 对于高频交易场景，这是重要的优化——避免 CPU 在注定被丢弃的分支上浪费周期
-
-## 6. 代码风格要求
-
-必须严格遵循 PUMP 项目现有代码风格（参考 `when_all.hh`）：
-
-- 使用 `__ncp__()` 宏标记 noncopyable 类
-- 使用 `__fwd__()` / `__mov__()` 进行完美转发和移动
-- 使用 `__all_must_rval__()` 断言右值
-- 使用 `__typ__()` 获取类型
-- include guard 格式：`PUMP_SENDER_WHEN_ANY_HH`
-- 命名空间：`pump::sender` 和内部 `pump::sender::_when_any`
-- 缩进：4 空格
-- 结构体声明风格与 when_all.hh 保持一致（`struct __ncp__(name) {` 换行风格）
-
-## 7. 测试要求
-
-测试文件 `apps/test/when_any_test.cc`，参考 `apps/test/sequential_test.cc` 的测试框架风格（TEST/PASS/FAIL 宏、test_count/pass_count/fail_count 计数）。
-
-### 7.1 单线程测试
-
-| 测试用例 | 说明 |
-|---|---|
-| `test_when_any_single_sender` | 只有一个分支，验证该分支结果正确传递，winner_index == 0 |
-| `test_when_any_basic` | 多个 just() 分支，验证某个分支胜出并正确传递值 |
-| `test_when_any_with_values` | 不同值的分支（如 `just(10)`, `just(20)`, `just(30)`），验证结果是其中之一 |
-| `test_when_any_in_pipeline` | `just() >> when_any(...) >> then(...) >> submit(context)` 完整管道 |
-| `test_when_any_void_senders` | 所有分支返回 void 的情况 |
-
-### 7.2 异常路径测试
-
-| 测试用例 | 说明 |
-|---|---|
-| `test_when_any_exception` | 某个分支抛异常，验证异常结果能正确作为 variant 中的 exception_ptr 传递 |
-| `test_when_any_all_exception` | 所有分支都抛异常，验证首个异常被传递 |
-
-### 7.3 多核测试（参考 sequential_test.cc 的 start_workers/stop_workers 模式）
-
-| 测试用例 | 说明 |
-|---|---|
-| `test_multicore_when_any_basic` | 多个分支分发到不同 scheduler 执行，验证首个完成的分支正确传递 |
-| `test_multicore_when_any_race` | 多个分支包含不同延时（通过计算量模拟），验证竞争正确性 |
-| `test_multicore_when_any_stress` | 大量重复执行 when_any，验证无内存泄漏、无崩溃 |
-
-### 7.4 内存安全测试
-
-| 测试用例 | 说明 |
-|---|---|
-| `test_when_any_no_leak` | 重复执行大量 when_any 管道，通过进程 RSS 或自定义计数器验证无内存泄漏 |
-
-### 7.5 测试主函数结构
-
-```cpp
-int main() {
-    std::cout << "========================================" << std::endl;
-    std::cout << "when_any Module Tests" << std::endl;
-    std::cout << "========================================" << std::endl;
-
-    // Single-thread tests
-    std::cout << "\n--- Single-thread Tests ---" << std::endl;
-    test_when_any_single_sender();
-    test_when_any_basic();
-    test_when_any_with_values();
-    test_when_any_in_pipeline();
-    test_when_any_void_senders();
-
-    // Exception tests
-    std::cout << "\n--- Exception Tests ---" << std::endl;
-    test_when_any_exception();
-    test_when_any_all_exception();
-
-    // Multi-core tests
-    uint32_t num_cores = std::min(8u, std::thread::hardware_concurrency());
-    std::cout << "\n--- Multi-core Tests (using " << num_cores << " cores) ---" << std::endl;
-    start_workers(num_cores);
-    test_multicore_when_any_basic();
-    test_multicore_when_any_race();
-    test_multicore_when_any_stress();
-    test_when_any_no_leak();
-    stop_workers();
-
-    // Summary
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Results: " << pass_count << "/" << test_count << " passed";
-    if (fail_count > 0) std::cout << ", " << fail_count << " FAILED";
-    std::cout << std::endl;
-    std::cout << "========================================" << std::endl;
-
-    return fail_count > 0 ? 1 : 0;
-}
-```
-
-## 8. 实现步骤建议
-
-1. **创建 `src/pump/sender/when_any.hh`**，从 `when_all.hh` 复制并修改
-2. **实现 `race_wrapper`**：使用 `std::atomic_flag` + `std::atomic<int>` ref_count，注意内存序标注
-3. **实现 `release_ref()`**：`fetch_sub(1, memory_order_acq_rel)`，最后递减者 `delete this`
-4. **修改 `reducer`**，使用 `when_any_reducer` 标志
-5. **修改 `starter`**，使用 `when_any_starter` 标志
-6. **修改 `sender`/`fn1`/`fn2`**，适配新命名空间
-7. **添加 `op_pusher` 特化和 `compute_sender_type` 特化**
-8. **创建测试文件**，逐步实现并通过各测试用例
-9. **更新 CMakeLists.txt**，添加测试目标
-10. **编译并运行测试**，确保全部通过（特别关注多核压力测试下的内存安全）
-
-## 9. 注意事项
-
-### 9.1 无锁设计
-- PUMP 框架是无锁的，when_any 的竞争逻辑只允许使用原子操作，不得引入互斥锁
-- 使用 `std::atomic_flag`（而非 `std::atomic<bool>`）作为竞争标志——它是 C++ 标准中**唯一保证 lock-free** 的原子类型
-
-### 9.2 内存序
-- 竞争标志 `finished`：使用 `memory_order_acq_rel`
-- 引用计数 `ref_count`：使用 `memory_order_acq_rel`
-- **禁止使用默认的 `memory_order_seq_cst`**——在 ARM/RISC-V 上 seq_cst 有额外开销（dmb ish full barrier），acq_rel 已足够保证正确性
-- x86 上 acq_rel 和 seq_cst 对 RMW 操作性能相同，但显式标注体现了对内存模型的理解
-
-### 9.3 单线程 scheduler
-- 每个 scheduler 是单线程的，但 when_any 的多个分支可能被调度到不同的 scheduler
-- 因此 race_wrapper 的原子操作是必要的
-
-### 9.4 内存安全
-- race_wrapper 的 `release_ref()` 必须是每个分支执行路径的**最后一步**
-- winner 的 `push_value` 必须在 `release_ref()` 之前完成
-- `delete this` 后不得访问任何成员——将 `release_ref()` 放在函数体最后一行
-
-### 9.5 宏和类型工具
-- 使用项目已有的宏（`__ncp__`、`__fwd__`、`__mov__`、`__typ__`），不要引入新的工具宏
-
-### 9.6 `parent_pusher_status`
-- 在 `_when_any` 中定义独立版本（保持 namespace 隔离），不复用 `_when_all::parent_pusher_status`
+### 7.4 缺少优雅关闭机制
+- 没有 scheduler 级别的 shutdown 流程
+- session 关闭时没有通知 pending 的 recv/send 请求
