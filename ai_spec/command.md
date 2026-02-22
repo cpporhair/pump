@@ -65,11 +65,6 @@
 - 未准备的 sqe 被提交到 io_uring 会导致未定义行为
 - 需要在 decode 失败时回调错误并跳过该 sqe，或者在获取 sqe 之前先验证 session
 
-### 4.2 `handle_send_request` 中 send_q 未完全排空
-- 当 `io_uring_get_sqe` 返回 nullptr（SQ 满）时，只将当前请求放入 `send_list` 然后 break
-- 但 `send_q` 中可能还有更多请求未被取出，这些请求会留在 queue 中等到下一次 advance
-- 如果 advance 频率不够高，可能导致 send 延迟增大
-
 ### 4.3 `on_read_event` 中 recv callback 与 submit_read 的顺序
 - `process_cqe` 的 read 分支先调用 `on_read_event`（回调 recv 请求），然后调用 `submit_read`（提交下一次读取）
 - `on_read_event` 中的回调可能会同步触发新的 `schedule(recv_req)`，而此时 submit_read 尚未执行

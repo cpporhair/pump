@@ -1,406 +1,283 @@
-# scheduler/net 模块修复开发计划
+# echo 示例代码修复计划
 
-> 基于 [command.md](./command.md) 问题清单制定  
-> 涉及文件目录：`src/env/scheduler/net/`
+## 一、echo.cc — 运行时初始化缺失（致命崩溃）
 
----
+### 1.1 修复 `create_runtime_schedulers()` — 创建并初始化所有 scheduler 实例
 
-## 开发原则
+**当前问题**：`create_runtime_schedulers()` 只执行了 `new runtime_schedulers()`，未创建任何 scheduler。
 
-- **每个阶段完成后需编译验证**，确保不引入新的编译错误
-- **修改顺序**：先修底层数据结构（common），再修 senders，再修 scheduler 实现，最后修 API 层和架构
-- **依赖关系**：阶段二依赖阶段一的 session 统一；阶段三依赖阶段一、二的基础修复
-- **测试**：每个阶段结束后运行现有测试，确保无回归
+**修复步骤**：
 
----
+1. 确定运行时参数：
+   - 监听地址（address）和端口（port），可硬编码或从 `argv` 读取
+   - io_uring 队列深度（queue_depth），参考其他示例（如 `apps/kv` 或 `apps/example/share_nothing`）确定合理值
+   - CPU 核心数（num_cores），通过 `std::thread::hardware_concurrency()` 或 `sysconf(_SC_NPROCESSORS_ONLN)` 获取，或暂时硬编码为可配置值
 
-## 阶段一：common 层基础修复（common/struct.hh + common/detail.hh）
+2. 创建 `accept_scheduler_t` 实例：
+   - `auto* accept_sched = new accept_scheduler_t();`
+   - 调用 `accept_sched->init(address, port, queue_depth)` 完成 socket bind/listen 和 io_uring ring 初始化
+   - 检查 `init` 返回值，失败时打印错误并退出
 
-> 目标：修复底层数据结构的内存错误、逻辑错误，为上层 scheduler 和 sender 提供正确的基础设施。
+3. 为每个核心创建 `session_scheduler_t` 实例：
+   - 循环 `num_cores` 次，每次 `new session_scheduler_t()` 并调用 `init(queue_depth)`
+   - 检查 `init` 返回值
 
-### 1.1 packet::clear() 内存释放错误
-- **文件**：`common/struct.hh`
-- **问题**：`delete data` 应为 `delete[] data`
-- **修改**：将 `delete data` 改为 `delete[] data`
-- **验证**：编译通过
+4. 创建 `task_scheduler_t` 实例（如需要）：
+   - 检查 `task_scheduler_t` 是否有 `init` 方法，如果有则调用
 
-### 1.2 packet_buffer 改造为 SPSC ring buffer
-- **文件**：`common/struct.hh`
-- **问题**：`_head` 和 `_tail` 使用 `volatile` 而非 `atomic`，且 `packet_buffer` 的并发模型未明确定义
-- **设计决策**：`packet_buffer` 是一个 **SPSC（Single-Producer Single-Consumer）ring buffer**：
-  - **生产者**只有一个（网络 IO 写入端）
-  - **消费者**在同一时刻只有一个（数据处理/读取端）
-  - 因此不需要多生产者或多消费者的同步机制
-- **修改**：
-  - 将 `_head` 和 `_tail` 从 `volatile size_t` 改为 `std::atomic<size_t>`，使用 SPSC 适用的内存序：
-    - 生产者更新 `_tail` 时使用 `std::memory_order_release`
-    - 消费者读取 `_tail` 时使用 `std::memory_order_acquire`
-    - 消费者更新 `_head` 时使用 `std::memory_order_release`
-    - 生产者读取 `_head` 时使用 `std::memory_order_acquire`
-  - 在类注释中明确标注 SPSC 语义，说明生产者/消费者的角色约定
-- **验证**：编译通过，检查所有引用点
+5. 通过 `add_core_schedulers(...)` 注册到 runtime：
+   - 对每个核心调用 `rs->add_core_schedulers(task_sched, accept_sched_or_nullptr, session_sched)`
+   - 注意：`accept_scheduler` 通常只绑定到一个核心（核心 0），其他核心传 `nullptr`
+   - `add_core_schedulers` 的参数顺序需与 `runtime_schedulers` 模板参数顺序一致：`task_scheduler_t, accept_scheduler_t, session_scheduler_t`
 
-### 1.3 packet_buffer::make_iovec() 环形缓冲区回绕未处理
-- **文件**：`common/struct.hh`
-- **问题**：只填充了 `vec[0]`，未处理回绕到开头的 `vec[1]`
-- **修改**：
-  - 计算 tail 到缓冲区末尾的距离 `first_len = _size - _tail`
-  - 若 `available() > first_len`，需要填充 `vec[1]` 为缓冲区开头到剩余长度
-  - `vec[0].iov_len = min(available(), first_len)`
-  - `vec[1].iov_base = _data; vec[1].iov_len = available() - first_len`（仅当回绕时）
-  - 返回实际使用的 iovec 数量（1 或 2）
-- **验证**：编译通过
+**参考文件**：
+- `runner.hh:93` — `add_core_schedulers` 签名和行为
+- `io_uring/scheduler.hh:147-187` — `accept_scheduler::init` 的两个重载
+- `io_uring/scheduler.hh:514-523` — `session_scheduler::init` 的两个重载
+- 参考 `apps/example/share_nothing/main.cc` 或 `apps/kv/runtime/` 中的初始化模式
 
-### 1.4 packet_buffer::make_iovec() 堆分配改栈/成员分配
-- **文件**：`common/struct.hh`
-- **问题**：每次调用 `new iovec[2]`，低延迟场景不可接受
-- **修改**：
-  - 在 `packet_buffer` 中添加 `iovec _iov[2]` 成员变量
-  - `make_iovec()` 返回 `_iov` 指针，不再每次 `new`
-  - 同步修改所有调用 `make_iovec()` 的地方，移除对应的 `delete[]` 调用
-- **验证**：编译通过，确认无内存泄漏
+### 1.2 修复 `schedulers_by_core` 为空导致的越界崩溃
 
-### 1.5 packet_buffer 添加析构函数
-- **文件**：`common/struct.hh`
-- **问题**：构造函数 `new char[_size]` 但无析构函数释放
-- **修改**：添加 `~packet_buffer() { delete[] _data; }`
-- **验证**：编译通过
+**当前问题**：`env::runtime::start(rs->schedulers_by_core)` 内部使用 `sched_getcpu()` 索引空向量。
 
-### 1.6 handle_data 回绕分支参数错误
-- **文件**：`common/struct.hh`
-- **问题**：回绕分支第四个参数应为回绕部分的长度
-- **修改**：将 `(start + len)` 改为 `len - (size() - head())` 或等价的正确计算
-- **验证**：编译通过
+**修复方式**：1.1 完成后此问题自动解决。`add_core_schedulers` 会逐核心填充 `schedulers_by_core`。
 
-### 1.7 has_full_pkt() / get_recv_pkt() 逻辑反转
-- **文件**：`common/detail.hh`
-- **问题**：`if (len != 0xffff)` 应为 `if (len == 0xffff)`
-- **修改**：修正两个函数中的条件判断
-- **验证**：编译通过
-
-### 1.8 _read_pkt_len 跨缓冲区读取溢出
-- **文件**：`common/detail.hh`
-- **问题**：`need[2]` 只有2字节，`memcpy` 偏移错误导致溢出
-- **修改**：
-  - 确认 pkt_len 的字节数（假设2字节），修正 `memcpy` 偏移为 `&need[l1]` 而非 `&need[1]`
-  - 或使用更安全的实现方式
-- **验证**：编译通过
-
-### 1.9 recv_cache::release() 实现
-- **文件**：`common/detail.hh`
-- **问题**：函数体为空
-- **修改**：实现资源释放逻辑，清理 buf 和 pending 的 req
-- **验证**：编译通过
-
-### 1.10 统一 session 抽象（关键架构修改）
-- **文件**：`common/detail.hh`
-- **问题**：`internal_session` 和 `session<reader_t>` 两套设计并存，职责重叠
-- **修改**：
-  - 保留 `internal_session` 作为唯一的 session 实现
-  - 移除或重构 `session<reader_t>`
-  - 更新所有引用点（epoll/io_uring scheduler 中的类型转换）
-- **依赖**：此修改影响阶段三的 scheduler 修复
-- **验证**：编译通过
-
-### 1.11 session::clear() 调用修正
-- **文件**：`common/detail.hh`
-- **问题**：对 `unique_ptr` 调用不存在的 `clear()` 方法，`release()` 后指针泄漏
-- **修改**：改为正确的清理逻辑（如 `rdr.reset()` 或直接析构）
-- **验证**：编译通过
-
----
-
-## 阶段二：Senders 层修复（senders/conn.hh, recv.hh, send.hh, join.hh, stop.hh）
-
-> 目标：修复所有 sender 的错误通知、类型不一致、内存泄漏问题。
-
-### 2.1 定义 net 模块专用异常类型
-- **文件**：新建 `common/error.hh` 或在 `common/struct.hh` 中添加
-- **问题**：所有 sender 使用无意义的 `logic_error("")` 作为错误通知
-- **修改**：
-  - 定义异常类型层次：`net_error`（基类）、`session_closed_error`、`duplicate_recv_error`、`enqueue_failed_error` 等
-  - 替换所有 sender 中的 `std::logic_error("")` 为对应的具体异常类型
-- **涉及文件**：`conn.hh`、`recv.hh`、`send.hh`、`join.hh`、`stop.hh`
-- **验证**：编译通过
-
-### 2.2 send sender cnt 类型统一
-- **文件**：`net.hh`、`senders/send.hh`
-- **问题**：`net.hh` 中为 `size_t`，内部为 `int`
-- **修改**：统一为 `size_t`（无符号，语义更正确）
-- **验证**：编译通过
-
-### 2.3 stop sender compute_sender_type 语义修正
-- **文件**：`senders/stop.hh`
-- **问题**：`count_value()` 返回 1 + `bool` 输出，但 stop 不产生有意义的值
-- **修改**：
-  - `count_value()` 改为返回 0
-  - 移除 `get_value_type_identity` 中的 `bool` 返回
-  - 与 `join` sender 保持一致
-- **验证**：编译通过，检查上游是否依赖 stop 的输出值
-
-### 2.4 sender op 的 request 泄漏处理
-- **文件**：所有 sender 的 `op::start` 方法
-- **问题**：`schedule()` 的 enqueue 失败时 request 泄漏
-- **修改**：
-  - 方案 A：让 `schedule()` 返回成功/失败状态，失败时 `op::start` 负责 `delete req` 并回调错误
-  - 方案 B：让 `schedule()` 在 enqueue 失败时自行 `delete req` 并回调错误
-  - 选择方案后统一修改所有 sender
-- **验证**：编译通过
-
----
-
-## 阶段三：epoll/scheduler.hh 修复
-
-> 目标：修复 epoll scheduler 的编译错误、逻辑错误、资源管理问题。
-
-### 3.1 移除错误的 liburing.h 包含
-- **文件**：`epoll/scheduler.hh`
-- **问题**：epoll scheduler 不应依赖 `<liburing.h>`
-- **修改**：移除 `#include <liburing.h>`，替换为所需的正确头文件
-- **验证**：编译通过
-
-### 3.2 handle_join_req / handle_stop_req session 类型修正
-- **文件**：`epoll/scheduler.hh`
-- **问题**：错误转换为 `session<reader>*`
-- **修改**：使用 `session_t`（即 `internal_session<recv_cache, epoll_send_cache>`）
-- **依赖**：阶段一 1.10 session 统一
-- **验证**：编译通过
-
-### 3.3 handle_read_event readv 调用修正
-- **文件**：`epoll/scheduler.hh`
-- **问题**：`readv` 传了4个参数，多了一个 `0`
-- **修改**：移除第4个参数，改为 `readv(s->fd, iov, iovcnt)`
-- **验证**：编译通过
-
-### 3.4 handle_read_event 读取后更新 tail
-- **文件**：`epoll/scheduler.hh`
-- **问题**：读取数据后缺少 `forward_tail(res)` 调用
-- **修改**：在 `readv` 成功返回后添加 `buf.forward_tail(res)`
-- **验证**：编译通过
-
-### 3.5 handle_write_event 批量处理 + 返回值检查
-- **文件**：`epoll/scheduler.hh`
-- **问题**：每次写事件只处理一个请求，且未检查 writev 返回值
-- **修改**：
-  - 循环处理队列中的所有待发送请求（或直到 EAGAIN）
-  - 检查 `writev` 返回值：处理部分写入（更新 iov 偏移）和错误情况
-- **验证**：编译通过
-
-### 3.6 accept_scheduler 服务端 socket 初始化
-- **文件**：`epoll/scheduler.hh`
-- **问题**：缺少 socket 创建、bind、listen 逻辑
-- **修改**：
-  - 添加初始化接口（或构造参数）：`init(address, port)` 或类似
-  - 实现 socket → bind → listen → epoll_ctl 注册
-- **验证**：编译通过
-
-### 3.7 handle_stop_req close_session 调用修正
-- **文件**：`epoll/scheduler.hh`
-- **问题**：类型错误 + 重复 del_event
-- **修改**：
-  - 传入正确的参数类型
-  - 整理 close_session 流程，避免重复操作
-- **验证**：编译通过
-
-### 3.8 schedule(recv_req) 异常路径添加 return
-- **文件**：`epoll/scheduler.hh`
-- **问题**：异常回调后未 return
-- **修改**：在 `req->cb(exception)` 后添加 `delete req; return;`
-- **验证**：编译通过
-
-### 3.9 epoll events 数组可配置化 + 析构释放
-- **文件**：`epoll/scheduler.hh`
-- **问题**：硬编码 16，无析构释放
-- **修改**：
-  - 定义常量或模板参数 `MAX_EVENTS`
-  - 在析构函数中 `delete[] events`
-  - 或改用 `std::array<epoll_event, MAX_EVENTS>` 避免堆分配
-- **验证**：编译通过
-
-### 3.10 close_session 逻辑梳理
-- **文件**：`epoll/scheduler.hh`
-- **问题**：events 数组元素设置 ptr = nullptr 后 delete，逻辑混乱
-- **修改**：理清 epoll_event 生命周期管理，确保 close_session 正确清理
-- **验证**：编译通过
-
----
-
-## 阶段四：io_uring/scheduler.hh 修复
-
-> 目标：修复 io_uring scheduler 的初始化缺失、内存错误、逻辑遗漏等问题。
-
-### 4.1 accept_scheduler 服务端 socket + ring 初始化
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：缺少 socket 创建/bind/listen 和 `io_uring_queue_init`
-- **修改**：
-  - 添加 socket 初始化流程（与 epoll 类似）
-  - 在构造函数或 `init()` 中调用 `io_uring_queue_init(queue_depth, &ring, 0)`
-  - 析构中调用 `io_uring_queue_exit(&ring)`
-- **验证**：编译通过
-
-### 4.2 accept_scheduler::schedule 中 req 泄漏
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：有现成连接时回调后未 `delete req`
-- **修改**：在 `req->cb(opt.value())` 后添加 `delete req`
-- **验证**：编译通过
-
-### 4.3 accept_scheduler::handle_io_uring switch case 添加 break
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：`case accept` 缺少 break，导致 fallthrough + double-free
-- **修改**：添加 `break` 语句
-- **验证**：编译通过
-
-### 4.4 new/free 混用修正
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：`new` 分配但 `free()` 释放
-- **修改**：统一为 `new/delete`
-- **验证**：编译通过
-
-### 4.5 accept_scheduler::advance 接口统一
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：与 epoll 版本签名不一致
-- **修改**：统一 `advance` 接口签名（需确认哪个是正确的）
-- **依赖**：可能需要同步修改 epoll 版本
-- **验证**：编译通过
-
-### 4.6 session_scheduler ring 初始化
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：缺少 `io_uring_queue_init`
-- **修改**：在构造函数或 `init()` 中初始化 ring，析构中退出 ring
-- **验证**：编译通过
-
-### 4.7 session_scheduler::schedule(recv_req) 异常路径添加 return
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：与 epoll 同样的缺少 return 问题
-- **修改**：异常回调后 `delete req; return;`
-- **验证**：编译通过
-
-### 4.8 session_scheduler::schedule(stop_req) 改为异步处理
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：同步执行违反 schedule/advance 模式
-- **修改**：
-  - `schedule` 只将 stop_req 入队
-  - 在 `advance` 中处理 stop 请求（关闭 fd、回调）
-- **验证**：编译通过
-
-### 4.9 handle_join_request 调用 join 回调
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：直接 delete req 未调用 `req->cb(true)`
-- **修改**：在 delete 前调用 `req->cb(true)`（或适当的完成值）
-- **验证**：编译通过
-
-### 4.10 process_err write case 添加 break + delete
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：缺少 break，导致 fallthrough；缺少 delete uring_req
-- **修改**：添加 `delete uring_req; break;`
-- **验证**：编译通过
-
-### 4.11 submit_read 中 iovec 泄漏修复
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：`make_iovec()` 分配的内存未释放
-- **修改**：配合阶段一 1.4 的修改（iovec 改为成员变量后自然解决）
-- **依赖**：阶段一 1.4
-- **验证**：编译通过
-
-### 4.12 handle_send_request 添加 io_uring_submit
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：准备了 SQE 但未提交
-- **修改**：在处理完所有 send 请求后调用 `io_uring_submit(&ring)`
-- **验证**：编译通过
-
-### 4.13 send 请求队列改为环形缓冲区
-- **文件**：`io_uring/scheduler.hh`
-- **问题**：`std::list` 频繁堆分配
-- **修改**：替换为固定容量的环形缓冲区（可复用 `packet_buffer` 的思路或使用 `moodycamel` 队列）
-- **验证**：编译通过，性能无回归
-
----
-
-## 阶段五：API 层修复（net.hh）
-
-> 目标：补充 API 一致性，修复接口安全性问题。
-
-### 5.1 补充 flat_map 风格重载
-- **文件**：`net.hh`
-- **问题**：`recv`、`send`、`join`、`stop` 缺少无参的 flat_map 版本
-- **修改**：
-  - 为 `recv`、`send`、`join`、`stop` 各添加无参重载，从 context 获取 scheduler
-  - 参考 `wait_connection()` 的实现模式
-- **验证**：编译通过
-
-### 5.2 send 接口裸指针改安全封装
-- **文件**：`net.hh`
-- **问题**：`iovec*` 裸指针，生命周期管理不安全
-- **修改**：
-  - 设计安全的数据缓冲区抽象（如 `send_buffer`、`buffer_view`）
-  - 或在 send sender 内部拷贝数据到内部缓冲区
-  - 确保异步操作期间数据有效
-- **验证**：编译通过
-
----
-
-## 阶段六：整体架构优化
-
-> 目标：统一两套 scheduler 的抽象，完善生命周期管理。
-
-### 6.1 统一 epoll/io_uring session 模型
-- **文件**：`common/detail.hh`、`epoll/scheduler.hh`、`io_uring/scheduler.hh`
-- **问题**：两套 session 模板参数不同
-- **修改**：
-  - 设计统一的 session 模板（包含 recv 和 send 缓存）
-  - epoll 和 io_uring 各自特化所需的 send_cache 类型
-- **依赖**：阶段一 1.10
-- **验证**：编译通过
-
-### 6.2 scheduler 初始化/销毁接口
-- **文件**：`epoll/scheduler.hh`、`io_uring/scheduler.hh`
-- **问题**：缺少完整的构造/初始化/析构
-- **修改**：
-  - 定义统一的初始化配置结构体（bind address、port、ring size、buffer size 等）
-  - 实现 RAII 风格的构造/析构
-  - accept_scheduler 和 session_scheduler 都需要完整的初始化流程
-- **验证**：编译通过
-
-### 6.3 session_id 改为 tagged handle
-- **文件**：`common/struct.hh`、`common/detail.hh` 及所有引用处
-- **问题**：裸 `uint64_t` session_id 缺乏类型安全，存在 use-after-free 风险
-- **修改**：
-  - 新建 `session_id_t` 类型，封装编码/解码逻辑
-  - 利用 x86-64 低 48 位存指针，高 16 位存 generation
-  - session 对象添加 `uint16_t generation` 字段
-  - scheduler 使用 session_id 时验证 generation
-  - 替换所有 `uint64_t` session_id 为 `session_id_t`
-- **验证**：编译通过，确认类型安全
-
-### 6.4 优雅关闭机制
-- **文件**：所有 scheduler 文件
-- **问题**：无 shutdown 流程，session 关闭不通知 pending 请求
-- **修改**：
-  - scheduler 添加 `shutdown()` 方法
-  - shutdown 时：停止接受新连接、关闭所有 session、通知所有 pending 的 recv/send 请求（回调错误）
-  - session 关闭时遍历 pending 请求列表，逐一回调错误
-- **验证**：编译通过
-
----
-
-## 执行顺序总结
-
-```
-阶段一（common 层） → 阶段二（senders 层） → 阶段三（epoll） → 阶段四（io_uring） → 阶段五（API 层） → 阶段六（架构优化）
+**验证**：确保 `schedulers_by_core.size() >= sched_getcpu() + 1`，可添加断言：
+```cpp
+assert(!rs->schedulers_by_core.empty() && "schedulers_by_core must not be empty");
 ```
 
-### 关键依赖链
-- 1.4（iovec 成员化）→ 4.11（iovec 泄漏自动解决）
-- 1.10（session 统一）→ 3.2（epoll session 类型）→ 6.1（统一 session 模型）
-- 2.1（异常类型）→ 所有 sender/scheduler 中的错误通知
-- 阶段三、四的 socket 初始化（3.6, 4.1）→ 阶段六的初始化接口统一（6.2）
+### 1.3 修复 `get_schedulers<accept_scheduler_t>()[0]` 越界
 
-### 估计工作量
-| 阶段 | 预估复杂度 | 说明 |
-|------|-----------|------|
-| 阶段一 | ⭐⭐⭐ | 修改量大，session 统一是关键路径 |
-| 阶段二 | ⭐⭐ | 定义异常类型 + 统一替换 |
-| 阶段三 | ⭐⭐⭐ | 逻辑修复较多，需要理解 epoll 事件循环 |
-| 阶段四 | ⭐⭐⭐⭐ | 问题最多，io_uring 接口复杂 |
-| 阶段五 | ⭐⭐ | API 设计 + 实现 |
-| 阶段六 | ⭐⭐⭐⭐ | 架构级重构，影响面广 |
+**当前问题**：`schedulers` 中的 `vector<accept_scheduler_t*>` 为空。
+
+**修复方式**：1.1 完成后此问题自动解决。`add_core_schedulers` 会同时填充 `schedulers` tuple 中对应类型的 vector。
+
+**验证**：确保调用 `wait_connection` 前，`rs->get_schedulers<accept_scheduler_t>()` 非空。
+
+---
+
+## 二、echo.cc — 管线逻辑问题
+
+### 2.1 修复 `pkt_iovec.vec` 内存泄漏
+
+**当前问题**：`_recv_pkt_getter` 中 `new iovec[...]` 分配的内存无人释放。
+
+**修复步骤**：
+
+1. 定位 `get_recv_pkt` 函数（在 `common/detail.hh` 中），确认 `pkt_iovec.vec` 的分配方式
+2. 方案 A — 在 send 完成后释放：
+   - 在 `session_proc` 的 `flat_map` 中，send 返回后添加 `then` 释放 `pkt.vec`：
+     ```cpp
+     >> flat_map([](const session_data &sd, scheduler::net::common::pkt_iovec &&pkt) {
+         auto* vec_ptr = pkt.vec;
+         return scheduler::net::send(sd.scheduler, sd.id, pkt.vec, pkt.cnt)
+             >> then([vec_ptr](...) { delete[] vec_ptr; });
+     })
+     ```
+3. 方案 B — 修改 `pkt_iovec` 结构，使用 RAII（如 `std::unique_ptr<iovec[]>`），在析构时自动释放
+   - 这需要修改 `common/struct.hh` 中的 `pkt_iovec` 定义
+   - 影响面较大，需要评估所有使用方
+4. 方案 C — 完全避免动态分配，使用栈上的固定大小数组（如 `iovec vec[2]`），修改 `pkt_iovec` 为值类型
+   - 在 `common/struct.hh` 中将 `pkt_iovec` 改为包含固定大小 `iovec` 数组的结构体
+
+**推荐方案**：方案 A 最小侵入，先实现 A 确保不泄漏；后续可考虑 C 做更彻底的优化。
+
+**参考文件**：
+- `common/detail.hh` — `get_recv_pkt` 实现
+- `common/struct.hh` — `pkt_iovec` 定义
+
+### 2.2 修复 `forward_head` 与异步 send 的数据竞争
+
+**当前问题**：`read_packet_coro` 中 `co_yield` 后立即 `forward_head`，但 send 可能还未完成，导致环形缓冲区数据被覆盖。
+
+**修复步骤**：
+
+1. 分析数据流：`read_packet_coro` → `co_yield pkt_iovec` → 下游 `flat_map` 调用 `send()` → send 完成
+2. 方案 A — 将 `forward_head` 延迟到 send 完成后：
+   - 将 `packet_buffer*` 和 `pio.cnt` 一起传递到下游
+   - 在 send 完成的回调/then 中执行 `buf->forward_head(cnt)`
+   - 需要修改 `pkt_iovec` 结构或额外传递 buffer 指针和 forward 计数
+   - 具体做法：修改 `pkt_iovec` 增加 `packet_buffer*` 和 `forward_cnt` 字段
+   - 在 `read_packet_coro` 中不再调用 `forward_head`，改为填充这两个字段
+   - 在 send 完成的 `then` 中调用 `pkt.buf->forward_head(pkt.forward_cnt)`
+
+3. 方案 B — 在 yield 之前将数据拷贝到独立缓冲区：
+   - 在 `read_packet_coro` 中，yield 之前分配新 buffer 并 memcpy
+   - `pkt_iovec.vec` 指向拷贝后的数据
+   - 可以安全 `forward_head`
+   - 缺点：额外的内存分配和拷贝开销
+
+**推荐方案**：方案 A，零拷贝且符合异步设计模式。
+
+**注意**：此修复与 2.1 的 iovec 释放紧密相关，两者应一起设计。
+
+### 2.3 修复 `session_proc` 中 `sid.raw() % 2` 硬编码
+
+**当前问题**：硬编码 `% 2` 假设有 2 个 session_scheduler。
+
+**修复步骤**：
+
+1. 将 `runtime_schedulers` 指针 `rs` 传递到取模处
+2. 使用 `rs->get_schedulers<session_scheduler_t>().size()` 获取实际数量
+3. 替换 `sid.raw() % 2` 为 `sid.raw() % rs->get_schedulers<session_scheduler_t>().size()`
+4. 注意：`get_by_core` 使用的是核心编号作为索引，而取模后的值应该是核心索引
+   - 需要确认 `session_scheduler` 在哪些核心上有实例
+   - 如果不是所有核心都有 session_scheduler，需要建立一个有效核心索引列表
+5. 更安全的做法：取模基于 `schedulers_by_core.size()` 或收集所有非 nullptr 的 session_scheduler 核心列表
+
+**修复代码示意**：
+```cpp
+auto session_count = rs->get_schedulers<session_scheduler_t>().size();
+auto core_idx = sid.raw() % session_count;
+// 使用 get_schedulers<session_scheduler_t>()[core_idx] 代替 get_by_core
+```
+
+**注意**：`session_proc` 中有两处 `get_by_core<session_scheduler_t>(sid.raw() % 2)`，都需要修改。
+
+### 2.4 `check_session` 协程的轮询方式 — 评估是否移除
+
+**当前问题**：`check_session` 的 `closed` 检查是冗余的，因为异常会先被 `any_exception` 捕获。
+
+**处理方式**：
+
+1. 分析 `check_session` 在管线中的角色：它作为 `as_stream()` 的源，控制循环是否继续
+2. 当前管线结构：`check_session → as_stream → recv → parse → send → count → any_exception → count`
+3. 当异常发生时（如连接断开），`any_exception` 捕获异常并设置 `closed=true`
+4. 但此时管线已经因异常终止，`check_session` 的循环不会再被驱动
+5. 两种处理方式：
+   - **保留但简化**：如果 `check_session` 的存在是为了未来扩展（如外部关闭信号），可保留但添加注释说明当前是冗余的
+   - **移除**：用 `just() >> forever()` 替代 `check_session`，依赖异常机制终止循环
+6. **推荐**：暂时保留，添加 TODO 注释说明冗余性，优先修复致命 bug
+
+---
+
+## 三、echo.cc — main 函数结构问题
+
+### 3.1 修复两层 `submit` 的执行模型
+
+**当前问题**：内层管线需要在 `start()` 之前将 accept 请求注册到队列中。
+
+**分析**：
+
+1. 当前执行流程：
+   ```
+   外层 submit → create_runtime_schedulers() → then(setup内层管线) → then(start())
+   ```
+2. `then` 是顺序执行的，所以内层 `submit` 会先执行（设置管线并提交 accept 请求），然后才执行 `start()`
+3. 需要验证：内层 `submit` 是否是同步完成的？即它是否在返回前就已经将 `wait_connection` 对应的 accept 请求提交到了 accept_scheduler 的队列中
+4. 检查 `submit` 的实现：如果 `submit` 是同步启动管线的第一步（提交初始请求），那么 `start()` 之前请求已在队列中，是正确的
+5. 如果 `submit` 只是注册而不执行，则需要确保 `start()` 后事件循环会驱动管线
+
+**修复步骤**：
+
+1. 阅读 `submit` 和 `make_root_context` 的实现，确认管线启动的同步/异步语义
+2. 如果内层 `submit` 是同步触发首个 `schedule(conn_req)` 的，则当前顺序正确，无需修改
+3. 如果不是，需要重构 main：
+   - 方案：将管线设置和 start 的顺序调整为：先 setup 管线（注册 accept 请求到队列），再 start 事件循环
+   - 或者在 `start()` 内部添加初始化钩子
+
+### 3.2 修复 `start()` 中线程未 detach 或 join
+
+**当前问题**：`share_nothing.hh:60` 的 `start(const std::vector<scheduler_runner*>&)` 重载中，`std::thread` 构造后既未 detach 也未 join。
+
+**修复步骤**：
+
+1. 确认 echo 实际使用的是哪个 `start` 重载：
+   - `echo.cc:145` 调用 `env::runtime::start(rs->schedulers_by_core)`
+   - `rs->schedulers_by_core` 类型为 `std::vector<std::tuple<...>*>`...不对
+   - 看 `runner.hh:55`：`schedulers_by_core` 类型为 `std::vector<std::tuple<Schedulers*...>>`
+   - 对应 `share_nothing.hh:108` 的 `start(std::vector<std::tuple<scheduler_t*...>>&)` 重载
+   - 该重载（第118-121行）已有 `.detach()`，所以 **echo 不受此 bug 影响**
+
+2. 但 `share_nothing.hh:60` 的另一个重载仍有 bug，需要修复：
+   - 在第65行，将 `std::thread([runner](){runner->operator()();});` 改为：
+     ```cpp
+     std::thread([runner](){(*runner)();}).detach();
+     ```
+
+**参考文件**：
+- `share_nothing.hh:60-72` — 有 bug 的 `start` 重载
+- `share_nothing.hh:108-136` — echo 实际使用的 `start` 重载（已有 detach）
+
+---
+
+## 四、io_uring/scheduler.hh — 影响 echo 正确性的问题
+
+### 4.1 修复 `submit_write` 中 session 解码失败时未处理 sqe
+
+**当前问题**：`io_uring_get_sqe` 获取 sqe 后，若 `decode` 返回 nullptr，sqe 未被准备就会被提交。
+
+**修复步骤**：
+
+1. 定位代码：`scheduler.hh:446-456` — `submit_write` 函数
+2. 方案 A — 先验证 session 再获取 sqe（推荐）：
+   ```cpp
+   auto submit_write(io_uring_sqe *sqe, common::send_req *req) {
+       auto* s = req->session_id.decode<session_t>();
+       if (!s) {
+           // 回调错误，不使用 sqe
+           // 需要将 sqe 标记为 NOP 或者重构调用方不提前获取 sqe
+           io_uring_prep_nop(sqe);  // 提交一个空操作避免未定义行为
+           req->on_err(/* error code */);
+           return;
+       }
+       io_uring_prep_writev(sqe, s->fd, req->iov, req->iov_cnt, 0);
+       // ... 设置 user_data 等
+   }
+   ```
+3. 方案 B — 重构 `handle_send_request`，在获取 sqe 之前先验证 session：
+   - 在 `handle_send_request` 中，先 decode session
+   - 如果 decode 失败，直接回调错误，不获取 sqe
+   - 如果成功，再 `io_uring_get_sqe` 并调用 `submit_write`
+
+**推荐方案**：方案 B 更干净，避免浪费 sqe 资源。但如果 `submit_write` 的调用方已经获取了 sqe，则用方案 A 中的 `io_uring_prep_nop` 作为安全降级。
+
+**参考文件**：
+- `scheduler.hh:446-456` — `submit_write`
+- `scheduler.hh:459-486` — `handle_send_request`
+
+### 4.3 ~~评估 `on_read_event` 中 recv callback 与 submit_read 的顺序~~ — 无需修改
+
+**原始问题**：`process_cqe` 中先回调 `on_read_event`，再 `submit_read`，是否存在时序问题。
+
+**分析结论：当前代码正确，无需修改。**
+
+1. **同步回调场景**：所有操作在 session_scheduler 线程内顺序执行，无并发问题。
+2. **异步回调场景**（回调链跳转到其他 scheduler）：`cb()` 立即返回（仅 enqueue），`on_read_event` 和 `submit_read` 之间无外部干扰。
+3. **`schedule(recv_req*)` 不走队列是有意设计**：同一时刻只有一个线程调用它，构成合法的 SPSC 模式（producer = session_scheduler 线程做 `forward_tail`，consumer = 调用方线程做 `has_full_pkt`/`forward_head`）。
+4. **`packet_buffer` 的 `used()` 中 `_tail.load(relaxed)`**：consumer 端读 producer 的变量理论上应用 `acquire`，但在 x86 TSO 下所有 load 隐含 acquire 语义，因此当前实现正确。如未来需支持 ARM 等弱内存序架构，需将 consumer 端的 `_tail.load` 改为 `acquire`。
+
+---
+
+## 五、修复优先级和执行顺序
+
+### P0 — 致命崩溃（必须先修）
+1. **1.1** `create_runtime_schedulers()` 创建并初始化 scheduler 实例
+2. **1.2** 自动解决（依赖 1.1）
+3. **1.3** 自动解决（依赖 1.1）
+
+### P1 — 数据正确性
+4. **2.2** `forward_head` 与异步 send 的数据竞争（需先于 2.1 设计，因为两者的修复方案相互关联）
+5. **2.1** `pkt_iovec.vec` 内存泄漏（与 2.2 一起修复）
+6. **4.1** `submit_write` 中 session 解码失败的未定义行为
+
+### P2 — 健壮性和正确性
+7. **2.3** `sid.raw() % 2` 硬编码修复
+8. **3.2** `start()` 中线程未 detach（非 echo 直接路径，但影响其他使用者）
+
+### P3 — 优化和清理
+9. **3.1** 验证两层 submit 的执行模型（可能无需修改，需读代码确认）
+10. **2.4** `check_session` 冗余检查（添加注释或移除）
+11. ~~**4.3** `on_read_event` 回调顺序~~ — 已确认安全，无需修改（x86 下正确）
+
+---
+
+## 六、验证计划
+
+1. **编译验证**：修复 1.1 后，确保 `example.echo` 编译通过
+2. **启动验证**：运行 echo 服务，确认不再崩溃（验证 1.1/1.2/1.3）
+3. **功能验证**：使用 telnet/nc 连接，发送数据验证 echo 回显正确
+4. **内存验证**：使用 valgrind 或 AddressSanitizer 检查内存泄漏（验证 2.1）
+5. **并发验证**：多客户端同时连接，验证 session 分配和数据不错乱（验证 2.2/2.3）
+6. **异常验证**：客户端异常断开，验证 session 正确清理
