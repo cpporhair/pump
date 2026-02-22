@@ -28,13 +28,13 @@ namespace pump::scheduler::net {
 
     template <typename scheduler_t>
     inline auto
-    join(scheduler_t* sche, uint64_t session_id) {
+    join(scheduler_t* sche, common::session_id_t session_id) {
         return senders::join::sender<scheduler_t>(sche, session_id);
     }
 
     // 5.1: flat_map overload for join
     inline auto
-    join(uint64_t session_id) {
+    join(common::session_id_t session_id) {
         return pump::sender::flat_map([session_id]<typename scheduler_t>(scheduler_t* sche) {
             return join(sche, session_id);
         });
@@ -42,13 +42,13 @@ namespace pump::scheduler::net {
 
     template <typename scheduler_t>
     inline auto
-    stop(scheduler_t* sche, uint64_t session_id) {
+    stop(scheduler_t* sche, common::session_id_t session_id) {
         return senders::stop::sender<scheduler_t>(sche, session_id);
     }
 
     // 5.1: flat_map overload for stop
     inline auto
-    stop(uint64_t session_id) {
+    stop(common::session_id_t session_id) {
         return pump::sender::flat_map([session_id]<typename scheduler_t>(scheduler_t* sche) {
             return stop(sche, session_id);
         });
@@ -56,13 +56,13 @@ namespace pump::scheduler::net {
 
     template <typename scheduler_t>
     inline auto
-    recv(scheduler_t *scheduler, uint64_t session_id){
+    recv(scheduler_t *scheduler, common::session_id_t session_id){
         return senders::recv::sender<scheduler_t>(scheduler, session_id);
     }
 
     // 5.1: flat_map overload for recv
     inline auto
-    recv(uint64_t session_id) {
+    recv(common::session_id_t session_id) {
         return pump::sender::flat_map([session_id]<typename scheduler_t>(scheduler_t* sche) {
             return recv(sche, session_id);
         });
@@ -70,13 +70,13 @@ namespace pump::scheduler::net {
 
     template <typename scheduler_t>
     inline auto
-    send(scheduler_t *scheduler, uint64_t sid, iovec *vec, size_t cnt) {
+    send(scheduler_t *scheduler, common::session_id_t sid, iovec *vec, size_t cnt) {
         return senders::send::sender<scheduler_t>(scheduler, sid, vec, cnt);
     }
 
     // 5.1: flat_map overload for send
     inline auto
-    send(uint64_t sid, iovec *vec, size_t cnt) {
+    send(common::session_id_t sid, iovec *vec, size_t cnt) {
         return pump::sender::flat_map([sid, vec, cnt]<typename scheduler_t>(scheduler_t* sche) {
             return send(sche, sid, vec, cnt);
         });

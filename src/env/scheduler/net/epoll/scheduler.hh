@@ -1,3 +1,4 @@
+
 #ifndef ENV_SCHEDULER_NET_EPOLL_SCHEDULER_HH
 #define ENV_SCHEDULER_NET_EPOLL_SCHEDULER_HH
 
@@ -32,6 +33,7 @@ namespace pump::scheduler::net::epoll {
         }
     };
 
+    // 6.1: unified session type with explicit recv and send cache
     using session_t = common::detail::internal_session<common::detail::recv_cache, epoll_send_cache>;
 
     enum class
@@ -59,17 +61,22 @@ namespace pump::scheduler::net::epoll {
 
         core::mpsc::queue<common::join_req*, 2048> join_q;
         core::mpsc::queue<common::stop_req*, 2048> stop_q;
+
+        // 6.4: shutdown flag
+        std::atomic<bool> _shutdown{false};
     private:
+        // 6.1: named accessor replaces std::get<0>
         static
         auto
         recv_cache(session_t* s) noexcept{
-            return std::get<0>(s->impls);
+            return s->get_recv_cache();
         }
 
+        // 6.1: named accessor replaces std::get<1>
         static
         auto
         send_cache(session_t* s) noexcept{
-            return std::get<1>(s->impls);
+            return s->get_send_cache();
         }
 
         auto
@@ -89,10 +96,11 @@ namespace pump::scheduler::net::epoll {
         }
 
         // 3.8: add return after exception path
+        // 6.3: use session_id_t::decode with generation validation
         auto
         schedule(common::recv_req* req) {
-            auto* s = reinterpret_cast<session_t*>(req->session_id);
-            if (s->status.load() != common::detail::session_status::normal) [[unlikely]] {
+            auto* s = req->session_id.decode<session_t>();
+            if (!s || s->status.load() != common::detail::session_status::normal) [[unlikely]] {
                 req->cb(std::make_exception_ptr(common::session_closed_error()));
                 delete req;
                 return;
@@ -111,10 +119,11 @@ namespace pump::scheduler::net::epoll {
             }
         }
 
+        // 6.3: use session_id_t::decode
         auto
         schedule(common::send_req* req) {
-            auto* s = reinterpret_cast<session_t*>(req->session_id);
-            if (s->status.load() != common::detail::session_status::normal) [[unlikely]] {
+            auto* s = req->session_id.decode<session_t>();
+            if (!s || s->status.load() != common::detail::session_status::normal) [[unlikely]] {
                 req->cb(false);
                 delete req;
                 return;
@@ -131,11 +140,16 @@ namespace pump::scheduler::net::epoll {
             s->close();
         }
 
-        // 3.2: use session_t instead of session<reader>
+        // 3.2: use session_t; 6.3: use session_id_t::decode
         auto
         handle_join_req() {
             while (auto opt = join_q.try_dequeue()) {
-                auto* s = reinterpret_cast<session_t*>(opt.value()->session_id);
+                auto* s = opt.value()->session_id.decode<session_t>();
+                if (!s) [[unlikely]] {
+                    opt.value()->cb(false);
+                    delete opt.value();
+                    continue;
+                }
                 auto event = new epoll_event;
                 event->data.ptr = s;
                 event->events = EPOLLIN | EPOLLOUT | EPOLLET;
@@ -152,11 +166,16 @@ namespace pump::scheduler::net::epoll {
             }
         }
 
-        // 3.2 + 3.7: use session_t, fix close_session flow
+        // 3.2 + 3.7: use session_t; 6.3: use session_id_t::decode
         auto
         handle_stop_req() {
             while (auto opt = stop_q.try_dequeue()) {
-                auto* s = reinterpret_cast<session_t*>(opt.value()->session_id);
+                auto* s = opt.value()->session_id.decode<session_t>();
+                if (!s) [[unlikely]] {
+                    opt.value()->cb(false);
+                    delete opt.value();
+                    continue;
+                }
                 close_session(s);
                 delete s;
                 opt.value()->cb(true);
@@ -228,14 +247,36 @@ namespace pump::scheduler::net::epoll {
             }
         }
 
+        // 6.4: drain all pending queues with error on shutdown
+        void
+        drain_on_shutdown() {
+            while (auto opt = join_q.try_dequeue()) {
+                opt.value()->cb(false);
+                delete opt.value();
+            }
+            while (auto opt = stop_q.try_dequeue()) {
+                opt.value()->cb(false);
+                delete opt.value();
+            }
+        }
 
     public:
         session_scheduler()
             : poller(){
         }
 
+        // 6.4: graceful shutdown
+        void
+        shutdown() {
+            _shutdown.store(true, std::memory_order_release);
+        }
+
         auto
         advance() {
+            if (_shutdown.load(std::memory_order_acquire)) [[unlikely]] {
+                drain_on_shutdown();
+                return false;
+            }
             handle_join_req();
             handle_events();
             handle_stop_req();
@@ -256,10 +297,15 @@ namespace pump::scheduler::net::epoll {
         friend struct conn_op_t<accept_scheduler>;
     private:
         core::mpsc::queue<common::conn_req*, 2048> conn_request_q;
-        core::mpmc::queue<uint64_t, 2048> session_q;
+        core::mpmc::queue<common::session_id_t, 2048> session_q;
         detail::poller_epoll poller;
         int listen_fd = -1;
+        size_t _recv_buffer_size = 4096;
+
+        // 6.4: shutdown flag
+        std::atomic<bool> _shutdown{false};
     private:
+        // 6.3: use session_id_t
         auto
         schedule(common::conn_req* req) {
             if (auto opt = session_q.try_dequeue();opt) {
@@ -268,23 +314,25 @@ namespace pump::scheduler::net::epoll {
             }
             else {
                 if (!conn_request_q.try_enqueue(req)) {
-                    req->cb(0);
+                    req->cb(common::session_id_t{});
                     delete req;
                 }
             }
         }
 
+        // 6.3: encode session pointer as tagged session_id_t
         auto
         create_internal_session(int fd) {
             const int flags = fcntl(fd, F_GETFL, 0);
             fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-            auto* s = new session_t(fd, new common::detail::recv_cache(4096), new epoll_send_cache());
+            auto* s = new session_t(fd, new common::detail::recv_cache(_recv_buffer_size), new epoll_send_cache());
+            auto sid = common::session_id_t::encode(s);
             if (const auto opt = conn_request_q.try_dequeue(); opt) {
-                opt.value()->cb(reinterpret_cast<uint64_t>(s));
+                opt.value()->cb(sid);
                 delete opt.value();
             }
             else {
-                session_q.try_enqueue(reinterpret_cast<uint64_t>(s));
+                session_q.try_enqueue(sid);
             }
         }
 
@@ -296,9 +344,25 @@ namespace pump::scheduler::net::epoll {
                 create_internal_session(conn_sock);
         }
 
+        // 6.4: drain pending requests on shutdown
+        void
+        drain_on_shutdown() {
+            while (auto opt = conn_request_q.try_dequeue()) {
+                opt.value()->cb(common::session_id_t{});
+                delete opt.value();
+            }
+        }
+
     public:
         accept_scheduler()
             : poller() {
+        }
+
+        // 6.2: unified init with scheduler_config
+        int
+        init(const common::scheduler_config& cfg) {
+            _recv_buffer_size = cfg.recv_buffer_size;
+            return init(cfg.address, cfg.port);
         }
 
         // 3.6: server socket initialization
@@ -341,8 +405,18 @@ namespace pump::scheduler::net::epoll {
                 ::close(listen_fd);
         }
 
+        // 6.4: graceful shutdown
+        void
+        shutdown() {
+            _shutdown.store(true, std::memory_order_release);
+        }
+
         auto
         advance() {
+            if (_shutdown.load(std::memory_order_acquire)) [[unlikely]] {
+                drain_on_shutdown();
+                return false;
+            }
             const int cnt = poller.wait_event(0);
             for (int i = 0; i < cnt; ++i) {
                 handle_new_connections(poller.events[i].data.fd);

@@ -30,7 +30,7 @@ namespace pump::scheduler::net::senders::conn {
         start(context_t &context, scope_t &scope) {
             return scheduler->schedule(
                 new common::conn_req{
-                    [context = context, scope = scope](uint64_t session_id) mutable {
+                    [context = context, scope = scope](common::session_id_t session_id) mutable {
                         core::op_pusher<pos + 1, scope_t>::push_value(
                             context,
                             scope,
@@ -91,7 +91,7 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<uint64_t>{};
+            return std::type_identity<scheduler::net::common::session_id_t>{};
         }
     };
 }

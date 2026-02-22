@@ -13,11 +13,11 @@ namespace pump::scheduler::net::senders::send {
     op {
         constexpr static bool net_sender_send_op = true;
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
         iovec* vec;
         size_t cnt;
 
-        op(scheduler_t* s, uint64_t sid, iovec* vec, size_t cnt)
+        op(scheduler_t* s, common::session_id_t sid, iovec* vec, size_t cnt)
             : scheduler(s)
             , session_id(sid)
             , vec(vec)
@@ -57,11 +57,11 @@ namespace pump::scheduler::net::senders::send {
     struct
     sender {
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
         iovec* vec;
         size_t cnt;
 
-        sender(scheduler_t* s, uint64_t sid, iovec* vec, size_t cnt)
+        sender(scheduler_t* s, common::session_id_t sid, iovec* vec, size_t cnt)
             : scheduler(s)
             , session_id(sid)
             , vec(vec)

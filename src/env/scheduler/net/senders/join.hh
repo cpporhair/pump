@@ -18,9 +18,9 @@ namespace pump::scheduler::net::senders::join {
     op {
         constexpr static bool net_sender_join_op = true;
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        op(scheduler_t* s, uint64_t sid)
+        op(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
@@ -53,9 +53,9 @@ namespace pump::scheduler::net::senders::join {
     struct
     sender {
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        sender(scheduler_t* s, uint64_t sid)
+        sender(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
