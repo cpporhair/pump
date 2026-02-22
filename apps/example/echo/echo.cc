@@ -1,5 +1,7 @@
 
 #include <print>
+#include <cassert>
+#include <thread>
 
 #include "pump/sender/flat.hh"
 #include "pump/sender/repeat.hh"
@@ -34,20 +36,28 @@ using session_scheduler_t = scheduler::net::io_uring::session_scheduler<
         scheduler::net::senders::stop::op
     >;
 
+struct
+pkt_iovec_ex {
+    scheduler::net::common::pkt_iovec pkt;
+    scheduler::net::common::packet_buffer* buf;
+    size_t forward_cnt;
+};
+
 auto
-read_packet_coro(scheduler::net::common::packet_buffer* buf) -> coro::return_yields<scheduler::net::common::pkt_iovec> {
+read_packet_coro(scheduler::net::common::packet_buffer* buf) -> coro::return_yields<pkt_iovec_ex> {
     bool run = true;
     do {
-        if (auto pio = scheduler::net::common::detail::get_recv_pkt(buf);pio.cnt > 0) {
-            co_yield __mov__(pio);
-            buf->forward_head(pio.cnt);
+        if (auto pio = scheduler::net::common::detail::get_recv_pkt(buf); pio.cnt > 0) {
+            co_yield pkt_iovec_ex{pio, buf, pio.len()};
+            // forward_head 在 co_yield 恢复后调用：无 concurrent 时 send 已完成，数据安全
+            buf->forward_head(pio.len());
         }
         else {
             run = false;
         }
     }
     while (run);
-    co_return scheduler::net::common::pkt_iovec{};
+    co_return pkt_iovec_ex{};
 }
 
 struct
@@ -85,15 +95,53 @@ using runtime_schedulers = env::runtime::runtime_schedulers<
 
 auto
 create_runtime_schedulers() {
-    return new runtime_schedulers();
+    auto* rs = new runtime_schedulers();
+
+    const char* address = "0.0.0.0";
+    uint16_t port = 8080;
+    unsigned queue_depth = 256;
+    uint32_t num_cores = std::thread::hardware_concurrency();
+
+    auto* accept_sched = new accept_scheduler_t();
+    if (accept_sched->init(address, port, queue_depth) < 0) {
+        std::println(stderr, "Failed to init accept_scheduler");
+        std::exit(1);
+    }
+
+    std::vector<session_scheduler_t*> session_scheds(num_cores);
+    for (uint32_t i = 0; i < num_cores; ++i) {
+        session_scheds[i] = new session_scheduler_t();
+        if (session_scheds[i]->init(queue_depth) < 0) {
+            std::println(stderr, "Failed to init session_scheduler for core {}", i);
+            std::exit(1);
+        }
+    }
+
+    for (uint32_t i = 0; i < num_cores; ++i) {
+        auto* task_sched = new task_scheduler_t(i);
+        rs->add_core_schedulers(
+            task_sched,
+            i == 0 ? accept_sched : nullptr,
+            session_scheds[i]
+        );
+    }
+
+    assert(!rs->schedulers_by_core.empty() && "schedulers_by_core must not be empty");
+    assert(!rs->get_schedulers<accept_scheduler_t>().empty() && "accept_schedulers must not be empty");
+
+    return rs;
 }
 
 auto
 session_proc(const runtime_schedulers *rs, const scheduler::net::common::session_id_t sid) {
-    return scheduler::net::join(rs->get_by_core<session_scheduler_t>(sid.raw() % 2), sid)
-        >> with_context(session_data(sid, rs->get_by_core<session_scheduler_t>(sid.raw() % 2)))([]() {
+    auto session_count = rs->get_schedulers<session_scheduler_t>().size();
+    auto core_idx = sid.raw() % session_count;
+    auto* session_sched = rs->get_schedulers<session_scheduler_t>()[core_idx];
+    return scheduler::net::join(session_sched, sid)
+        >> with_context(session_data(sid, session_sched))([]() {
             return get_context<session_data>()
                 >> then([](const session_data &sd) {
+                    // TODO: check_session 的 closed 检查当前是冗余的，异常会先被 any_exception 捕获
                     return coro::make_view_able(check_session(sd));
                 })
                 >> as_stream()
@@ -106,8 +154,12 @@ session_proc(const runtime_schedulers *rs, const scheduler::net::common::session
                 })
                 >> as_stream()
                 >> get_context<session_data>()
-                >> flat_map([](const session_data &sd, scheduler::net::common::pkt_iovec &&pkt) {
-                    return scheduler::net::send(sd.scheduler, sd.id, pkt.vec, pkt.cnt);
+                >> flat_map([](const session_data &sd, pkt_iovec_ex &&pkt_ex) {
+                    auto* vec_ptr = pkt_ex.pkt.vec;
+                    return scheduler::net::send(sd.scheduler, sd.id, pkt_ex.pkt.vec, pkt_ex.pkt.cnt)
+                        >> then([vec_ptr](bool) {
+                            delete[] vec_ptr;
+                        });
                 })
                 >> count()
                 >> any_exception([](std::exception_ptr e) {
@@ -121,6 +173,33 @@ session_proc(const runtime_schedulers *rs, const scheduler::net::common::session
         });
 }
 
+/*
+ *  Echo Server — Scheduler-to-CPU-Core Topology
+ *
+ *  Each core runs one thread; that thread drives all schedulers assigned to it.
+ *  accept_scheduler only lives on core 0; session/task schedulers exist on every core.
+ *
+ *  ┌─────────────────────────────────────────────────────────────────────────┐
+ *  │                         runtime_schedulers                             │
+ *  ├──────────────────────────┬──────────────────────┬───────────────── ─ ─ ┤
+ *  │        Core 0            │       Core 1         │     Core N-1         │
+ *  │  ┌──────────────────┐    │  ┌────────────────┐  │  ┌────────────────┐  │
+ *  │  │ task_scheduler    │    │  │ task_scheduler  │  │  │ task_scheduler  │  │
+ *  │  └──────────────────┘    │  └────────────────┘  │  └────────────────┘  │
+ *  │  ┌──────────────────┐    │  ┌────────────────┐  │  ┌────────────────┐  │
+ *  │  │ accept_scheduler  │    │  │    nullptr      │  │  │    nullptr      │  │
+ *  │  │  (bind/listen)    │    │  │                 │  │  │                 │  │
+ *  │  │  io_uring: accept │    │  └────────────────┘  │  └────────────────┘  │
+ *  │  └──────────────────┘    │  ┌────────────────┐  │  ┌────────────────┐  │
+ *  │  ┌──────────────────┐    │  │session_scheduler│  │  │session_scheduler│  │
+ *  │  │session_scheduler  │    │  │ io_uring: r/w   │  │  │ io_uring: r/w   │  │
+ *  │  │ io_uring: r/w     │    │  └────────────────┘  │  └────────────────┘  │
+ *  │  └──────────────────┘    │                       │                      │
+ *  ├──────────────────────────┴──────────────────────┴───────────────── ─ ─ ┤
+ *  │  N = std::thread::hardware_concurrency()                               │
+ *  │  Session assignment: sid.raw() % N → core_idx → session_scheduler[idx] │
+ *  └─────────────────────────────────────────────────────────────────────────┘
+ */
 int
 main(int argc, char **argv) {
     just()
@@ -131,12 +210,10 @@ main(int argc, char **argv) {
                 >> flat_map([rs](...) {
                     return scheduler::net::wait_connection(rs->get_schedulers<accept_scheduler_t>()[0]);
                 })
-                >> concurrent()
-                >> get_context<runtime_schedulers *>()
-                >> flat_map([](runtime_schedulers *r, scheduler::net::common::session_id_t s) {
-                    return session_proc(r, s);
+                >> then([rs](scheduler::net::common::session_id_t s) {
+                    session_proc(rs, s)
+                        >> submit(core::make_root_context());
                 })
-                >> sequential()
                 >> count()
                 >> submit(core::make_root_context(rs));
         })
