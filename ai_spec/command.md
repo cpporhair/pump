@@ -12,9 +12,11 @@
 ┌─────────────────────────────────────────────┐
 │         应用协议层 (Application Protocol)     │
 │   raft / resp / mq / 自定义协议 ...          │
+│   （各模块独立开发，互不感知）                  │
 ├─────────────────────────────────────────────┤
 │              RPC 层 (本文档)                  │
 │   消息帧 / 编解码 / 请求-响应关联 / 流控      │
+│   业务模块路由 / 连接池 / 收发调度             │
 ├─────────────────────────────────────────────┤
 │         Net 层 (已实现)                       │
 │   conn / connect / recv / send / join / stop │
@@ -29,6 +31,9 @@
 - 提供请求与响应的关联匹配机制
 - 提供面向上层协议的可扩展编解码抽象
 - 提供连接级别的多路复用（multiplexing），使单连接可并发处理多个独立请求
+- 提供业务模块级路由——同一连接上的不同业务模块（如 raft、事务、时钟同步）的消息互不干扰
+- 提供连接池管理——延迟敏感业务可独占连接，其他业务共享连接池
+- 提供连接级收发调度——统一 recv 分发和 send 合并的逻辑 scheduler
 
 **RPC 层不负责**：
 - 具体应用协议的语义（如 raft 选举逻辑、resp 命令解析）
@@ -142,6 +147,52 @@ RPC 层需要支持的通信模式：
 | **解码器（Decoder）** | 字节 → 消息（对应 2.2 节） |
 | **请求ID提取** | 如何从消息中提取 request_id（对应 2.3 节） |
 | **消息分类** | 判断一个帧是请求、响应还是推送通知 |
+| **模块标识** | 该协议对应的业务模块 ID（用于共享连接上的路由） |
+
+### 2.5 业务模块路由（Module Routing）
+
+#### 2.5.1 需求描述
+
+在实际系统中，服务 A 与服务 B 之间往往有多个独立业务模块同时通信（如 raft 模块、事务模块、逻辑时钟同步模块等），这些模块通常由不同团队独立开发。RPC 层需要支持：
+
+- 延迟敏感的业务（如 raft）可独占连接，避免与其他业务争抢
+- 延迟容忍度较高的业务可共享连接池，节省连接资源
+- 共享同一连接的多个业务模块之间消息互不干扰
+
+#### 2.5.2 功能需求
+
+- **F-ROUTE-1**：每个协议特征必须声明唯一的模块标识（`module_id`），用于在共享连接上区分不同业务模块的消息
+- **F-ROUTE-2**：RPC 层的帧头必须包含 `module_id` 字段，使接收端能够将消息路由到正确的业务模块
+- **F-ROUTE-3**：业务模块通过向 RPC dispatcher 注册自己的 `module_id` + 协议特征来接入共享连接，注册过程不需要知道其他模块的存在
+- **F-ROUTE-4**：新增一个业务模块只需注册新的 `module_id`，不需要修改已有模块的任何代码（业务隔离）
+
+#### 2.5.3 业务隔离场景示例
+
+```
+服务 A                                        服务 B
+┌──────────────────┐                    ┌──────────────────┐
+│ Raft 模块         │── 专用连接 ──────────│ Raft 模块         │
+│ 事务模块          │─┐                  │ 事务模块          │
+│ 时钟同步模块       │─┼─ 共享连接池 ──────│ 时钟同步模块       │
+│ 模块 N ...        │─┘                  │ 模块 N ...        │
+└──────────────────┘                    └──────────────────┘
+```
+
+- Raft 模块：延迟敏感，独占连接，不经过 dispatcher（纯 sender 组合）
+- 事务 / 时钟同步 / 模块 N：共享连接池，通过 dispatcher 路由
+
+### 2.6 连接池（Connection Pool）
+
+#### 2.6.1 需求描述
+
+当多个业务模块共享连接时，需要一个连接池来管理可用连接，并决定每个请求使用哪个连接。
+
+#### 2.6.2 功能需求
+
+- **F-POOL-1**：提供连接池抽象，管理一组到同一目标服务的连接
+- **F-POOL-2**：支持可配置的连接选择策略（如 round-robin、least-loaded 等）
+- **F-POOL-3**：业务模块通过连接池发送请求，无需关心具体使用哪个连接
+- **F-POOL-4**：连接池应支持动态扩缩容（连接断开时移除，按需建立新连接）
 
 ---
 
@@ -323,14 +374,45 @@ RPC 层需要定义清晰的错误类型层次：
 
 ### 8.2 与 Scheduler 的集成
 
-- **F-INT-4**：RPC 层不引入新的 scheduler 类型，复用 net 层的 session_scheduler
-- **F-INT-5**：RPC 的状态（pending 请求映射等）应跟随 session 绑定在 session_scheduler 的线程上
+RPC 层引入两个逻辑 scheduler（类比 KV 层的 `fs::scheduler` 和 `batch::scheduler`），用于无锁串行化共享状态访问和批量操作合并：
+
+#### 8.2.1 RPC Dispatcher（per-connection 逻辑 scheduler）
+
+- **F-INT-4**：RPC 层引入 `rpc_dispatcher` 逻辑 scheduler，每个共享连接拥有一个 dispatcher 实例
+- **F-INT-5**：`rpc_dispatcher` 负责该连接上的 recv 分发（按 `module_id` 路由到对应业务模块）和 send 合并（多个业务模块的发送请求合并为一次 `writev`）
+- **F-INT-6**：`rpc_dispatcher` 持有该连接的共享可变状态：pending 请求映射表（`request_id → 回调`）、已注册的业务模块处理器映射（`module_id → handler`）
+- **F-INT-7**：`rpc_dispatcher` 通过 MP_SC 队列接收来自多个业务模块线程的请求（类比 `fs::scheduler` 的 `spdk_ring`），在自己的线程上串行处理，实现无锁
+- **F-INT-8**：send 合并采用 Leader/Follower 模式（类比 `fs::scheduler::handle_allocate`）——多个 send 请求的 iovec 合并为一次 `writev`，leader 完成后通知所有 follower
+
+#### 8.2.2 Connection Pool（逻辑 scheduler）
+
+- **F-INT-9**：RPC 层引入 `connection_pool` 逻辑 scheduler，管理一组到同一目标服务的 dispatcher
+- **F-INT-10**：`connection_pool` 负责连接选择策略，业务模块通过连接池发送请求时，由 pool 决定使用哪个连接的 dispatcher（类比 KV 的 `chose_scheduler()` 模式）
+
+#### 8.2.3 专用连接模式
+
+- **F-INT-11**：延迟敏感的业务模块（如 raft）可以绕过 dispatcher 和连接池，直接使用专用连接 + 纯 sender 组合，此时 RPC sender 直接复用 net 层的 session_scheduler，不经过额外调度层
+- **F-INT-12**：同一进程中可同时存在专用连接模式和共享连接池模式，两者互不影响
+
+#### 8.2.4 架构总览
+
+```
+                    ┌─ Raft 模块（专用连接，纯 sender，复用 net session_scheduler）
+                    │
+connection_pool ────┼─ rpc_dispatcher(conn#1) ─┬─ 事务模块
+(scheduler)         │                          ├─ 时钟同步模块
+                    │                          └─ 模块 N
+                    │
+                    └─ rpc_dispatcher(conn#2) ─┬─ 事务模块
+                                               ├─ 时钟同步模块
+                                               └─ 模块 N
+```
 
 ### 8.3 与 PUMP Sender 框架的集成
 
-- **F-INT-6**：RPC sender 必须实现 `op` / `sender` / `op_pusher` / `compute_sender_type` 四件套
-- **F-INT-7**：RPC sender 的 op 必须支持 `Flat OpTuple` 平铺
-- **F-INT-8**：RPC sender 必须支持通过 `context` 传递跨步骤状态
+- **F-INT-13**：RPC sender 必须实现 `op` / `sender` / `op_pusher` / `compute_sender_type` 四件套
+- **F-INT-14**：RPC sender 的 op 必须支持 `Flat OpTuple` 平铺
+- **F-INT-15**：RPC sender 必须支持通过 `context` 传递跨步骤状态
 
 ---
 
@@ -367,7 +449,7 @@ RPC 层需要定义清晰的错误类型层次：
 | F-API-1~3 | call/send/recv sender | 核心 API |
 | F-API-5~8 | Sender 组合性 | 与 PUMP 框架集成 |
 | F-ERR-1~2 | 异常传播 | 基本错误处理 |
-| F-INT-1~8 | 架构集成 | 与现有模块兼容 |
+| F-INT-1~3,11~15 | 架构集成（基础） | 与 Net 层和 PUMP Sender 框架兼容 |
 
 ### P1 — 重要（核心完成后立即实现）
 
@@ -378,6 +460,15 @@ RPC 层需要定义清晰的错误类型层次：
 | F-API-4 | serve sender | 服务端请求处理循环 |
 | F-SESSION-1~5 | 会话级状态 | 有状态 RPC |
 | F-ERR-3~4 | 高级错误处理 | 健壮性 |
+| F-INT-4~8 | RPC Dispatcher | per-connection 逻辑 scheduler（recv 分发 + send 合并） |
+| F-ROUTE-1~4 | 业务模块路由 | 共享连接上的 module_id 路由 |
+
+### P1.5 — 连接池（Dispatcher 完成后实现）
+
+| 编号 | 需求 | 说明 |
+|------|------|------|
+| F-INT-9~10 | Connection Pool | 连接池逻辑 scheduler |
+| F-POOL-1~4 | 连接池管理 | 连接选择策略、动态扩缩容 |
 
 ### P2 — 增强（按需实现）
 
@@ -411,6 +502,10 @@ RPC 层需要定义清晰的错误类型层次：
 | D-10 | 编码内存管理 | 栈/预分配固定缓冲（`std::array<iovec, 8>`），编码器将 iovec 写入 RPC 层预分配的固定大小缓冲区 | P-MEM-2, P-THR-2, F-CODEC-4 |
 | D-11 | `rpc::recv` 消息类型 | 返回扁平化的 `std::variant<具体消息类型...>`（如 `variant<vote_request, append_request, vote_response, append_response>`），下游通过 PUMP 的 `visit()` 算子解包后用 `if constexpr` 分支处理。不使用嵌套 variant（不先分 req/res 再分具体命令类型） | F-API-3, 12.4 recv 签名, 12.1 Protocol concept |
 | D-12 | handler 返回值 | 每个命令的 handler 函数统一返回 sender（如 `just(result)`），无论内部实现是同步还是异步，保持 pump 管道风格一致性 | 13.1, 13.2 使用示例 |
+| D-13 | RPC Dispatcher | RPC 层引入 per-connection 的 `rpc_dispatcher` 逻辑 scheduler（类比 KV 的 `fs::scheduler`），负责：1) recv 分发——持续 recv 后按 `module_id` 路由到对应业务模块；2) send 合并——Leader/Follower 模式合并多个 send 的 iovec 为一次 `writev`；3) pending 请求管理——`request_id → 回调` 映射。通过 MP_SC 队列接收请求，单线程处理，实现无锁 | F-INT-4~8, F-ROUTE-1~4 |
+| D-14 | Connection Pool | RPC 层引入 `connection_pool` 逻辑 scheduler（类比 KV 的 `chose_scheduler()` 模式），管理一组到同一目标服务的 dispatcher，负责连接选择策略 | F-INT-9~10, F-POOL-1~4 |
+| D-15 | 专用连接 bypass | 延迟敏感业务（如 raft）可绕过 dispatcher 和连接池，直接使用专用连接 + 纯 sender 组合，复用 net 层 session_scheduler。同一进程可同时存在两种模式 | F-INT-11~12 |
+| D-16 | module_id | `uint16_t` 类型，每个协议特征必须声明，嵌入 RPC 统一帧头中用于路由。专用连接模式下 module_id 仍存在但路由逻辑简化 | F-ROUTE-1~2 |
 
 ---
 
@@ -440,6 +535,9 @@ enum class message_kind {
 
 template <typename P>
 concept Protocol = requires {
+    // 模块标识（D-16: uint16_t，用于共享连接上的路由）
+    { P::MODULE_ID } -> std::convertible_to<uint16_t>;
+
     // 类型定义
     typename P::message_type;       // 扁平化的消息 variant 类型（D-11）
                                     // 例如: std::variant<vote_request, append_request,
@@ -491,7 +589,26 @@ net::recv(sid)
 - 整个过程零拷贝，直接操作 `packet_buffer` 的 head/tail 指针（F-FRAME-5）
 - D-8: 每解出一个完整帧，逐个推送给下游（每帧一次 push），本版不做批量推送
 
-### 12.3 编解码与 Net 层对齐
+### 12.3 RPC 统一帧头
+
+在共享连接模式下，RPC 层需要一个统一的帧头来支持路由和关联（D-16）：
+
+```
+┌──────────────────────────────────────────┐
+│ total_len (4B)     ← 帧总长度（含帧头）    │
+│ request_id (4B)    ← 关联请求和响应（D-1） │
+│ module_id (2B)     ← 路由到哪个业务模块     │  ← D-16 新增
+│ msg_type (1B)      ← 模块内的消息类型       │
+│ flags (1B)         ← request/response/push │
+│ payload ...                               │
+└──────────────────────────────────────────┘
+```
+
+- `module_id`：由 `Protocol::MODULE_ID` 决定，dispatcher 据此将消息分发到正确的业务模块
+- 专用连接模式下帧头仍包含 `module_id`（保持格式统一），但路由逻辑简化为直接传递
+- 帧头格式为 RPC 层统一定义，协议特征的 `try_parse_frame` 在帧头之后处理协议特定部分
+
+### 12.4 编解码与 Net 层对齐
 
 - 编码输出必须是 `iovec*` + `size_t cnt`，与 `net::send(sid, vec, cnt)` 签名直接匹配（F-CODEC-4）
 - 编码器负责在 `iovec` 数组中包含帧头（长度前缀/分隔符等），确保接收端的分帧器能识别
@@ -503,7 +620,7 @@ net::recv(sid)
   - 缓冲区生命周期与 send op 绑定，send 完成后自动释放，无需手动管理
   - 对比现有 echo 中 `new iovec[2]` + 手动 `delete[]` 的模式，彻底消除热路径动态分配
 
-### 12.4 Sender API 签名细化
+### 12.5 Sender API 签名细化
 
 ```cpp
 namespace pump::scheduler::rpc {
@@ -555,7 +672,7 @@ namespace pump::scheduler::rpc {
 }
 ```
 
-### 12.5 会话 RPC 状态结构
+### 12.6 会话 RPC 状态结构
 
 每个绑定了协议特征的 session 需要维护以下状态（D-9: 存储在 RPC 层独立映射中，不修改 net 层）：
 
@@ -594,13 +711,14 @@ struct rpc_state_registry {
 };
 ```
 
-### 12.6 使用示例（结合 echo 改造）
+### 12.7 使用示例（结合 echo 改造）
 
 以下展示将现有 echo 示例改造为使用 RPC 层的效果：
 
 ```cpp
 // 定义 Echo 协议特征
 struct EchoProtocol {
+    static constexpr uint16_t MODULE_ID = 0x00FF;  // D-16
     using request_type = echo_request;
     using response_type = echo_response;
 
@@ -710,6 +828,9 @@ using raft_message = std::variant<
 
 ```cpp
 struct RaftProtocol {
+    // D-16: 模块标识，用于共享连接上的路由
+    static constexpr uint16_t MODULE_ID = 0x0001;
+
     // D-11: 扁平化 message_type，所有命令类型在同一层
     using message_type = raft_message;
 
@@ -1028,6 +1149,9 @@ using mq_message = std::variant<
 
 ```cpp
 struct MqProtocol {
+    // D-16: 模块标识
+    static constexpr uint16_t MODULE_ID = 0x0010;
+
     // D-11: 扁平化 message_type
     using message_type = mq_message;
 
@@ -1276,24 +1400,177 @@ auto run_broker(const runtime_schedulers_t* rs, broker_state& state)
 }
 ```
 
-### 13.3 示例对比总结
+### 13.3 业务隔离与连接池使用示例
 
-| 特性 | Echo（12.6） | Raft（13.1） | MQ（13.2） |
-|------|------------|------------|-----------|
-| 通信模式 | 请求-响应 | 请求-响应 | 请求-响应 + 推送 + 单向 |
-| 消息多样性 | 单一类型 | 2 种请求 + 2 种响应 | 3 种请求 + 2 种响应 |
-| variant 结构 | 无（D-11） | 扁平 variant（4 种类型） | 扁平 variant（5 种类型） |
-| handler 返回 | sender（D-12） | sender（D-12） | sender（D-12） |
-| `rpc::serve` | ✓（简单场景） | ✗（需 visit 分发） | ✗（需 visit 分发 + 推送） |
-| `rpc::call` | ✗ | ✓（投票、复制） | ✓（发布） |
-| `rpc::send` | ✗ | ✓（响应发回） | ✓（ACK 单向、推送） |
-| `visit()` 算子 | ✗ | ✓ | ✓ |
-| `concurrent` | ✗ | ✓（并行投票/复制） | ✓（fan-out 推送） |
-| `when_all` | ✗ | ✗ | ✓（ACK + fan-out） |
-| 零拷贝 | ✓ | ✓（entries_data） | ✓（topic/payload string_view） |
+> 本节展示多业务模块共享连接池 + 延迟敏感业务独占连接的完整场景（D-13~D-16）。
+
+#### 13.3.1 业务模块协议定义（各模块独立开发，互不感知）
+
+```cpp
+// ---- 事务模块（由事务团队开发）----
+struct TxnProtocol {
+    static constexpr uint16_t MODULE_ID = 0x0020;  // D-16
+    using message_type = std::variant<begin_txn, commit_txn, txn_result>;
+    // ... try_parse_frame / decode / encode / get_request_id / classify
+};
+
+// ---- 逻辑时钟同步模块（由基础设施团队开发）----
+struct ClockProtocol {
+    static constexpr uint16_t MODULE_ID = 0x0021;  // D-16
+    using message_type = std::variant<clock_request, clock_response>;
+    // ... try_parse_frame / decode / encode / get_request_id / classify
+};
+
+// ---- Raft 模块（延迟敏感，独占连接）----
+struct RaftProtocol {
+    static constexpr uint16_t MODULE_ID = 0x0001;  // D-16
+    using message_type = raft_message;
+    // ... （见 13.1.2）
+};
+```
+
+#### 13.3.2 Dispatcher 注册与共享连接使用
+
+```cpp
+// 服务启动时，建立共享连接池并注册各业务模块
+auto setup_shared_connections(const runtime_schedulers_t* rs,
+                              const char* peer_addr, uint16_t peer_port)
+{
+    // D-14: 创建连接池，包含 4 个共享连接
+    auto* pool = new rpc::connection_pool(4);
+
+    // 为连接池建立连接，每个连接创建一个 dispatcher（D-13）
+    for (int i = 0; i < 4; i++) {
+        scheduler::net::connect(sched, peer_addr, peer_port)
+            >> then([pool](session_id_t sid) {
+                auto* dispatcher = pool->create_dispatcher(sid);
+                // F-ROUTE-3: 各模块独立注册，互不知道对方的存在
+                dispatcher->register_module<TxnProtocol>();
+                dispatcher->register_module<ClockProtocol>();
+                // 未来新增模块只需在这里加一行注册，不修改已有模块代码（F-ROUTE-4）
+            });
+    }
+    return pool;
+}
+```
+
+#### 13.3.3 事务模块通过连接池发送请求
+
+```cpp
+// 事务模块开发者的代码——不需要知道时钟模块、Raft 模块的存在
+auto begin_transaction(rpc::connection_pool* pool, txn_state& state)
+{
+    begin_txn req { .request_id = 0, .txn_id = state.next_txn_id() };
+
+    // D-14: 通过连接池发送，pool 自动选择连接（类比 KV 的 chose_scheduler()）
+    return pool->call<TxnProtocol>(req)
+        >> visit()
+        >> then([&state](auto&& resp) {
+            if constexpr (std::is_same_v<__typ__(resp), txn_result>) {
+                state.on_txn_result(resp);
+                return just();
+            } else {
+                throw rpc::protocol_error("unexpected response");
+                return just();
+            }
+        });
+}
+```
+
+#### 13.3.4 时钟同步模块通过同一连接池发送请求
+
+```cpp
+// 时钟同步模块开发者的代码——不需要知道事务模块的存在
+auto sync_clock(rpc::connection_pool* pool, clock_state& state)
+{
+    clock_request req { .request_id = 0, .local_timestamp = state.now() };
+
+    // 使用同一个连接池，可能和事务请求走同一个连接
+    // dispatcher 通过 module_id 路由，两者互不干扰
+    return pool->call<ClockProtocol>(req)
+        >> visit()
+        >> then([&state](auto&& resp) {
+            if constexpr (std::is_same_v<__typ__(resp), clock_response>) {
+                state.adjust(resp.remote_timestamp);
+                return just();
+            } else {
+                return just();
+            }
+        });
+}
+```
+
+#### 13.3.5 Raft 模块使用专用连接（D-15: bypass dispatcher）
+
+```cpp
+// Raft 模块——延迟敏感，使用专用连接，不经过 dispatcher 和连接池
+auto setup_raft_connection(session_scheduler_t* sched,
+                           const char* peer_addr, uint16_t peer_port,
+                           raft_state& state)
+{
+    return scheduler::net::connect(sched, peer_addr, peer_port)
+        >> then([sched, &state](session_id_t dedicated_sid) {
+            // D-15: 专用连接，直接用纯 sender 组合，复用 net session_scheduler
+            // 不经过 dispatcher，零额外开销
+            return follower_loop(sched, dedicated_sid, state);
+        });
+}
+```
+
+#### 13.3.6 服务端：Dispatcher 接收分发
+
+```cpp
+// 服务端接受连接后，创建 dispatcher 并注册模块处理器
+auto accept_shared_connections(const runtime_schedulers_t* rs,
+                               txn_service& txn, clock_service& clk)
+{
+    auto* accept_sched = rs->template get_schedulers<accept_scheduler_t>()[0];
+
+    return scheduler::net::wait_connection(accept_sched)
+        >> flat_map([rs, &txn, &clk](session_id_t sid) {
+            auto* session_sched = pick_session_scheduler(rs, sid);
+
+            // 创建 per-connection dispatcher（D-13）
+            auto* dispatcher = new rpc::rpc_dispatcher(session_sched, sid);
+
+            // F-ROUTE-3: 各模块独立注册 handler
+            dispatcher->register_handler<TxnProtocol>(
+                [&txn](auto&& msg) { return txn.handle(msg); });
+            dispatcher->register_handler<ClockProtocol>(
+                [&clk](auto&& msg) { return clk.handle(msg); });
+
+            // dispatcher 内部持续 recv → 按 module_id 分发 → 调用对应 handler
+            dispatcher->run() >> submit(core::make_root_context());
+
+            return just();
+        })
+        >> concurrent(1024);
+}
+```
+
+### 13.4 示例对比总结
+
+| 特性 | Echo（12.7） | Raft（13.1） | MQ（13.2） | 业务隔离（13.3） |
+|------|------------|------------|-----------|---------------|
+| 通信模式 | 请求-响应 | 请求-响应 | 请求-响应 + 推送 + 单向 | 多模块混合 |
+| 消息多样性 | 单一类型 | 2 种请求 + 2 种响应 | 3 种请求 + 2 种响应 | 每模块独立 |
+| variant 结构 | 无（D-11） | 扁平 variant（4 种类型） | 扁平 variant（5 种类型） | 每模块独立 variant |
+| handler 返回 | sender（D-12） | sender（D-12） | sender（D-12） | sender（D-12） |
+| `MODULE_ID` | ✓（D-16） | ✓（0x0001） | ✓（0x0010） | ✓（各模块独立） |
+| 连接模式 | 专用 | 专用（D-15） | 专用 | 混合：专用 + 连接池 |
+| `rpc_dispatcher` | ✗ | ✗（bypass） | ✗ | ✓（D-13） |
+| `connection_pool` | ✗ | ✗ | ✗ | ✓（D-14） |
+| `rpc::serve` | ✓（简单场景） | ✗（需 visit 分发） | ✗（需 visit 分发 + 推送） | ✗（dispatcher 分发） |
+| `rpc::call` | ✗ | ✓（投票、复制） | ✓（发布） | ✓（通过 pool） |
+| `rpc::send` | ✗ | ✓（响应发回） | ✓（ACK 单向、推送） | ✓ |
+| `visit()` 算子 | ✗ | ✓ | ✓ | ✓ |
+| `concurrent` | ✗ | ✓（并行投票/复制） | ✓（fan-out 推送） | ✗ |
+| `when_all` | ✗ | ✗ | ✓（ACK + fan-out） | ✗ |
+| 零拷贝 | ✓ | ✓（entries_data） | ✓（topic/payload string_view） | ✓ |
+| 业务隔离 | N/A | N/A | N/A | ✓（模块互不感知） |
 
 ---
 
 ## 十四、待确认问题
 
-> 已确认的问题已转入第十一节设计决策记录（D-7 ~ D-12）。当前无待确认问题。
+> 已确认的问题已转入第十一节设计决策记录（D-7 ~ D-16）。当前无待确认问题。
