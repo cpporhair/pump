@@ -383,6 +383,7 @@ RPC 层引入两个逻辑 scheduler（类比 KV 层的 `fs::scheduler` 和 `batc
 - **F-INT-6**：`rpc_dispatcher` 持有该连接的共享可变状态：pending 请求映射表（`request_id → 回调`）、已注册的业务模块处理器映射（`module_id → handler`）
 - **F-INT-7**：`rpc_dispatcher` 通过 MP_SC 队列接收来自多个业务模块线程的请求（类比 `fs::scheduler` 的 `spdk_ring`），在自己的线程上串行处理，实现无锁
 - **F-INT-8**：send 合并采用 Leader/Follower 模式（类比 `fs::scheduler::handle_allocate`）——多个 send 请求的 iovec 合并为一次 `writev`，leader 完成后通知所有 follower
+- **F-INT-8a**：对于请求-响应模式，dispatcher 在调用 handler 后自动将返回的响应消息编码并通过**同一连接**发回（响应原路返回，D-17）。handler 不感知连接 ID，只需返回响应消息
 
 #### 8.2.2 Connection Pool（逻辑 scheduler）
 
@@ -506,6 +507,7 @@ connection_pool ────┼─ rpc_dispatcher(conn#1) ─┬─ 事务模块
 | D-14 | Connection Pool | RPC 层引入 `connection_pool` 逻辑 scheduler（类比 KV 的 `chose_scheduler()` 模式），管理一组到同一目标服务的 dispatcher，负责连接选择策略 | F-INT-9~10, F-POOL-1~4 |
 | D-15 | 专用连接 bypass | 延迟敏感业务（如 raft）可绕过 dispatcher 和连接池，直接使用专用连接 + 纯 sender 组合，复用 net 层 session_scheduler。同一进程可同时存在两种模式 | F-INT-11~12 |
 | D-16 | module_id | `uint16_t` 类型，每个协议特征必须声明，嵌入 RPC 统一帧头中用于路由。专用连接模式下 module_id 仍存在但路由逻辑简化 | F-ROUTE-1~2 |
+| D-17 | handler 响应发送语义 | 对于请求-响应模式，dispatcher 在调用 handler 后自动将返回值编码并通过**同一连接**发回（响应原路返回）。handler 只需返回响应消息（sender），不需要也不应该感知连接 ID。对于需要跨连接操作的高级场景（如 Broker 的 fan-out 推送），handler 可通过注入的 `rpc::request_context`（含 `sid`、`dispatcher` 引用等）获取连接信息并自行发送 | F-INT-4~8, D-13 |
 
 ---
 
@@ -1534,12 +1536,19 @@ auto accept_shared_connections(const runtime_schedulers_t* rs,
             auto* dispatcher = new rpc::rpc_dispatcher(session_sched, sid);
 
             // F-ROUTE-3: 各模块独立注册 handler
+            // D-17: handler 只返回响应消息（sender），dispatcher 自动通过同一连接发回
+            //   handler 不需要感知 sid 或连接概念
             dispatcher->register_handler<TxnProtocol>(
-                [&txn](auto&& msg) { return txn.handle(msg); });
+                [&txn](auto&& msg) {
+                    // handler 返回响应消息，dispatcher 自动编码并通过同一连接发回（D-17）
+                    return txn.handle(msg);  // 返回 sender，完成值为响应消息
+                });
             dispatcher->register_handler<ClockProtocol>(
-                [&clk](auto&& msg) { return clk.handle(msg); });
+                [&clk](auto&& msg) {
+                    return clk.handle(msg);  // 同上，dispatcher 自动发回响应
+                });
 
-            // dispatcher 内部持续 recv → 按 module_id 分发 → 调用对应 handler
+            // dispatcher 内部持续 recv → 按 module_id 分发 → 调用 handler → 自动发回响应（D-17）
             dispatcher->run() >> submit(core::make_root_context());
 
             return just();
@@ -1547,6 +1556,19 @@ auto accept_shared_connections(const runtime_schedulers_t* rs,
         >> concurrent(1024);
 }
 ```
+
+> **D-17 说明**：上述 handler 只返回响应消息，不负责发送。dispatcher 在 handler 返回后自动将响应编码并通过**同一连接**（即收到请求的那个 `sid`）发回。这确保了请求-响应的「原路返回」语义，handler 完全不感知连接。
+>
+> 对于需要跨连接操作的高级场景（如 MQ Broker 的 fan-out 推送，见 13.2.5），handler 可通过 `rpc::request_context` 获取连接信息：
+> ```cpp
+> dispatcher->register_handler<MqProtocol>(
+>     [&state](rpc::request_context ctx, auto&& msg) {
+>         // ctx.sid: 收到请求的连接
+>         // ctx.dispatcher: 当前 dispatcher 引用
+>         // handler 自行决定是否发响应、发给谁
+>         return handle_publish(ctx, state, msg);
+>     });
+> ```
 
 ### 13.4 示例对比总结
 
