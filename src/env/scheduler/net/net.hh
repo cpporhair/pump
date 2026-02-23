@@ -7,6 +7,7 @@
 
 #include "pump/sender/flat.hh"
 #include "./senders/conn.hh"
+#include "./senders/connect.hh"
 #include "./senders/recv.hh"
 #include "./senders/send.hh"
 #include "./senders/join.hh"
@@ -23,6 +24,19 @@ namespace pump::scheduler::net {
     wait_connection() {
         return pump::sender::flat_map([]<typename scheduler_t>(scheduler_t* sche) {
             return wait_connection(sche);
+        });
+    }
+
+    template <typename scheduler_t>
+    inline auto
+    connect(scheduler_t* sche, const char* address, uint16_t port) {
+        return senders::connect::sender<scheduler_t>(sche, address, port);
+    }
+
+    inline auto
+    connect(const char* address, uint16_t port) {
+        return pump::sender::flat_map([address, port]<typename scheduler_t>(scheduler_t* sche) {
+            return connect(sche, address, port);
         });
     }
 
