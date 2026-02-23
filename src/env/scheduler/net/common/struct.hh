@@ -206,6 +206,13 @@ namespace pump::scheduler::net::common {
     };
 
     struct
+    connect_req {
+        const char* address;
+        uint16_t port;
+        std::move_only_function<void(session_id_t)> cb;
+    };
+
+    struct
     recv_req {
         session_id_t session_id;
         std::move_only_function<void(std::variant<packet_buffer*, std::exception_ptr>)> cb;

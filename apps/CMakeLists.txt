@@ -1,6 +1,7 @@
 
 add_executable(example.pump ./example/hello_world/pump.cc)
 add_executable(example.echo ./example/echo/echo.cc)
+add_executable(example.echo_client ./example/echo_client/echo_client.cc)
 add_executable(example.share_nothing ./example/share_nothing/main.cc)
 add_executable(example.nvme ./example/nvme/nvme_test.cc)
 add_executable(example.coro ./example/coro/main.cc)
@@ -13,6 +14,7 @@ add_executable(test.when_any ./test/when_any_test.cc)
 target_link_libraries(test.when_any PRIVATE pthread numa)
 
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY})
+target_link_libraries(example.echo_client PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.share_nothing PRIVATE numa)
 target_link_libraries(example.pump PRIVATE numa)
 target_link_libraries(example.nvme PRIVATE 
