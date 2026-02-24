@@ -106,14 +106,19 @@ namespace pump::scheduler::net::epoll {
                 return;
             }
 
-            if (common::detail::has_full_pkt(&recv_cache(s)->buf)) {
-                req->cb(&(recv_cache(s)->buf));
+            // check ready_q first (frames already copied out but not yet consumed)
+            if (auto opt = recv_cache(s)->ready_q.try_dequeue()) {
+                req->cb(std::move(*opt.value()));
+                delete opt.value();
+                delete req;
+            }
+            else if (auto frame = common::detail::copy_out_frame(&recv_cache(s)->buf); frame.size() > 0) {
+                req->cb(std::move(frame));
                 delete req;
             }
             else {
-                auto tmp = static_cast<common::recv_req*>(nullptr);
-                if (!recv_cache(s)->req.compare_exchange_strong(tmp, req)) [[unlikely]] {
-                    req->cb(std::make_exception_ptr(common::duplicate_recv_error()));
+                if (!recv_cache(s)->recv_q.try_enqueue(req)) [[unlikely]] {
+                    req->cb(std::make_exception_ptr(common::session_closed_error()));
                     delete req;
                 }
             }
@@ -192,17 +197,32 @@ namespace pump::scheduler::net::epoll {
             if (auto res = readv(s->fd, buf.iov(), iovcnt); res > 0) {
                 // 3.4: update tail after read
                 buf.forward_tail(res);
-                if (auto req = recv_cache(s)->req.exchange(nullptr); req != nullptr) {
-                    req->cb(&buf);
-                    delete req;
+                for (auto frame = common::detail::copy_out_frame(&buf);
+                     frame.size() > 0;
+                     frame = common::detail::copy_out_frame(&buf)) {
+                    if (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
+                        opt.value()->cb(std::move(frame));
+                        delete opt.value();
+                    } else {
+                        // no waiting recv, stash frame for later consumption
+                        recv_cache(s)->ready_q.try_enqueue(new common::recv_frame(std::move(frame)));
+                    }
                 }
             }
             else if (res == 0) {
+                while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
+                    opt.value()->cb(std::make_exception_ptr(common::session_closed_error()));
+                    delete opt.value();
+                }
                 close_session(s);
             }
             else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     return;
+                while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
+                    opt.value()->cb(std::make_exception_ptr(common::session_closed_error()));
+                    delete opt.value();
+                }
                 close_session(s);
             }
         }

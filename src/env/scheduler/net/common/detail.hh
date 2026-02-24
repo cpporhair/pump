@@ -2,7 +2,7 @@
 #ifndef ENV_SCHEDULER_NET_COMMON_DETAIL_HH
 #define ENV_SCHEDULER_NET_COMMON_DETAIL_HH
 #include <atomic>
-#include <string.h>
+#include <cstring>
 #include <unistd.h>
 
 #include "pump/core/meta.hh"
@@ -96,21 +96,61 @@ namespace pump::scheduler::net::common::detail {
     };
 
     struct
+    _frame_copier {
+        recv_frame
+        operator()() const noexcept {
+            return {};
+        }
+
+        recv_frame
+        operator()(const char* data, const size_t len) const noexcept {
+            auto* copy = new char[len];
+            memcpy(copy, data, len);
+            return {copy, len};
+        }
+
+        recv_frame
+        operator()(const char* d1, const size_t l1, const char* d2, const size_t l2) const noexcept {
+            auto total = l1 + l2;
+            auto* copy = new char[total];
+            memcpy(copy, d1, l1);
+            memcpy(copy + l1, d2, l2);
+            return {copy, total};
+        }
+    };
+
+    inline constexpr _frame_copier frame_copier{};
+
+    inline recv_frame
+    copy_out_frame(common::packet_buffer* buf) {
+        const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
+        if (len == 0xffff)
+            return {};
+        auto frame = buf->handle_data(len, frame_copier);
+        if (frame.size() > 0)
+            buf->forward_head(len);
+        return frame;
+    }
+
+    struct
     recv_cache {
         packet_buffer buf;
-        std::atomic<common::recv_req *> req;
+        core::spsc::queue<common::recv_req*> recv_q;
+        core::spsc::queue<common::recv_frame*> ready_q;
 
         explicit
         recv_cache(size_t size)
-            : buf(size)
-            , req(nullptr) {
+            : buf(size) {
         }
 
         // 1.9: implement resource release
         auto
         release() {
-            if (auto* r = req.exchange(nullptr); r != nullptr) {
-                delete r;
+            while (auto opt = recv_q.try_dequeue()) {
+                delete opt.value();
+            }
+            while (auto opt = ready_q.try_dequeue()) {
+                delete opt.value();
             }
         }
     };

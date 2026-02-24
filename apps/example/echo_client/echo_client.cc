@@ -57,8 +57,8 @@ session_proc(const runtime_schedulers<connect_scheduler_t, session_scheduler_t> 
         })
         >> flat_map([session_sched, sid](...) {
             return scheduler::net::recv(session_sched, sid)
-                >> then([](scheduler::net::common::packet_buffer* buf) {
-                    std::println("Received echo response, buffer used: {}", buf->used());
+                >> then([](scheduler::net::common::recv_frame&& frame) {
+                    std::println("Received echo response, frame size: {}", frame.size());
                 });
         })
         >> flat_map([session_sched, sid](...) {
