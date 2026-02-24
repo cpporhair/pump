@@ -25,7 +25,7 @@
 ### 1.1 RPC 层的职责边界
 
 **RPC 层负责**：
-- 将 net 层的原始字节流转化为结构化的消息帧
+- 将 net 层产出的 `recv_frame` 解析为结构化的消息
 - 提供异步请求-响应（request-response）语义
 - 提供请求与响应的关联匹配机制
 - 提供面向上层协议的可扩展编解码抽象
@@ -35,7 +35,7 @@
 - 具体应用协议的语义（如 raft 选举逻辑、resp 命令解析）
 - 连接建立与生命周期管理（由 net 层负责）
 - 底层字节收发（由 net 层负责）
-- 连接池、连接选择策略、业务模块路由（由上层应用负责）
+- 连接池、连接选择策略（由上层应用负责）
 - 连接级收发调度（recv 分发、send 合并）（由上层应用负责）
 - 服务发现、负载均衡等更上层关注点
 
@@ -57,13 +57,12 @@
 
 ### 2.1 消息帧（Frame）
 
-RPC 层需要将 net 层的连续字节流切分为独立的消息帧：
+net 层负责将连续字节流切分为独立的消息包（`recv_frame`），RPC 层负责解释包内容：
 
-- **F-FRAME-1**：支持从 `packet_buffer` 中识别和提取完整的消息帧
-- **F-FRAME-2**：支持处理不完整帧（数据不足时等待更多数据到达）
-- **F-FRAME-3**：支持处理单次 recv 中包含多个完整帧的情况（粘包）
-- **F-FRAME-4**：分帧策略必须由上层协议自定义，RPC 层提供抽象接口
-- **F-FRAME-5**：完整帧通过 copy-out 复制为独立的 `recv_frame`，上层通过 struct overlay 零开销访问帧数据
+- **F-FRAME-1**：net 层通过长度前缀从环形缓冲区中识别和提取完整的消息包
+- **F-FRAME-2**：net 层处理不完整包（数据不足时等待更多数据到达）和粘包（单次 recv 中包含多个完整包）
+- **F-FRAME-3**：完整包通过 copy-out 复制为独立的 `recv_frame`，RPC 层通过 struct overlay 零开销访问帧数据
+- **F-FRAME-4**：`recv_frame` 内部的具体内容（RPC 帧头、payload）完全由 RPC 层决定，net 层不解释包内容
 
 ### 2.2 编解码（Codec）
 
@@ -97,20 +96,18 @@ RPC 层需要支持的通信模式：
 
 - **F-PROTO-1**：上层协议通过实现协议特征来定义帧格式、编解码规则和消息类型
 - **F-PROTO-2**：协议特征应在编译期完全确定，不引入运行时多态开销
-- **F-PROTO-3**：RPC 层的 sender API 应以协议特征为模板参数进行参数化
+- **F-PROTO-3**：RPC 层的 sender API 以 `service_type` 值为模板参数进行参数化（`service<st>` 同时满足 Protocol concept）
 - **F-PROTO-4**：不同的连接/session 可以使用不同的协议特征
 
-协议特征需要定义的内容：
+协议特征需要定义的内容（通过 `service<st>` 模板特化提供）：
 
 | 特征项 | 说明 |
 |--------|------|
-| **分帧器** | 如何从字节流中切分帧 |
 | **消息类型** | 请求/响应的 C++ 类型（扁平化 variant） |
-| **编码器** | 消息 → 字节 |
-| **解码器** | 字节 → 消息 |
-| **请求ID提取** | 如何从消息中提取 request_id |
-| **消息分类** | 判断一个帧是请求、响应还是推送 |
-| **模块标识** | 该协议对应的 module_id |
+| **编码器** | 消息 → 字节（iovec 数组） |
+| **解码器** | 字节 → 消息（按 msg_type 区分） |
+
+> 注：`request_id`、`module_id`、`flags`（消息分类）均由 RPC 统一帧头定义，RPC 层直接从帧头提取，不属于协议特征的职责。`module_id` 由 `service_type` 枚举值自动确定。
 
 ### 2.5 服务注册与分发
 
@@ -120,7 +117,7 @@ RPC 层提供基于模板特化的服务注册和编译期分发机制：
 - **F-SVC-2**：每个服务通过 `handle()` 静态方法的重载处理不同请求类型，handler 统一返回 sender
 - **F-SVC-3**：RPC 层通过 concept 检测服务是否支持特定请求类型（`has_handle_concept`）
 - **F-SVC-4**：RPC 层提供编译期 `dispatch` 机制，根据 service_id 将请求路由到对应服务的 handler
-- **F-SVC-5**：新增服务只需添加 `service_type` 枚举值和对应的模板特化，无需修改 RPC 层代码
+- **F-SVC-5**：`service_type` 枚举定义在独立文件中，新增服务只需在该文件中添加枚举值并提供对应的 `service<sid>` 模板特化，无需修改 RPC 层其他代码
 
 ### 2.6 上层职责（非 RPC 层）
 
@@ -128,7 +125,6 @@ RPC 层提供基于模板特化的服务注册和编译期分发机制：
 
 - **连接策略**：哪些业务独占连接、哪些共享连接池
 - **连接池**：管理一组连接、选择策略、动态扩缩容
-- **模块路由**：共享连接上按 `module_id` 将消息分发到不同业务模块
 - **收发调度**：recv 分发、send 合并
 
 ---
@@ -157,7 +153,7 @@ RPC 层提供基于模板特化的服务注册和编译期分发机制：
 - **语义**：从连接中接收并解码下一条完整消息
 - **输入**：session_id
 - **输出**：解码后的消息对象（扁平化 variant）
-- **说明**：内部处理分帧和解码
+- **说明**：内部处理解码
 - **需求编号**：F-API-3
 
 #### 3.1.4 `rpc::serve` — 服务端请求处理循环
@@ -181,8 +177,7 @@ RPC 层提供基于模板特化的服务注册和编译期分发机制：
 // 客户端：发送请求并获取响应
 scheduler::net::connect(sched, addr, port)
     >> then([sched](session_id_t sid) {
-        return rpc::call<MyProtocol>(sched, sid, request_msg)
-            >> visit()
+        return rpc::call<service_type::my_service>(sched, sid, request_msg)
             >> then([](auto&& resp) { /* 处理响应 */ });
     })
 
@@ -190,15 +185,15 @@ scheduler::net::connect(sched, addr, port)
 scheduler::net::wait_connection(accept_sched)
     >> concurrent(1024)
     >> flat_map([](session_id_t sid) {
-        return rpc::serve<service_type>(sid);
+        return rpc::serve<service_type::service_001, service_type::service_002>(sid);
     })
     >> all()
 
 // 单向发送
-rpc::send<MyProtocol>(sched, sid, notification_msg)
+rpc::send<service_type::my_service>(sched, sid, notification_msg)
 
 // 接收消息并按类型分发
-rpc::recv<MyProtocol>(sched, sid)
+rpc::recv<service_type::my_service>(sched, sid)
     >> visit()
     >> then([](auto&& msg) {
         if constexpr (std::is_same_v<__typ__(msg), request_a>) {
@@ -227,7 +222,7 @@ rpc::recv<MyProtocol>(sched, sid)
 | 错误类别 | 示例 | 处理方式 |
 |----------|------|----------|
 | **传输错误** | 连接断开、发送失败 | 来自 net 层，直接传播为异常 |
-| **帧错误** | 帧格式不合法、帧过大 | 由分帧器检测，产生异常 |
+| **帧错误** | RPC 帧头字段不合法 | 由 RPC 层解析帧头时检测，产生异常 |
 | **编解码错误** | 反序列化失败、类型不匹配 | 由编解码器检测，产生异常 |
 | **协议错误** | 未知消息类型、版本不兼容 | 由协议特征检测，产生异常 |
 
@@ -288,7 +283,7 @@ RPC 层的抽象应能支持以下典型协议模式：
 - **NF-ORG-1**：RPC 层代码应放置在独立的命名空间（如 `pump::scheduler::rpc`）
 - **NF-ORG-2**：RPC 层的文件应独立于 net 层目录（如 `src/env/scheduler/rpc/`）
 - **NF-ORG-3**：协议特征的实现应与 RPC 核心分离
-- **NF-TEST-1**：RPC 层的分帧器、编解码器应可独立测试
+- **NF-TEST-1**：RPC 层的编解码器应可独立测试
 - **NF-TEST-2**：请求-响应关联机制应可独立测试
 - **NF-DOC-1**：提供协议特征的 concept 文档
 - **NF-DOC-2**：提供至少一个完整的协议实现示例
@@ -301,7 +296,7 @@ RPC 层的抽象应能支持以下典型协议模式：
 
 | 编号 | 需求 | 说明 |
 |------|------|------|
-| F-FRAME-1~5 | 消息分帧 | RPC 最基础的能力 |
+| F-FRAME-1~4 | 消息帧 | net 层分帧 + RPC 层帧内容解析 |
 | F-CODEC-1~4 | 编解码 | 消息结构化的基础 |
 | F-PROTO-1~4 | 协议特征 | 可扩展性的基石 |
 | F-SVC-1~5 | 服务注册与分发 | 服务端核心机制 |
