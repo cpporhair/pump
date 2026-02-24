@@ -260,6 +260,24 @@ namespace pump::scheduler::net::common {
         iovec* vec;
         size_t cnt;  // 2.2: unified to size_t
         std::move_only_function<void(bool)> cb;
+
+        // net layer auto-prepends uint16_t length prefix on send
+        uint16_t _frame_len = 0;
+        static constexpr size_t max_send_iov = 9; // 1 prefix + up to 8 data iovecs
+        iovec _send_vec[max_send_iov] = {};
+        size_t _send_cnt = 0;
+
+        void prepare_frame() {
+            size_t total = 0;
+            for (size_t i = 0; i < cnt; ++i)
+                total += vec[i].iov_len;
+            _frame_len = static_cast<uint16_t>(total + sizeof(uint16_t));
+            _send_vec[0] = {&_frame_len, sizeof(_frame_len)};
+            auto n = std::min(cnt, max_send_iov - 1);
+            for (size_t i = 0; i < n; ++i)
+                _send_vec[i + 1] = vec[i];
+            _send_cnt = n + 1;
+        }
     };
 
     struct
