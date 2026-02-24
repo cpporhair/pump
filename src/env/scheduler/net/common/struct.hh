@@ -38,6 +38,42 @@ namespace pump::scheduler::net::common {
         }
     };
 
+    struct
+    recv_frame {
+        char* _data;
+        size_t _len;
+
+        recv_frame() : _data(nullptr), _len(0) {}
+        recv_frame(char* data, size_t len) : _data(data), _len(len) {}
+
+        recv_frame(recv_frame&& rhs) noexcept : _data(rhs._data), _len(rhs._len) {
+            rhs._data = nullptr;
+            rhs._len = 0;
+        }
+
+        recv_frame& operator=(recv_frame&& rhs) noexcept {
+            if (this != &rhs) {
+                delete[] _data;
+                _data = rhs._data;
+                _len = rhs._len;
+                rhs._data = nullptr;
+                rhs._len = 0;
+            }
+            return *this;
+        }
+
+        recv_frame(const recv_frame&) = delete;
+        recv_frame& operator=(const recv_frame&) = delete;
+
+        ~recv_frame() { delete[] _data; }
+
+        [[nodiscard]] const char* data() const { return _data; }
+        [[nodiscard]] size_t size() const { return _len; }
+
+        template <typename T>
+        [[nodiscard]] const T* as() const { return reinterpret_cast<const T*>(_data); }
+    };
+
     // SPSC (Single-Producer Single-Consumer) ring buffer.
     // Producer: network IO write end (updates _tail)
     // Consumer: data processing/read end (updates _head)
@@ -215,7 +251,7 @@ namespace pump::scheduler::net::common {
     struct
     recv_req {
         session_id_t session_id;
-        std::move_only_function<void(std::variant<packet_buffer*, std::exception_ptr>)> cb;
+        std::move_only_function<void(std::variant<recv_frame, std::exception_ptr>)> cb;
     };
 
     struct

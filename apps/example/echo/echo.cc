@@ -29,29 +29,6 @@ using namespace pump::sender;
 
 using task_scheduler_t = scheduler::task::scheduler;
 
-struct
-pkt_iovec_ex {
-    scheduler::net::common::pkt_iovec pkt;
-    scheduler::net::common::packet_buffer* buf;
-    size_t forward_cnt;
-};
-
-auto
-read_packet_coro(scheduler::net::common::packet_buffer* buf) -> coro::return_yields<pkt_iovec_ex> {
-    bool run = true;
-    do {
-        if (auto pio = scheduler::net::common::detail::get_recv_pkt(buf); pio.cnt > 0) {
-            co_yield pkt_iovec_ex{pio, buf, pio.len()};
-            // forward_head 在 co_yield 恢复后调用：无 concurrent 时 send 已完成，数据安全
-            buf->forward_head(pio.len());
-        }
-        else {
-            run = false;
-        }
-    }
-    while (run);
-    co_return pkt_iovec_ex{};
-}
 
 template <typename session_scheduler_t>
 struct
@@ -106,19 +83,16 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                 >> flat_map([](const session_data<session_scheduler_t> &sd, ...) {
                     return scheduler::net::recv(sd.scheduler, sd.id);
                 })
-                >> then([](scheduler::net::common::packet_buffer *p) {
-                    return coro::make_view_able(read_packet_coro(p));
-                })
-                >> as_stream()
                 >> get_context<session_data<session_scheduler_t>>()
-                >> flat_map([](const session_data<session_scheduler_t> &sd, pkt_iovec_ex &&pkt_ex) {
-                    auto* vec_ptr = pkt_ex.pkt.vec;
-                    return scheduler::net::send(sd.scheduler, sd.id, pkt_ex.pkt.vec, pkt_ex.pkt.cnt)
-                        >> then([vec_ptr](bool) {
-                            delete[] vec_ptr;
+                >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::net::common::recv_frame &&frame) {
+                    auto* vec = new iovec{const_cast<char*>(frame.data()), frame.size()};
+                    auto frame_ptr = new scheduler::net::common::recv_frame(std::move(frame));
+                    return scheduler::net::send(sd.scheduler, sd.id, vec, 1)
+                        >> then([vec, frame_ptr](bool) {
+                            delete frame_ptr;
+                            delete vec;
                         });
                 })
-                >> count()
                 >> any_exception([](std::exception_ptr e) {
                     return just()
                         >> get_context<session_data<session_scheduler_t>>()
