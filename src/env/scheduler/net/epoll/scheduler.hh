@@ -233,7 +233,8 @@ namespace pump::scheduler::net::epoll {
             auto *s = static_cast<session_t*>(e->data.ptr);
             while (auto opt = send_cache(s)->send_q.try_dequeue()) {
                 auto *r = opt.value();
-                auto res = writev(s->fd, r->vec, r->cnt);
+                r->prepare_frame();
+                auto res = writev(s->fd, r->_send_vec, r->_send_cnt);
                 if (res < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         r->cb(false);

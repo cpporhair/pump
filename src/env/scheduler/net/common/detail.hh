@@ -126,9 +126,15 @@ namespace pump::scheduler::net::common::detail {
         const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
         if (len == 0xffff)
             return {};
-        auto frame = buf->handle_data(len, frame_copier);
+        if (buf->used() < len)
+            return {};
+        // skip the uint16_t length prefix — net layer handles framing,
+        // recv_frame contains only the application payload
+        buf->forward_head(sizeof(uint16_t));
+        auto payload_len = static_cast<size_t>(len) - sizeof(uint16_t);
+        auto frame = buf->handle_data(payload_len, frame_copier);
         if (frame.size() > 0)
-            buf->forward_head(len);
+            buf->forward_head(payload_len);
         return frame;
     }
 

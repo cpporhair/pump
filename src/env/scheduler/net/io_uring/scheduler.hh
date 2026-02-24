@@ -473,12 +473,13 @@ namespace pump::scheduler::net::io_uring {
         auto
         submit_write(::io_uring_sqe *sqe, common::send_req* req) {
             const auto s = req->session_id.decode<session_t>();
+            req->prepare_frame();
             auto *io_req = new io_uring_request;
             io_req->event_type = uring_event_type::write;
             io_req->user_data = req;
             ::io_uring_sqe_set_data(sqe, io_req);
             if (s) {
-                ::io_uring_prep_writev(sqe, s->fd, req->vec, req->cnt, 0);
+                ::io_uring_prep_writev(sqe, s->fd, req->_send_vec, req->_send_cnt, 0);
             } else {
                 // session decode 失败，提交 NOP 避免未定义行为
                 ::io_uring_prep_nop(sqe);
