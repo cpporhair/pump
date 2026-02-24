@@ -1,629 +1,461 @@
-# PUMP Net 客户端功能实现计划
+# PUMP RPC 层设计方案
 
-基于 `command.md` 需求文档，本计划详细描述客户端网络功能的实现步骤。
+> **文档目的**：记录 RPC 层的设计决策、实现方案和技术细节  
+> **配套文档**：`command.md`（需求文档，描述"做什么"）；本文档描述"怎么做"  
+> **前置依赖**：net 模块已实现底层网络收发（conn/connect/recv/send/join/stop）
 
 ---
 
-## 一、新增 `connect_req` 结构体
+## 一、设计决策记录
 
-**文件**：`src/env/scheduler/net/common/struct.hh`
+以下决策已在需求讨论中确认，作为实现的约束条件：
 
-**位置**：在 `conn_req` 结构体之后（约第 206 行后）新增
+| 编号 | 决策项 | 决策结果 | 影响范围 |
+|------|--------|----------|----------|
+| D-1 | request_id 类型 | `uint32_t`，session 内自增 | F-CORR-1, F-CORR-5 |
+| D-2 | 超时机制 | 本版不在 RPC 层实现 | F-CORR-3 降为 P2 |
+| D-3 | 背压/限流 | 本版不实现，由 `concurrent(max)` 在管道层控制 | 无需额外需求 |
+| D-4 | 连接级握手 | 协议层通过注册和实现"握手"RPC 命令自行处理 | F-EXT-4 降为 P2 |
+| D-5 | 消息大小限制 | 本版不实现 | 无需额外需求 |
+| D-6 | RESP 按序响应 | 不为 RESP 破坏 RPC 层的 request_id 设计；RESP 将来可直接架构在 Net 层上 | RPC 层只需支持基于 request_id 的乱序响应匹配 |
+| D-7 | pending_requests 容量 | 默认 256，可通过 session 初始化时配置调整 | session_rpc_state 初始化 |
+| D-8 | 多帧推送策略 | 本版单次推送（每帧一次 push），不做批量推送 | P-THR-3 降为 P2 |
+| D-9 | session RPC 状态存储 | RPC 层维护独立的 `session_id → rpc_state` 映射，通过 `get_or_bind` 首次访问时自动创建（lazy bind） | 符合 F-INT-1 |
+| D-10 | 编码内存管理 | 栈/预分配固定缓冲（`std::array<iovec, 8>`），编码器将 iovec 写入 RPC 层预分配的固定大小缓冲区 | P-MEM-2, P-THR-2, F-CODEC-4 |
+| D-11 | `rpc::recv` 消息类型 | 返回扁平化的 `std::variant<具体消息类型...>`，下游通过 PUMP 的 `visit()` 算子解包后用 `if constexpr` 分支处理。不使用嵌套 variant | F-API-3 |
+| D-12 | handler 返回值 | 每个命令的 handler 函数统一返回 sender（如 `just(result)`），保持 pump 管道风格一致性 | 使用示例 |
+| D-13 | 连接池、调度、路由均为上层职责 | RPC 层不引入 dispatcher、connection_pool、模块路由。RPC 层只关心「用哪个 session 完成一次 RPC 调用」 | 1.1 职责边界 |
+| D-14 | module_id | `uint16_t` 类型，每个协议特征必须声明，嵌入 RPC 统一帧头。RPC 层只负责将其写入帧头，路由逻辑由上层实现 | 帧头设计 |
+| D-15 | handler 响应发送语义 | `rpc::serve` 在调用 handler 后自动将返回值编码并通过同一 session 发回。handler 只需返回响应消息（sender），不需感知连接 ID | serve 语义 |
+| D-16 | net 层 recv 机制重构 | net 层已从「暴露 `packet_buffer*` 指针 + atomic 单槽位」改为「copy-out 独立帧 `recv_frame` + 多 recv 队列」模式。`recv_cache` 从单槽位改为 `recv_q` + `ready_q`；`on_read_event` 在数据到达时自动分帧并 copy-out | F-INT-1, F-FRAME-5, F-CODEC-5 |
 
-**内容**：
+---
+
+## 二、协议特征（Protocol Trait）设计
+
+上层协议通过满足以下 concept 接入 RPC 层：
+
 ```cpp
-struct connect_req {
-    const char* address;       // 目标地址（如 "127.0.0.1"）
-    uint16_t port;             // 目标端口
-    std::move_only_function<void(session_id_t)> cb;  // 连接完成回调
+struct frame_result {
+    enum status { complete, incomplete, error };
+    status st;
+    size_t frame_offset;
+    size_t frame_length;
+};
+
+enum class message_kind {
+    request,
+    response,
+    push
+};
+
+template <typename P>
+concept Protocol = requires {
+    // 模块标识（D-14）
+    { P::MODULE_ID } -> std::convertible_to<uint16_t>;
+
+    // 扁平化的消息 variant 类型（D-11）
+    typename P::message_type;
+
+    // 分帧：给定 packet_buffer，判断是否包含完整帧
+    { P::try_parse_frame(std::declval<const packet_buffer&>()) }
+        -> std::same_as<frame_result>;
+
+    // 解码：将 copy-out 后的独立帧反序列化为 message_type
+    { P::decode(std::declval<const recv_frame&>()) }
+        -> std::same_as<typename P::message_type>;
+
+    // 编码：将消息序列化为 iovec 数组（D-10）
+    // 每种消息类型提供独立重载
+
+    // 从消息中提取 request_id（D-1）
+    { P::get_request_id(std::declval<const typename P::message_type&>()) }
+        -> std::same_as<uint32_t>;
+
+    // 判断消息类别
+    { P::classify(std::declval<const recv_frame&>()) }
+        -> std::same_as<message_kind>;
 };
 ```
 
-**设计要点**：
-- 回调签名 `void(session_id_t)` 与 `conn_req` 完全一致，确保下游管道统一处理服务端/客户端连接
-- 连接失败时回调空 `session_id_t{}`（与 `accept_scheduler` 的错误处理方式一致）
-- `address` 和 `port` 作为请求参数传入，而非在 scheduler init 时固定（客户端可能连接不同目标）
+### 2.1 协议特征实现示例
+
+```cpp
+struct MyProtocol {
+    static constexpr uint16_t MODULE_ID = 0x0001;
+    using message_type = std::variant<request_a, request_b, response_a, response_b>;
+
+    static frame_result try_parse_frame(const packet_buffer& buf) {
+        constexpr size_t HEADER_SIZE = sizeof(my_header);
+        if (buf.used() < HEADER_SIZE)
+            return { .st = incomplete };
+        uint32_t total_len = buf.handle_data(sizeof(uint32_t),
+            [](const char* d, size_t) { return read_u32(d); });
+        if (buf.used() < total_len)
+            return { .st = incomplete };
+        return { .st = complete, .frame_offset = buf.head(), .frame_length = total_len };
+    }
+
+    static message_type decode(const recv_frame& frame) {
+        auto* hdr = frame.as<my_header>();
+        switch (hdr->msg_type) {
+            case 0x01: return *frame.as<request_a>();
+            case 0x02: return *frame.as<request_b>();
+            case 0x03: return *frame.as<response_a>();
+            case 0x04: return *frame.as<response_b>();
+            default:   throw rpc::protocol_error("unknown msg_type");
+        }
+    }
+
+    static size_t encode(const request_a& msg, std::array<iovec, 8>& buf) {
+        return do_encode(msg, buf);
+    }
+    // ... 其他消息类型的 encode 重载
+
+    static uint32_t get_request_id(const message_type& msg) {
+        return std::visit([](const auto& m) { return m.request_id; }, msg);
+    }
+
+    static message_kind classify(const recv_frame& frame) {
+        auto* hdr = frame.as<my_header>();
+        return (hdr->msg_type <= 0x02) ? message_kind::request : message_kind::response;
+    }
+};
+```
 
 ---
 
-## 二、新增 `connect` sender
+## 三、RPC 统一帧头设计
 
-**新建文件**：`src/env/scheduler/net/senders/connect.hh`
+```
+┌──────────────────────────────────────────┐
+│ total_len (4B)     ← 帧总长度（含帧头）    │
+│ request_id (4B)    ← 关联请求和响应（D-1） │
+│ module_id (2B)     ← 模块标识（D-14）        │
+│ msg_type (1B)      ← 模块内的消息类型       │
+│ flags (1B)         ← request/response/push │
+│ payload ...                               │
+└──────────────────────────────────────────┘
+```
 
-完全对称于 `senders/conn.hh` 的结构，包含四部分：
+- `module_id`：由 `Protocol::MODULE_ID` 决定，RPC 层将其写入帧头，上层据此实现消息路由
+- 帧头格式为 RPC 层统一定义，协议特征的 `try_parse_frame` 在帧头之后处理协议特定部分
 
-### 2.1 `op` 结构体
+---
+
+## 四、分帧器工作流程
+
+net 层的 `on_read_event` 在数据到达时自动完成分帧和 copy-out：
+
+```
+io_uring/epoll 事件循环:
+  数据到达 → buf.forward_tail(res)
+  → 循环:
+      copy_out_frame(&buf)
+      if frame.size() > 0:
+          if recv_q 有等待的回调 → 触发回调，传递 recv_frame
+          else → 暂存到 ready_q
+          buf.forward_head(frame_length)
+          继续循环（处理粘包）
+      if frame.size() == 0:
+          break  // 不完整帧，等待更多数据
+```
+
+RPC 层在 net 层之上完成协议级别的解码：
+
+```
+net::recv(sid)
+  → recv_frame&&
+  → Protocol::decode(frame)  // struct overlay 解码
+  → 推送给下游
+```
+
+---
+
+## 五、Sender API 签名设计
 
 ```cpp
-namespace pump::scheduler::net::senders::connect {
-    template <typename scheduler_t>
-    struct op {
-        using request_t = common::connect_req;
-        constexpr static bool net_sender_connect_op = true;  // 类型标记
-        scheduler_t* scheduler;
-        const char* address;
-        uint16_t port;
+namespace pump::scheduler::rpc {
 
-        op(scheduler_t* s, const char* addr, uint16_t p)
-            : scheduler(s), address(addr), port(p) {}
+    // --- rpc::call ---
+    template <Protocol P, typename scheduler_t>
+    auto call(scheduler_t* sche, session_id_t sid, typename P::request_type req);
+    // 返回 sender，完成值类型为 P::response_type
 
-        op(op&& rhs) noexcept
-            : scheduler(rhs.scheduler), address(rhs.address), port(rhs.port) {}
+    template <Protocol P>
+    auto call(session_id_t sid, typename P::request_type req);  // flat_map 版本
 
-        template<uint32_t pos, typename context_t, typename scope_t>
-        auto start(context_t &context, scope_t &scope) {
-            return scheduler->schedule(
-                new common::connect_req{
-                    address, port,
-                    [context = context, scope = scope](common::session_id_t sid) mutable {
-                        core::op_pusher<pos + 1, scope_t>::push_value(context, scope, sid);
-                    }
+    // --- rpc::send ---
+    template <Protocol P, typename scheduler_t>
+    auto send(scheduler_t* sche, session_id_t sid, auto&& msg);
+
+    template <Protocol P>
+    auto send(session_id_t sid, auto&& msg);
+
+    // --- rpc::recv ---
+    template <Protocol P, typename scheduler_t>
+    auto recv(scheduler_t* sche, session_id_t sid);
+    // 返回 sender，完成值类型为 P::message_type（扁平 variant）
+
+    template <Protocol P>
+    auto recv(session_id_t sid);
+
+    // --- rpc::serve ---
+    template <typename scheduler_t, typename... Services>
+    auto serve(scheduler_t* sche, session_id_t sid);
+
+    template <typename... Services>
+    auto serve(session_id_t sid);
+}
+```
+
+---
+
+## 六、会话 RPC 状态设计
+
+每个绑定了协议特征的 session 维护以下状态（D-9）：
+
+```cpp
+template <Protocol P>
+struct session_rpc_state {
+    uint32_t next_request_id = 0;                                    // D-1
+    pending_requests_map<uint32_t, completion_callback> pending{256}; // D-7
+    // 分帧器状态无需额外缓存：net 层 packet_buffer 天然支持部分帧保留
+};
+
+// D-9: RPC 层独立维护 session_id → rpc_state 映射
+template <Protocol P>
+struct rpc_state_registry {
+    std::unordered_map<session_id_t, session_rpc_state<P>> states;
+
+    auto& get_or_bind(session_id_t sid) {
+        auto it = states.find(sid);
+        if (it != states.end()) return it->second;
+        return states.emplace(sid, session_rpc_state<P>{}).first->second;
+    }
+
+    void unbind(session_id_t sid) { states.erase(sid); }
+};
+```
+
+**绑定时机**：`rpc::call` / `rpc::serve` / `rpc::recv` 内部首次对某个 session 进行 RPC 操作时，通过 `get_or_bind(sid)` 自动创建状态（lazy init）。
+
+---
+
+## 七、`rpc::call` 内部机制
+
+### 7.1 核心流程
+
+```
+rpc::call<P>(sched, sid, req) 内部：
+  1. auto& state = registry.get_or_bind(sid)    // lazy bind（D-9）
+  2. auto rid = state.next_request_id++          // 分配 request_id（D-1）
+  3. P::encode(req, iov_buf)                     // 编码为 iovec（D-10）
+  4. net::send(sched, sid, vec, cnt)             // 发送
+  5. pending_map[rid] = continuation             // 注册等待回调
+  6. net::recv(sched, sid)                       // 注册 recv
+  7. recv 回调收到 recv_frame：
+     → P::classify(frame) → P::get_request_id(P::decode(frame))
+     → 在 pending_map 中查找对应的 callback → 触发
+```
+
+### 7.2 多 call 并发的响应分发
+
+每个 `rpc::call` 各自注册一个 recv，但 recv 回调拿到的帧可能不属于自己（TCP 字节流中响应乱序到达）。recv 回调通过 `pending_requests_map` 查找真正的等待者：
+
+```cpp
+auto recv_callback = [&state, my_rid](recv_frame&& frame) {
+    auto msg = P::decode(frame);
+    auto rid = P::get_request_id(msg);
+    if (rid == my_rid) {
+        return just(std::move(msg));       // 恰好是自己的响应
+    } else {
+        if (auto cb = state.pending.extract(rid))
+            cb(std::move(msg));            // 转交给真正的等待者
+        return net::recv(sched, sid) >> then(/* 继续等待 */);
+    }
+};
+```
+
+### 7.3 跨线程安全
+
+| 资源 | 写入者 | 读取者 | 安全保证 |
+|------|--------|--------|----------|
+| `send_q` (lock_free_queue) | 任意线程（多生产者） | scheduler 线程（单消费者） | MPSC 无锁队列 |
+| `recv_q` (spsc::queue) | scheduler 线程 | scheduler 线程 | 单线程不变量 |
+| `pending_requests_map` | scheduler 线程 | scheduler 线程 | 单线程不变量 |
+| `next_request_id` | scheduler 线程 | scheduler 线程 | 单线程不变量 |
+
+### 7.4 与 on_data 方案的对比
+
+选择了「每个 call 各自注册 recv」而非「on_data 持久化回调」方案：
+
+| 方面 | on_data 方案 | 多 recv 方案（采用） |
+|------|-------------|---------------------|
+| 新增概念 | 需要在 net 层加 `on_data` | 不需要，复用现有 recv |
+| net 层改动 | 改 `recv_cache` + `on_read_event` | 只需 recv 从单槽位变队列（D-16 已完成） |
+| 侵入性 | 需要 `bind` 设置 on_data | 不需要额外 bind |
+| 生命周期 | on_data 引用 rpc_state | recv 回调随 call 自然创建销毁 |
+| 符合 sender 模型 | on_data 是命令式回调 | recv 本身就是 sender |
+
+---
+
+## 八、编码与 Net 层对齐
+
+- 编码输出为 `iovec*` + `size_t cnt`，与 `net::send(sid, vec, cnt)` 签名直接匹配
+- 编码器负责在 `iovec` 中包含帧头，确保接收端分帧器能识别
+- 解码器输入为 `recv_frame`（独立线性 buffer），通过 `frame.as<T>()` struct overlay 零开销解码
+- **D-10: 编码内存管理**：
+  - RPC 层在 send 路径上持有 `std::array<iovec, 8>` 固定缓冲
+  - 编码器签名接收缓冲区引用，写入 iovec 段，返回实际段数
+  - 超过 8 段时 throw 异常
+  - 缓冲区生命周期与 send op 绑定
+
+---
+
+## 九、服务注册与分发设计
+
+> 参考 rpc.md 中的设计思路，服务端通过模板特化实现服务注册，RPC 层提供编译期分发机制。
+
+### 9.1 服务注册
+
+```cpp
+// 由 RPC 层提供：服务类型枚举（应用层增加新的 service_type 值）
+enum class service_type {
+    service_001,
+    service_002,
+    service_003,
+    max_service
+};
+
+// 由 RPC 层提供：service 基模板
+template<service_type sid>
+struct service {
+    static constexpr bool is_service = false;
+};
+
+// 由 RPC 层提供：handle 能力检测
+template<typename T, typename Req>
+concept has_handle_concept = requires(Req &&r) {
+    T::handle(std::forward<Req>(r));
+};
+```
+
+### 9.2 应用层实现服务
+
+应用层通过模板特化定义具体服务，每个服务可有多个 `handle` 重载处理不同请求类型：
+
+```cpp
+// 应用层 A 实现 service_001
+template <>
+struct service<service_type::service_001> {
+    struct add_req { int a; int b; };
+    struct sleep_and_add_req { int a; int b; int sleep_ms; };
+
+    static constexpr bool is_service = true;
+
+    static auto handle(add_req&& req) {
+        return just(req.a + req.b);
+    }
+
+    static auto handle(sleep_and_add_req&& req) {
+        return just()
+            >> then([req = __fwd__(req)]() {
+                return ... /*异步操作的pipeline*/;
+            })
+            >> flat();
+    }
+};
+
+// 应用层 B 实现 service_002
+template <>
+struct service<service_type::service_002> {
+    struct sub_req { int a; int b; };
+    static constexpr bool is_service = true;
+
+    static auto handle(sub_req&& req) {
+        return just(req.a - req.b);
+    }
+};
+```
+
+### 9.3 服务端分发机制
+
+```cpp
+template<service_type ...service_ids>
+auto get_service_class_by_id(service_type sid) {
+    using res_t = std::variant<service<service_ids>...>;
+    std::optional<res_t> result;
+    (void)((sid == service_ids && (result.emplace(service<service_ids>{}), true)) || ...);
+    if (result) return result.value();
+    throw std::logic_error("unknown service type");
+}
+
+template<service_type ...service_ids>
+auto dispatch() {
+    return flat_map([](uint16_t service_id, auto &&msg) {
+        return just()
+            >> visit(get_service_class_by_id<service_ids...>(
+                   static_cast<service_type>(service_id)))
+            >> flat_map([req = __fwd__(msg)](auto &&result) mutable {
+                if constexpr (std::decay_t<decltype(result)>::is_service) {
+                    if constexpr (has_handle_concept<
+                            std::decay_t<decltype(result)>, decltype(req)>)
+                        return std::decay_t<decltype(result)>::handle(__mov__(req));
+                    else
+                        return just_exception(
+                            std::logic_error("unknown request type"));
+                } else {
+                    return just_exception(
+                        std::logic_error("unknown service type"));
                 }
-            );
-        }
-    };
-}
-```
-
-**对比 `conn::op`**：
-- 额外持有 `address` 和 `port` 字段（conn::op 不需要，因为 accept 是被动的）
-- 使用 `connect_req` 替代 `conn_req`
-- 类型标记为 `net_sender_connect_op`（conn::op 为 `net_sender_conn_op`）
-
-### 2.2 `sender` 结构体
-
-```cpp
-namespace pump::scheduler::net::senders::connect {
-    template<typename scheduler_t>
-    struct sender {
-        scheduler_t* scheduler;
-        const char* address;
-        uint16_t port;
-
-        sender(scheduler_t* s, const char* addr, uint16_t p)
-            : scheduler(s), address(addr), port(p) {}
-
-        sender(sender &&rhs) noexcept
-            : scheduler(rhs.scheduler), address(rhs.address), port(rhs.port) {}
-
-        auto make_op() {
-            return op<scheduler_t>(scheduler, address, port);
-        }
-
-        template<typename context_t>
-        auto connect() {
-            return core::builder::op_list_builder<0>().push_back(make_op());
-        }
-    };
-}
-```
-
-### 2.3 `op_pusher` 特化
-
-```cpp
-namespace pump::core {
-    template<uint32_t pos, typename scope_t>
-    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-    && (get_current_op_type_t<pos, scope_t>::net_sender_connect_op)
-    struct op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
-        template<typename context_t>
-        static void push_value(context_t &context, scope_t &scope) {
-            std::get<pos>(scope->get_op_tuple()).template start<pos>(context, scope);
-        }
-    };
-}
-```
-
-- 与 `conn.hh` 中的 `op_pusher` 特化结构完全一致
-- 通过 `net_sender_connect_op` 约束匹配
-
-### 2.4 `compute_sender_type` 特化
-
-```cpp
-namespace pump::core {
-    template <typename context_t, typename scheduler_t>
-    struct compute_sender_type<context_t, scheduler::net::senders::connect::sender<scheduler_t>> {
-        consteval static uint32_t count_value() { return 1; }
-        consteval static auto get_value_type_identity() {
-            return std::type_identity<scheduler::net::common::session_id_t>{};
-        }
-    };
-}
-```
-
-- 返回类型为 `session_id_t`，与 `conn` sender 完全一致
-- 确保下游管道可以无差异对待服务端和客户端连接
-
----
-
-## 三、更新 `net.hh` API 层
-
-**文件**：`src/env/scheduler/net/net.hh`
-
-### 3.1 新增 include
-
-在现有 include 区域（约第 9-13 行）添加：
-```cpp
-#include "./senders/connect.hh"
-```
-
-### 3.2 新增 `connect()` API 函数
-
-在 `namespace pump::scheduler::net` 中添加两个重载：
-
-```cpp
-// 显式 scheduler 版本
-template <typename scheduler_t>
-inline auto
-connect(scheduler_t* sche, const char* address, uint16_t port) {
-    return senders::connect::sender<scheduler_t>(sche, address, port);
-}
-
-// flat_map 版本（从上下文获取 scheduler）
-inline auto
-connect(const char* address, uint16_t port) {
-    return pump::sender::flat_map([address, port]<typename scheduler_t>(scheduler_t* sche) {
-        return connect(sche, address, port);
+            });
     });
 }
 ```
 
-**放置位置**：建议在 `wait_connection()` 之后、`join()` 之前，保持"连接建立 → 会话管理"的逻辑顺序。
-
----
-
-## 四、实现 epoll 后端 `connect_scheduler`
-
-**新建文件**：`src/env/scheduler/net/epoll/connect_scheduler.hh`
-
-独立文件，避免膨胀现有 `scheduler.hh`。
-
-### 4.1 类定义
+### 9.4 服务端会话处理
 
 ```cpp
-namespace pump::scheduler::net::epoll {
-    template <template<typename> class conn_op_t>
-    struct connect_scheduler {
-        friend struct conn_op_t<connect_scheduler>;
-    };
+template<service_type ...service_ids>
+auto dispatch_proc(session_data& sd) {
+    return for_each(coro::make_view_able(check_session(sd)))
+        >> flat_map([&sd](auto&& is_running) {
+            return scheduler::net::recv(sd.scheduler, sd.id);
+        })
+        >> decode_msg(...)
+        >> dispatch<service_ids...>()
+        >> then([](auto&& response) {
+            return scheduler::net::send(sd.scheduler, sd.id, ... /*response*/);
+        })
+        >> reduce();
 }
-```
 
-- 模板签名与 `accept_scheduler` 完全一致：`template <template<typename> class conn_op_t>`
-- 便于泛型代码统一处理
-
-### 4.2 核心成员
-
-| 成员 | 类型 | 说明 | 对比 accept_scheduler |
-|------|------|------|----------------------|
-| `conn_request_q` | `mpsc::queue<connect_req*, 2048>` | 连接请求队列 | 类型从 `conn_req*` 变为 `connect_req*` |
-| `session_q` | `mpmc::queue<session_id_t, 2048>` | 已建立连接的会话队列 | 完全相同 |
-| `poller` | `detail::poller_epoll` | epoll 实例 | 完全相同 |
-| `_recv_buffer_size` | `size_t` | 接收缓冲区大小 | 完全相同 |
-| `_shutdown` | `atomic<bool>` | 关闭标志 | 完全相同 |
-| `pending_connects` | `std::list<pending_connect_info>` | 正在进行中的连接信息 | **新增**，跟踪 EINPROGRESS 状态的 fd |
-
-**新增辅助结构**（类内私有）：
-```cpp
-struct pending_connect_info {
-    int fd;
-    common::connect_req* req;  // 保留原始请求，用于连接完成后回调或失败处理
-};
-```
-
-### 4.3 核心方法实现
-
-#### `init(const scheduler_config& cfg)` / `init()`
-- **不需要** bind/listen（与 accept_scheduler 的核心差异）
-- 只初始化 epoll poller 和 `_recv_buffer_size`
-- 返回 0 表示成功
-
-```cpp
-int init(const common::scheduler_config& cfg) {
-    _recv_buffer_size = cfg.recv_buffer_size;
-    return 0;  // 无需 bind/listen
-}
-```
-
-#### `schedule(connect_req* req)`
-- 与 accept_scheduler 的 `schedule(conn_req*)` 模式对称
-- 先检查 session_q 是否有已完成的连接；若有直接回调
-- 否则发起新的非阻塞 connect
-
-```cpp
-auto schedule(common::connect_req* req) {
-    if (auto opt = session_q.try_dequeue(); opt) {
-        req->cb(opt.value());
-        delete req;
-    } else {
-        initiate_connect(req);
-    }
-}
-```
-
-#### `initiate_connect(connect_req* req)` — **新增方法**
-- 创建非阻塞 socket：`socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)`
-- 构造 `sockaddr_in`，调用 `::connect(fd, ...)`
-- 如果 `connect` 返回 0（立即成功，极少见）：直接 `create_internal_session(fd)`，回调 `req->cb(sid)`
-- 如果 `connect` 返回 -1 且 `errno == EINPROGRESS`（正常的非阻塞连接）：
-  - 注册 `EPOLLOUT` 到 poller，监听可写事件
-  - 将 `{fd, req}` 存入 `pending_connects` 列表
-- 如果其他错误：回调 `req->cb(session_id_t{})`，关闭 fd，`delete req`
-
-#### `handle_connect_completion(epoll_event* e)` — **新增方法**
-- 从 `pending_connects` 中找到对应 fd 的条目
-- 调用 `getsockopt(fd, SOL_SOCKET, SO_ERROR, ...)` 检查连接结果
-- 如果 `so_error == 0`（连接成功）：
-  - 从 poller 移除该 fd 的 EPOLLOUT 监听
-  - `create_internal_session(fd)` 创建 session
-  - 回调 `req->cb(sid)`
-- 如果 `so_error != 0`（连接失败）：
-  - 回调 `req->cb(session_id_t{})`
-  - 关闭 fd
-- 从 `pending_connects` 中移除该条目
-- `delete req`
-
-#### `create_internal_session(int fd)`
-- 与 `accept_scheduler::create_internal_session` **完全相同**的逻辑
-- 设置 O_NONBLOCK（如果尚未设置）
-- 创建 `session_t` + `recv_cache` + `epoll_send_cache`
-- 编码为 `session_id_t`
-- 尝试匹配等待中的 conn_request_q 请求，否则放入 session_q
-
-```cpp
-auto create_internal_session(int fd) {
-    const int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    auto* s = new session_t(fd, new common::detail::recv_cache(_recv_buffer_size), new epoll_send_cache());
-    auto sid = common::session_id_t::encode(s);
-    if (const auto opt = conn_request_q.try_dequeue(); opt) {
-        opt.value()->cb(sid);
-        delete opt.value();
-    } else {
-        session_q.try_enqueue(sid);
-    }
-}
-```
-
-注意：这里 `conn_request_q` 的类型是 `mpsc::queue<connect_req*, 2048>`，需要相应调整回调调用方式（`opt.value()->cb(sid)` 中 `cb` 字段名相同）。
-
-#### `advance()`
-- 事件循环推进，与 accept_scheduler 类似
-- `epoll_wait` 检测事件
-- 对于收到的 `EPOLLOUT` 事件调用 `handle_connect_completion`
-- 检查 `_shutdown` 标志
-
-```cpp
-auto advance() {
-    if (_shutdown.load(std::memory_order_relaxed)) {
-        drain_on_shutdown();
-        return false;
-    }
-    poller.poll([this](epoll_event* e) {
-        handle_connect_completion(e);
-    });
-    return true;
-}
-```
-
-#### `shutdown()` / `drain_on_shutdown()`
-- 与 accept_scheduler 对称
-- `shutdown()` 设置 `_shutdown = true`
-- `drain_on_shutdown()` 清理 `conn_request_q` 中的待处理请求（回调空 session_id_t）
-- 关闭所有 `pending_connects` 中的 fd
-
-#### `advance(const runtime_t&)` 模板重载
-- 与 accept_scheduler 一致，简单委托到 `advance()`
-
-### 4.4 需要引入的头文件
-
-```cpp
-#include <list>
-#include <bits/move_only_function.h>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <sys/uio.h>
-#include <arpa/inet.h>
-#include <cerrno>
-
-#include "pump/core/op_pusher.hh"
-#include "pump/core/compute_sender_type.hh"
-#include "pump/core/lock_free_queue.hh"
-
-#include "../common/struct.hh"
-#include "../common/detail.hh"
-#include "../common/error.hh"
-#include "./epoll.hh"
-```
-
----
-
-## 五、实现 io_uring 后端 `connect_scheduler`
-
-**新建文件**：`src/env/scheduler/net/io_uring/connect_scheduler.hh`
-
-### 5.1 与 epoll 后端的核心差异
-
-| 方面 | epoll 后端 | io_uring 后端 |
-|------|-----------|--------------|
-| connect 提交 | `::connect()` + `EPOLLOUT` 监听 | `io_uring_prep_connect(sqe, ...)` |
-| 完成通知 | `epoll_wait` + `getsockopt(SO_ERROR)` | CQE `res == 0` 表示成功 |
-| 事件类型 | 无（用 fd 匹配） | 需新增 `uring_event_type::CONNECT` |
-
-### 5.2 新增事件类型
-
-在 `io_uring/scheduler.hh` 的 `uring_event_type` 枚举中新增：
-
-```cpp
-enum uring_event_type {
-    READ = 0,
-    WRITE = 1,
-    ACCEPT = 2,
-    CONNECT = 3    // 新增
-};
-```
-
-或者在新文件中定义独立的事件类型，避免修改现有枚举。推荐直接在现有枚举中添加，因为 `process_cqe` 等逻辑需要统一处理。
-
-### 5.3 类定义与成员
-
-```cpp
-namespace pump::scheduler::net::io_uring {
-    template <template<typename> class conn_op_t>
-    struct connect_scheduler {
-        friend struct conn_op_t<connect_scheduler>;
-    private:
-        core::mpsc::queue<common::connect_req*, 2048> conn_request_q;
-        core::mpmc::queue<common::session_id_t, 2048> session_q;
-        struct io_uring ring;
-        size_t _recv_buffer_size = 4096;
-        std::atomic<bool> _shutdown{false};
-
-        // 跟踪进行中的连接
-        struct pending_connect_info {
-            int fd;
-            sockaddr_in addr;           // 保存地址信息（io_uring_prep_connect 需要地址在提交期间有效）
-            io_uring_request uring_req;  // 关联的 io_uring 请求
-        };
-    };
-}
-```
-
-### 5.4 核心方法实现
-
-#### `init(const scheduler_config& cfg)` / `init(unsigned queue_depth)`
-- 初始化 `io_uring ring`：`io_uring_queue_init(queue_depth, &ring, 0)`
-- 设置 `_recv_buffer_size`
-- **不需要** bind/listen
-
-#### `schedule(connect_req* req)`
-- 与 epoll 版本相同的请求匹配逻辑
-
-#### `initiate_connect(connect_req* req)`
-- 创建非阻塞 socket
-- 分配 `pending_connect_info`，填充 `sockaddr_in`
-- 获取 sqe：`io_uring_get_sqe(&ring)`
-- 提交异步连接：`io_uring_prep_connect(sqe, fd, addr, addrlen)`
-- 设置 user_data：`io_uring_sqe_set_data(sqe, &pending.uring_req)`，其中 `uring_req.type = CONNECT`
-- `io_uring_submit(&ring)`
-
-#### `handle_io_uring()`
-- 类似 accept_scheduler 的 `handle_io_uring()`
-- 遍历 CQE
-- 对于 `CONNECT` 类型的 CQE：
-  - `cqe->res == 0`：连接成功，`create_internal_session(fd)`
-  - `cqe->res < 0`：连接失败，回调 `req->cb(session_id_t{})`
-- `io_uring_cqe_seen(&ring, cqe)`
-
-#### `create_internal_session(int fd)`
-- 与 epoll 版本完全相同
-- 注意：io_uring 版本中 session_t 的构造可能略有不同（无 epoll_send_cache），需参考 io_uring accept_scheduler 的实现
-
-#### `advance()` / `shutdown()` / `drain_on_shutdown()`
-- 与 epoll 版本对称，事件驱动方式改为 io_uring
-
-### 5.5 需要引入的头文件
-
-```cpp
-#include <cstdint>
-#include <list>
-#include <bits/move_only_function.h>
-#include <liburing.h>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <arpa/inet.h>
-
-#include "pump/core/op_pusher.hh"
-#include "pump/core/compute_sender_type.hh"
-#include "pump/core/lock_free_queue.hh"
-
-#include "../common/struct.hh"
-#include "../common/detail.hh"
-#include "../common/error.hh"
-```
-
----
-
-## 六、编写 echo 客户端示例
-
-**新建目录**：`apps/example/echo_client/`
-
-**新建文件**：`apps/example/echo_client/echo_client.cc`
-
-### 6.1 runtime 类型定义
-
-```cpp
-// io_uring 后端
-using connect_scheduler_t = scheduler::net::io_uring::connect_scheduler<scheduler::net::senders::conn::op>;
-using session_scheduler_t = scheduler::net::io_uring::session_scheduler<
-    scheduler::net::senders::join::op,
-    scheduler::net::senders::recv::op,
-    scheduler::net::senders::send::op,
-    scheduler::net::senders::stop::op>;
-using task_scheduler_t = scheduler::task::task_scheduler<>;
-using runtime_schedulers = env::runtime::runtime_schedulers<
-    task_scheduler_t, connect_scheduler_t, session_scheduler_t>;
-```
-
-注意：`conn_op_t` 模板参数复用 `senders::conn::op`（与 command.md 2.3 节一致）。
-
-### 6.2 create_runtime_schedulers
-
-```cpp
-auto create_client_runtime_schedulers() {
-    auto* rs = new runtime_schedulers();
-    auto cfg = scheduler::net::common::scheduler_config{};
-
-    // Core 0: task + connect + session
-    auto* task_sched_0 = new task_scheduler_t();
-    auto* connect_sched = new connect_scheduler_t();
-    connect_sched->init(cfg);  // 不需要 address/port
-    auto* session_sched_0 = new session_scheduler_t();
-    session_sched_0->init(cfg);
-    rs->add_core_schedulers(task_sched_0, connect_sched, session_sched_0);
-
-    // Core 1..N-1: task + nullptr + session
-    auto num_cores = std::thread::hardware_concurrency();
-    for (unsigned i = 1; i < num_cores; ++i) {
-        auto* task_sched = new task_scheduler_t();
-        auto* session_sched = new session_scheduler_t();
-        session_sched->init(cfg);
-        rs->add_core_schedulers(task_sched, nullptr, session_sched);
-    }
-
-    return rs;
-}
-```
-
-### 6.3 客户端会话处理管道
-
-```cpp
-auto client_session_proc(runtime_schedulers* rs, session_id_t sid) {
-    auto session_count = rs->get_schedulers<session_scheduler_t>().size();
-    auto core_idx = sid.raw() % session_count;
-    auto* session_sched = rs->get_schedulers<session_scheduler_t>()[core_idx];
-
+template<service_type ...service_ids>
+auto serv(session_scheduler_t* sc, scheduler::net::common::session_id_t id) {
     return scheduler::net::join(session_sched, sid)
-        >> scheduler::net::send(session_sched, sid, /* 发送数据 */)
-        >> scheduler::net::recv(session_sched, sid)
-        >> then([](auto* buf) {
-            // 处理服务端回显数据
-        })
-        >> scheduler::net::stop(session_sched, sid);
+        >> dispatch_proc<service_ids...>(session_data<session_scheduler_t>(sc, id));
 }
 ```
 
-### 6.4 main 函数结构
+### 9.5 客户端调用
 
 ```cpp
-int main() {
-    just()
-        >> get_context<runtime_schedulers*>()
-        >> then([](runtime_schedulers* rs) {
-            auto* connect_sched = rs->get_schedulers<connect_scheduler_t>()[0];
-            scheduler::net::connect(connect_sched, "127.0.0.1", 8080)
-                >> then([rs](session_id_t sid) {
-                    client_session_proc(rs, sid)
-                        >> submit(core::make_root_context());
-                })
-                >> submit(core::make_root_context(rs));
+// rpc::call — 发送请求并等待响应
+template<service_type st>
+auto call(session_scheduler_t* sc, session_id_t id, auto&& req) {
+    return rpc::encode_msg<st>(req)
+        >> flat_map([sc, id](char* buf, size_t len) {
+            return scheduler::net::send(sc, id, buf, len);
         })
-        >> get_context<runtime_schedulers*>()
-        >> then([](runtime_schedulers* rs) {
-            env::runtime::start(rs->schedulers_by_core);
-        })
-        >> submit(core::make_root_context(
-            create_client_runtime_schedulers()
-        ));
+        >> rpc::wait_response_at(sc, id);
+}
+
+// rpc::send — 单向发送，不等待响应
+auto send(session_scheduler_t* sc, session_id_t id, auto&& req) {
+    return rpc::encode_msg<st>(req)
+        >> flat_map([sc, id](char* buf, size_t len) {
+            return scheduler::net::send(sc, id, buf, len);
+        });
 }
 ```
-
-### 6.5 更新 CMakeLists.txt
-
-**文件**：`apps/CMakeLists.txt`（或相应的子目录 CMakeLists）
-
-新增构建目标：
-```cmake
-add_executable(example.echo_client apps/example/echo_client/echo_client.cc)
-target_link_libraries(example.echo_client PRIVATE uring)
-```
-
-需参考现有 `example.echo` 目标的配置方式。
-
----
-
-## 七、实现优先级与执行顺序
-
-### P0 — 核心基础设施（必须先完成）
-
-| 序号 | 任务 | 文件 | 依赖 |
-|------|------|------|------|
-| 1 | 新增 `connect_req` 结构体 | `common/struct.hh` | 无 |
-| 2 | 新增 `connect` sender（op + sender + op_pusher + compute_sender_type） | `senders/connect.hh`（新建） | 1 |
-| 3 | 更新 `net.hh` 添加 `connect()` API | `net.hh` | 2 |
-
-### P1 — 后端实现
-
-| 序号 | 任务 | 文件 | 依赖 |
-|------|------|------|------|
-| 4 | 实现 epoll `connect_scheduler` | `epoll/connect_scheduler.hh`（新建） | 1 |
-| 5 | 实现 io_uring `connect_scheduler` | `io_uring/connect_scheduler.hh`（新建） | 1 |
-
-### P2 — 示例与验证
-
-| 序号 | 任务 | 文件 | 依赖 |
-|------|------|------|------|
-| 6 | 编写 echo 客户端示例 | `apps/example/echo_client/echo_client.cc`（新建） | 3, 4 或 5 |
-| 7 | 更新 CMakeLists.txt | `apps/CMakeLists.txt` | 6 |
-| 8 | 编译验证 | — | 7 |
-| 9 | 功能验证：echo 客户端连接 echo 服务端 | — | 8 |
-
-### P3 — 健壮性（后续扩展）
-
-| 序号 | 任务 | 说明 |
-|------|------|------|
-| 10 | 连接超时处理 | connect_scheduler 内部可选超时机制 |
-| 11 | 连接失败重试 | 在 sender 管道层面通过 `repeat` + 异常处理实现 |
-| 12 | 多目标地址连接 | DNS 解析后尝试多个地址 |
-
----
-
-## 八、验证计划
-
-1. **编译验证**：完成 P0+P1 后，确保所有新文件编译通过（无模板实例化错误）
-2. **启动验证**：启动 echo 服务端（`example.echo`），然后启动 echo 客户端（`example.echo_client`），确认客户端能正常连接
-3. **功能验证**：客户端发送数据，验证服务端正确回显
-4. **多连接验证**：客户端建立多个连接，验证 session 分配和数据隔离正确
-5. **异常验证**：
-   - 服务端未启动时客户端连接，验证 ECONNREFUSED 正确处理
-   - 服务端异常断开，验证客户端 session 正确清理
-6. **对称性验证**：确认连接建立后，客户端和服务端使用完全相同的 `join/recv/send/stop` 管道代码
-
----
-
-## 九、文件变更清单
-
-| 操作 | 文件路径 | 变更内容 |
-|------|----------|----------|
-| 修改 | `src/env/scheduler/net/common/struct.hh` | 新增 `connect_req` 结构体 |
-| 新增 | `src/env/scheduler/net/senders/connect.hh` | `connect` 的 op、sender、op_pusher、compute_sender_type |
-| 修改 | `src/env/scheduler/net/net.hh` | 新增 `connect()` API，新增 `#include` |
-| 新增 | `src/env/scheduler/net/epoll/connect_scheduler.hh` | epoll 后端 `connect_scheduler` |
-| 新增 | `src/env/scheduler/net/io_uring/connect_scheduler.hh` | io_uring 后端 `connect_scheduler` |
-| 新增 | `apps/example/echo_client/echo_client.cc` | echo 客户端示例 |
-| 修改 | `apps/CMakeLists.txt`（或子目录） | 新增 `example.echo_client` 构建目标 |
-
----
-
-## 十、设计约束检查清单
-
-实现时需逐项确认：
-
-- [ ] `connect_scheduler` 只能被单个线程运行（Single-Thread Scheduler）
-- [ ] 使用 `mpsc::queue` / `mpmc::queue` 做请求/结果传递，不引入锁（Lock-Free）
-- [ ] `connect` sender 的 op 支持被编译期平铺到 tuple 中（Flat OpTuple）
-- [ ] `connect` op 的 `start` 方法通过 `op_pusher<pos+1>` 推进（Position-based Pushing）
-- [ ] connect_scheduler 与 session_scheduler 保持执行域隔离（Scheduler Isolation）
-- [ ] session_scheduler 零修改（客户端连接产生的 session_id_t 格式完全一致）
-- [ ] `connect_req` 回调签名与 `conn_req` 一致（`void(session_id_t)`）
-- [ ] epoll 和 io_uring 双后端都已实现
