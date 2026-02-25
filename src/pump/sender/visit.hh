@@ -223,6 +223,19 @@ namespace pump::core {
             );
         }
 
+        template <typename context_t, typename ...visit_t>
+        static inline
+        auto
+        do_push_value(context_t& context, scope_t& scope, const std::variant<visit_t...>& vi) {
+            std::visit(
+                [&context, &scope](auto &&vi) {
+                    op_pusher<pos + 1, scope_t>::push_value(context, scope, vi);
+                },
+                vi
+            );
+        }
+
+
         template <typename context_t, typename values_t>
         static inline
         auto
