@@ -58,7 +58,7 @@ namespace pump::sender {
                 explicit
                 sender(prev_t&& s, value_t&& v)
                     : prev(__fwd__(s))
-                    , value(__fwd__(value)){
+                    , value(__fwd__(v)){
                 }
 
                 sender(sender&& o)noexcept
@@ -222,6 +222,19 @@ namespace pump::core {
                 vi
             );
         }
+
+        template <typename context_t, typename ...visit_t>
+        static inline
+        auto
+        do_push_value(context_t& context, scope_t& scope, const std::variant<visit_t...>& vi) {
+            std::visit(
+                [&context, &scope](auto &&vi) {
+                    op_pusher<pos + 1, scope_t>::push_value(context, scope, vi);
+                },
+                vi
+            );
+        }
+
 
         template <typename context_t, typename values_t>
         static inline
