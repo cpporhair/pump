@@ -13,6 +13,12 @@ target_link_libraries(test.sequential PRIVATE pthread numa)
 add_executable(test.when_any ./test/when_any_test.cc)
 target_link_libraries(test.when_any PRIVATE pthread numa)
 
+add_executable(test.rpc ./test/rpc_test.cc)
+target_link_libraries(test.rpc PRIVATE pthread)
+
+add_executable(example.rpc ./example/rpc/rpc_example.cc)
+target_link_libraries(example.rpc PRIVATE ${URING_LIBRARY})
+
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.echo_client PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.share_nothing PRIVATE numa)

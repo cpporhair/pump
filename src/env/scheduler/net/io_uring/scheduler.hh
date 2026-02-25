@@ -228,7 +228,7 @@ namespace pump::scheduler::net::io_uring {
         friend struct recv_op_t<session_scheduler>;
         friend struct send_op_t<session_scheduler>;
         friend struct stop_op_t<session_scheduler>;
-    private:
+    public:
         core::mpsc::queue<common::join_req*, 2048> join_q;
         core::mpsc::queue<common::send_req*, 2048> send_q;
         core::mpsc::queue<common::stop_req*, 2048> stop_q;
@@ -237,7 +237,7 @@ namespace pump::scheduler::net::io_uring {
 
         // 6.4: shutdown flag
         std::atomic<bool> _shutdown{false};
-    private:
+
         // 6.1: named accessor
         static
         auto
@@ -298,6 +298,7 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
+    private:
         void
         on_read_event(const io_uring_request *iur, int res) {
             auto s = static_cast<session_t*>(iur->user_data);
