@@ -32,7 +32,7 @@ namespace pump::scheduler::net::senders::recv {
             return scheduler->schedule(
                 new common::recv_req{
                     session_id,
-                    [context = context, scope = scope](std::variant<common::recv_frame, std::exception_ptr>&& res) mutable {
+                    [context = context, scope = scope](std::variant<common::net_frame, std::exception_ptr>&& res) mutable {
                         if (res.index() == 0) [[likely]] {
                             core::op_pusher<pos + 1, scope_t>::push_value(context, scope, std::move(std::get<0>(res)));
                         }
@@ -98,7 +98,7 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<scheduler::net::common::recv_frame>{};
+            return std::type_identity<scheduler::net::common::net_frame>{};
         }
     };
 }

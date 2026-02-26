@@ -44,20 +44,18 @@ session_proc(const runtime_schedulers<connect_scheduler_t, session_scheduler_t> 
     auto msg_len = strlen(msg);
     auto* send_buf = new char[msg_len];
     memcpy(send_buf, msg, msg_len);
-    auto* vec = new iovec{send_buf, msg_len};
-
     return scheduler::net::join(session_sched, sid)
-        >> flat_map([session_sched, sid, vec](...) {
-            return scheduler::net::send(session_sched, sid, vec, 1)
-                >> then([vec](bool) {
-                    delete[] static_cast<char*>(vec->iov_base);
-                    delete vec;
+        >> flat_map([session_sched, sid, send_buf, msg_len](...) {
+            return scheduler::net::send(session_sched, sid, send_buf, static_cast<uint32_t>(msg_len))
+                >> then([send_buf](bool) {
+                    delete[] send_buf;
                 });
         })
         >> flat_map([session_sched, sid](...) {
             return scheduler::net::recv(session_sched, sid)
-                >> then([](scheduler::net::common::recv_frame&& frame) {
+                >> then([](scheduler::net::common::net_frame&& frame) {
                     std::println("Received echo response, frame size: {}", frame.size());
+                    delete[] frame._data;
                 });
         })
         >> flat_map([session_sched, sid](...) {

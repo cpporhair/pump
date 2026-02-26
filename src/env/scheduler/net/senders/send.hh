@@ -14,21 +14,18 @@ namespace pump::scheduler::net::senders::send {
         constexpr static bool net_sender_send_op = true;
         scheduler_t* scheduler;
         common::session_id_t session_id;
-        iovec* vec;
-        size_t cnt;
+        common::net_frame frame;
 
-        op(scheduler_t* s, common::session_id_t sid, iovec* vec, size_t cnt)
+        op(scheduler_t* s, common::session_id_t sid, common::net_frame&& f)
             : scheduler(s)
             , session_id(sid)
-            , vec(vec)
-            , cnt(cnt){
+            , frame(__fwd__(f)){
         }
 
         op(op &&rhs) noexcept
             : scheduler(rhs.scheduler)
             , session_id(rhs.session_id)
-            , vec(rhs.vec)
-            , cnt(rhs.cnt) {
+            , frame(__fwd__(rhs.frame)) {
         }
 
 
@@ -39,8 +36,7 @@ namespace pump::scheduler::net::senders::send {
             return scheduler->schedule(
                 new common::send_req{
                     session_id,
-                    vec,
-                    cnt,
+                    __mov__(frame),
                     [context = context, scope = scope](bool succeed) mutable {
                         core::op_pusher<pos + 1, scope_t>::push_value(
                             context,
@@ -58,27 +54,24 @@ namespace pump::scheduler::net::senders::send {
     sender {
         scheduler_t* scheduler;
         common::session_id_t session_id;
-        iovec* vec;
-        size_t cnt;
+        common::net_frame frame;
 
-        sender(scheduler_t* s, common::session_id_t sid, iovec* vec, size_t cnt)
+        sender(scheduler_t* s, common::session_id_t sid, common::net_frame&& f)
             : scheduler(s)
             , session_id(sid)
-            , vec(vec)
-            , cnt(cnt){
+            , frame(__fwd__(f)) {
         }
 
         sender(sender &&rhs) noexcept
             : scheduler(rhs.scheduler)
             , session_id(rhs.session_id)
-            , vec(rhs.vec)
-            , cnt(rhs.cnt){
+            , frame(__fwd__(rhs.frame)){
         }
 
         inline
         auto
         make_op(){
-            return op<scheduler_t>(scheduler, session_id, vec, cnt);
+            return op<scheduler_t>(scheduler, session_id, __mov__(frame));
         }
 
         template<typename context_t>

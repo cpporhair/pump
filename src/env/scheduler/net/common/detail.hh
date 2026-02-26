@@ -97,21 +97,21 @@ namespace pump::scheduler::net::common::detail {
 
     struct
     _frame_copier {
-        recv_frame
+        net_frame
         operator()() const noexcept {
             return {};
         }
 
-        recv_frame
-        operator()(const char* data, const size_t len) const noexcept {
+        net_frame
+        operator()(const char* data, const uint16_t len) const noexcept {
             auto* copy = new char[len];
             memcpy(copy, data, len);
             return {copy, len};
         }
 
-        recv_frame
-        operator()(const char* d1, const size_t l1, const char* d2, const size_t l2) const noexcept {
-            auto total = l1 + l2;
+        net_frame
+        operator()(const char* d1, const uint16_t l1, const char* d2, const uint16_t l2) const noexcept {
+            uint16_t total = l1 + l2;
             auto* copy = new char[total];
             memcpy(copy, d1, l1);
             memcpy(copy + l1, d2, l2);
@@ -121,7 +121,7 @@ namespace pump::scheduler::net::common::detail {
 
     inline constexpr _frame_copier frame_copier{};
 
-    inline recv_frame
+    inline net_frame
     copy_out_frame(common::packet_buffer* buf) {
         const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
         if (len == 0xffff)
@@ -129,7 +129,7 @@ namespace pump::scheduler::net::common::detail {
         if (buf->used() < len)
             return {};
         // skip the uint16_t length prefix — net layer handles framing,
-        // recv_frame contains only the application payload
+        // net_frame contains only the application payload
         buf->forward_head(sizeof(uint16_t));
         auto payload_len = static_cast<size_t>(len) - sizeof(uint16_t);
         auto frame = buf->handle_data(payload_len, frame_copier);
@@ -142,7 +142,7 @@ namespace pump::scheduler::net::common::detail {
     recv_cache {
         packet_buffer buf;
         core::spsc::queue<common::recv_req*> recv_q;
-        core::spsc::queue<common::recv_frame*> ready_q;
+        core::spsc::queue<common::net_frame*> ready_q;
 
         explicit
         recv_cache(size_t size)
@@ -156,6 +156,7 @@ namespace pump::scheduler::net::common::detail {
                 delete opt.value();
             }
             while (auto opt = ready_q.try_dequeue()) {
+                delete[] opt.value()->_data;
                 delete opt.value();
             }
         }

@@ -205,7 +205,7 @@ namespace pump::scheduler::net::epoll {
                         delete opt.value();
                     } else {
                         // no waiting recv, stash frame for later consumption
-                        recv_cache(s)->ready_q.try_enqueue(new common::recv_frame(std::move(frame)));
+                        recv_cache(s)->ready_q.try_enqueue(new common::net_frame(std::move(frame)));
                     }
                 }
             }

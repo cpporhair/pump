@@ -84,13 +84,10 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                     return scheduler::net::recv(sd.scheduler, sd.id);
                 })
                 >> get_context<session_data<session_scheduler_t>>()
-                >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::net::common::recv_frame &&frame) {
-                    auto* vec = new iovec{const_cast<char*>(frame.data()), frame.size()};
-                    auto frame_ptr = new scheduler::net::common::recv_frame(std::move(frame));
-                    return scheduler::net::send(sd.scheduler, sd.id, vec, 1)
-                        >> then([vec, frame_ptr](bool) {
-                            delete frame_ptr;
-                            delete vec;
+                >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::net::common::net_frame &&frame) {
+                    return scheduler::net::send(sd.scheduler, sd.id, frame._data, frame._len)
+                        >> then([data =frame.data()](bool) {
+                            delete[] data;
                         });
                 })
                 >> any_exception([](std::exception_ptr e) {

@@ -39,21 +39,20 @@ namespace pump::scheduler::net::common {
     };
 
     struct
-    recv_frame {
+    net_frame {
         char* _data;
-        size_t _len;
+        uint16_t _len;
 
-        recv_frame() : _data(nullptr), _len(0) {}
-        recv_frame(char* data, size_t len) : _data(data), _len(len) {}
+        net_frame() : _data(nullptr), _len(0) {}
+        net_frame(char* data, const uint16_t len) : _data(data), _len(len) {}
 
-        recv_frame(recv_frame&& rhs) noexcept : _data(rhs._data), _len(rhs._len) {
+        net_frame(net_frame&& rhs) noexcept : _data(rhs._data), _len(rhs._len) {
             rhs._data = nullptr;
             rhs._len = 0;
         }
 
-        recv_frame& operator=(recv_frame&& rhs) noexcept {
+        net_frame& operator=(net_frame&& rhs) noexcept {
             if (this != &rhs) {
-                delete[] _data;
                 _data = rhs._data;
                 _len = rhs._len;
                 rhs._data = nullptr;
@@ -62,13 +61,13 @@ namespace pump::scheduler::net::common {
             return *this;
         }
 
-        recv_frame(const recv_frame&) = delete;
-        recv_frame& operator=(const recv_frame&) = delete;
+        net_frame(const net_frame&) = delete;
+        net_frame& operator=(const net_frame&) = delete;
 
-        ~recv_frame() { delete[] _data; }
+        ~net_frame() = default;
 
         [[nodiscard]] const char* data() const { return _data; }
-        [[nodiscard]] size_t size() const { return _len; }
+        [[nodiscard]] uint16_t size() const { return _len; }
 
         template <typename T>
         [[nodiscard]] const T* as() const { return reinterpret_cast<const T*>(_data); }
@@ -251,32 +250,25 @@ namespace pump::scheduler::net::common {
     struct
     recv_req {
         session_id_t session_id;
-        std::move_only_function<void(std::variant<recv_frame, std::exception_ptr>)> cb;
+        std::move_only_function<void(std::variant<net_frame, std::exception_ptr>)> cb;
     };
 
     struct
     send_req {
         session_id_t session_id;
-        iovec* vec;
-        size_t cnt;  // 2.2: unified to size_t
+        net_frame frame;
         std::move_only_function<void(bool)> cb;
 
         // net layer auto-prepends uint16_t length prefix on send
         uint16_t _frame_len = 0;
-        static constexpr size_t max_send_iov = 9; // 1 prefix + up to 8 data iovecs
-        iovec _send_vec[max_send_iov] = {};
+        iovec _send_vec[2] = {};
         size_t _send_cnt = 0;
 
         void prepare_frame() {
-            size_t total = 0;
-            for (size_t i = 0; i < cnt; ++i)
-                total += vec[i].iov_len;
-            _frame_len = static_cast<uint16_t>(total + sizeof(uint16_t));
+            _frame_len = static_cast<uint16_t>(frame._len + sizeof(uint16_t));
             _send_vec[0] = {&_frame_len, sizeof(_frame_len)};
-            auto n = std::min(cnt, max_send_iov - 1);
-            for (size_t i = 0; i < n; ++i)
-                _send_vec[i + 1] = vec[i];
-            _send_cnt = n + 1;
+            _send_vec[1] = {frame._data, frame._len};
+            _send_cnt = 2;
         }
     };
 
