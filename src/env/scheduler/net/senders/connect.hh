@@ -1,5 +1,5 @@
-#ifndef ENV_SCHEDULER_NET_SENDERS_CONN_HH
-#define ENV_SCHEDULER_NET_SENDERS_CONN_HH
+#ifndef ENV_SCHEDULER_NET_SENDERS_CONNECT_HH
+#define ENV_SCHEDULER_NET_SENDERS_CONNECT_HH
 #include <cstdint>
 #include <bits/move_only_function.h>
 
@@ -8,34 +8,33 @@
 
 #include "../common/struct.hh"
 
-namespace pump::scheduler::net::senders::conn {
+namespace pump::scheduler::net::senders::connect {
 
     template <typename scheduler_t>
     struct
     op {
-        using request_t = common::conn_req;
-        constexpr static bool net_sender_conn_op = true;
+        using request_t = common::connect_req;
+        constexpr static bool net_sender_connect_op = true;
         scheduler_t* scheduler;
+        const char* address;
+        uint16_t port;
 
-        op(scheduler_t* s)
-            : scheduler(s) {
+        op(scheduler_t* s, const char* addr, uint16_t p)
+            : scheduler(s), address(addr), port(p) {
         }
 
         op(op&& rhs) noexcept
-            : scheduler(rhs.scheduler) {
+            : scheduler(rhs.scheduler), address(rhs.address), port(rhs.port) {
         }
 
         template<uint32_t pos, typename context_t, typename scope_t>
         auto
         start(context_t &context, scope_t &scope) {
             return scheduler->schedule(
-                new common::conn_req{
-                    [context = context, scope = scope](common::session_id_t session_id) mutable {
-                        core::op_pusher<pos + 1, scope_t>::push_value(
-                            context,
-                            scope,
-                            session_id
-                        );
+                new common::connect_req{
+                    address, port,
+                    [context = context, scope = scope](common::session_id_t sid) mutable {
+                        core::op_pusher<pos + 1, scope_t>::push_value(context, scope, sid);
                     }
                 }
             );
@@ -46,18 +45,20 @@ namespace pump::scheduler::net::senders::conn {
     struct
     sender {
         scheduler_t* scheduler;
+        const char* address;
+        uint16_t port;
 
-        sender(scheduler_t* s)
-            : scheduler(s) {
+        sender(scheduler_t* s, const char* addr, uint16_t p)
+            : scheduler(s), address(addr), port(p) {
         }
 
         sender(sender &&rhs) noexcept
-            : scheduler(rhs.scheduler) {
+            : scheduler(rhs.scheduler), address(rhs.address), port(rhs.port) {
         }
 
         auto
         make_op(){
-            return op<scheduler_t>(scheduler);
+            return op<scheduler_t>(scheduler, address, port);
         }
 
         template<typename context_t>
@@ -71,7 +72,7 @@ namespace pump::scheduler::net::senders::conn {
 namespace pump::core {
     template<uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-    && (get_current_op_type_t<pos, scope_t>::net_sender_conn_op)
+    && (get_current_op_type_t<pos, scope_t>::net_sender_connect_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
         template<typename context_t>
@@ -83,7 +84,7 @@ namespace pump::core {
 
     template <typename context_t, typename scheduler_t>
     struct
-    compute_sender_type<context_t, scheduler::net::senders::conn::sender<scheduler_t>> {
+    compute_sender_type<context_t, scheduler::net::senders::connect::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
             return 1;
@@ -96,4 +97,4 @@ namespace pump::core {
     };
 }
 
-#endif //ENV_SCHEDULER_NET_SENDERS_CONN_HH
+#endif //ENV_SCHEDULER_NET_SENDERS_CONNECT_HH

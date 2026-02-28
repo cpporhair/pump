@@ -7,76 +7,13 @@
 #include <bits/move_only_function.h>
 
 namespace pump::env::runtime {
-    
-    struct
-    scheduler_runner{
-        std::atomic<bool> running = true;
-        uint16_t core{};
-        std::vector<std::move_only_function<bool()>> runners;
-        auto
-        operator () () {
-            bool res = false;
-            for (std::move_only_function<bool()>& runner : runners)
-                res |= runner();
-            return res;
-        }
-    };
-
-    template <typename scheduler_t0>
-    auto
-    make_runner(std::vector<std::move_only_function<bool()>>& c,scheduler_t0* s) {
-        if (s)
-            c.push_back([s](){return s->advance();});
-    }
-
-    template <typename scheduler_t0, typename ...scheduler_t1>
-    auto
-    make_runner(std::vector<std::move_only_function<bool()>>& c,scheduler_t0* s,  scheduler_t1* ...others) {
-        if (s)
-            c.push_back([s](){return s->advance();});
-        make_runner(c, others...);
-    }
 
     template <typename ...scheduler_t>
     auto
-    make_runner(scheduler_t* ...sche) {
-        std::vector<std::move_only_function<bool()>> runners;
-        make_runner(runners, sche...);
-        return runners;
-    }
-
-    template <typename ...scheduler_t>
-    auto
-    make_runner(uint16_t max_core, scheduler_t** ...by_core) {
-        std::vector<scheduler_runner> runners_by_core(max_core);
-        for (uint16_t i = 0; i < max_core; i++) {
-            runners_by_core[i] = make_runner(by_core[i]...);
-        }
-        return runners_by_core;
-    }
-
-    inline
-    auto
-    start(const std::vector<scheduler_runner*>&  runners) {
-        const uint16_t this_core = sched_getcpu();
-        scheduler_runner* this_core_runner =nullptr;
-        for (scheduler_runner* runner : runners) {
-            if (runner->core != this_core)
-                std::thread([runner](){runner->operator()();});
-            else
-                this_core_runner = runner ;
-        }
-
-        if (this_core_runner)
-            this_core_runner->operator()();
-    }
-
-    template <typename Runtime, typename ...scheduler_t>
-    auto
-    run(std::atomic<bool>& running, Runtime* rt, scheduler_t* ...sche) {
+    run(std::atomic<bool>& running, scheduler_t* ...sche) {
         const static auto st = std::chrono::milliseconds(1);
-        while (running.load()) {
-            if (!(... || (sche ? sche->advance(rt) : false))) {
+        while (running.load()) [[likely]] {
+            if (!(... | (sche ? sche->advance() : false))) [[unlikely]] {
                 std::this_thread::sleep_for(st);
             }
         }

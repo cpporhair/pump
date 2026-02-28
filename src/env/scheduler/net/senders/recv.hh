@@ -14,9 +14,9 @@ namespace pump::scheduler::net::senders::recv {
     op {
         constexpr static bool net_sender_recv_op = true;
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        op(scheduler_t* s, uint64_t sid)
+        op(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
@@ -32,9 +32,9 @@ namespace pump::scheduler::net::senders::recv {
             return scheduler->schedule(
                 new common::recv_req{
                     session_id,
-                    [context = context, scope = scope](std::variant<common::packet_buffer*, std::exception_ptr>&& res) mutable {
+                    [context = context, scope = scope](std::variant<common::net_frame, std::exception_ptr>&& res) mutable {
                         if (res.index() == 0) [[likely]] {
-                            core::op_pusher<pos + 1, scope_t>::push_value(context, scope, std::get<0>(res));
+                            core::op_pusher<pos + 1, scope_t>::push_value(context, scope, std::move(std::get<0>(res)));
                         }
                         else {
                             core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::get<1>(res));
@@ -49,9 +49,9 @@ namespace pump::scheduler::net::senders::recv {
     struct
     sender {
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        sender(scheduler_t* s, uint64_t sid)
+        sender(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
@@ -98,7 +98,7 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<scheduler::net::common::packet_buffer *>{};
+            return std::type_identity<scheduler::net::common::net_frame>{};
         }
     };
 }

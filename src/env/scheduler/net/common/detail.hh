@@ -2,7 +2,8 @@
 #ifndef ENV_SCHEDULER_NET_COMMON_DETAIL_HH
 #define ENV_SCHEDULER_NET_COMMON_DETAIL_HH
 #include <atomic>
-#include <string.h>
+#include <cstring>
+#include <unistd.h>
 
 #include "pump/core/meta.hh"
 #include "pump/core/lock_free_queue.hh"
@@ -19,11 +20,12 @@ namespace pump::scheduler::net::common::detail {
         operator()(const char* data ,const size_t len) const noexcept {
             return *reinterpret_cast<const uint16_t*>(data);
         }
+        // 1.8: fix cross-buffer read - use &need[l1] instead of &need[1]
         uint16_t
         operator()(const char* d1 ,const size_t l1,const char* d2,const size_t l2) const noexcept {
             uint08_t need[2] = {0, 0};
             memcpy(&need[0],d1,l1) ;
-            memcpy(&need[1],d2,l2);
+            memcpy(&need[l1],d2,l2);
             return *reinterpret_cast<const uint16_t*>(need);
         }
     };
@@ -68,19 +70,21 @@ namespace pump::scheduler::net::common::detail {
     inline constexpr _full_pkt_checker full_pkt_checker{};
     inline constexpr _recv_pkt_getter recv_pkt_getter{};
 
+    // 1.7: fix condition - 0xffff means data insufficient, should return false
     [[nodiscard]]
     inline bool
     has_full_pkt(const common::packet_buffer* buf) {
         const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
-        if (len != 0xffff)
+        if (len == 0xffff)
             return false;
         return buf->handle_data(len, full_pkt_checker);
     }
 
+    // 1.7: fix condition - 0xffff means data insufficient
     inline auto
     get_recv_pkt(const common::packet_buffer* buf) {
         const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
-        if (len != 0xffff)
+        if (len == 0xffff)
             return pkt_iovec{0};
         return buf->handle_data(len, recv_pkt_getter);
     }
@@ -92,17 +96,69 @@ namespace pump::scheduler::net::common::detail {
     };
 
     struct
+    _frame_copier {
+        net_frame
+        operator()() const noexcept {
+            return {};
+        }
+
+        net_frame
+        operator()(const char* data, const uint16_t len) const noexcept {
+            auto* copy = new char[len];
+            memcpy(copy, data, len);
+            return {copy, len};
+        }
+
+        net_frame
+        operator()(const char* d1, const uint16_t l1, const char* d2, const uint16_t l2) const noexcept {
+            uint16_t total = l1 + l2;
+            auto* copy = new char[total];
+            memcpy(copy, d1, l1);
+            memcpy(copy + l1, d2, l2);
+            return {copy, total};
+        }
+    };
+
+    inline constexpr _frame_copier frame_copier{};
+
+    inline net_frame
+    copy_out_frame(common::packet_buffer* buf) {
+        const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
+        if (len == 0xffff)
+            return {};
+        if (buf->used() < len)
+            return {};
+        // skip the uint16_t length prefix — net layer handles framing,
+        // net_frame contains only the application payload
+        buf->forward_head(sizeof(uint16_t));
+        auto payload_len = static_cast<size_t>(len) - sizeof(uint16_t);
+        auto frame = buf->handle_data(payload_len, frame_copier);
+        if (frame.size() > 0)
+            buf->forward_head(payload_len);
+        return frame;
+    }
+
+    struct
     recv_cache {
         packet_buffer buf;
-        std::atomic<common::recv_req *> req;
+        core::spsc::queue<common::recv_req*> recv_q;
+        core::spsc::queue<common::net_frame*> ready_q;
 
         explicit
         recv_cache(size_t size)
             : buf(size) {
         }
 
+        // 1.9: implement resource release
         auto
         release() {
+            while (auto opt = recv_q.try_dequeue()) {
+                delete opt.value();
+            }
+            while (auto opt = ready_q.try_dequeue()) {
+                delete[] opt.value()->_data;
+                delete opt.value();
+            }
         }
     };
 
@@ -113,23 +169,36 @@ namespace pump::scheduler::net::common::detail {
         errors
     };
 
-    template <typename ...impl_t>
+    // 6.3: global generation counter for session tagged handles
+    inline std::atomic<uint16_t> _session_generation_counter{0};
+
+    // 6.1: unified session template with explicit recv_cache and optional send_cache
+    // Primary template: session with both recv and send cache
+    template <typename recv_cache_t, typename send_cache_t = void>
     struct
     internal_session {
         int fd;
+        uint16_t generation;
         std::atomic<session_status> status;
-        std::tuple<impl_t*...> impls;
+        recv_cache_t* _recv_cache;
+        send_cache_t* _send_cache;
 
         explicit
-        internal_session(const int _fd, impl_t* ...args)
-            : impls(args...)
-            , fd(_fd)
-            , status(session_status::normal) {
+        internal_session(const int _fd, recv_cache_t* rc, send_cache_t* sc)
+            : fd(_fd)
+            , generation(_session_generation_counter.fetch_add(1, std::memory_order_relaxed))
+            , status(session_status::normal)
+            , _recv_cache(rc)
+            , _send_cache(sc) {
         }
+
+        [[nodiscard]] auto* get_recv_cache() noexcept { return _recv_cache; }
+        [[nodiscard]] auto* get_send_cache() noexcept { return _send_cache; }
 
         auto
         release() {
-            std::apply([](impl_t *... impl) { (impl->release(), ...); }, impls);
+            _recv_cache->release();
+            _send_cache->release();
         }
 
         void
@@ -140,26 +209,35 @@ namespace pump::scheduler::net::common::detail {
         }
     };
 
-    template <typename reader_t>
+    // 6.1: specialization for recv-only session (io_uring - no per-session send cache)
+    template <typename recv_cache_t>
     struct
-    session {
+    internal_session<recv_cache_t, void> {
         int fd;
+        uint16_t generation;
         std::atomic<session_status> status;
-        std::unique_ptr<reader_t> rdr;
-        void* user_data;
+        recv_cache_t* _recv_cache;
 
         explicit
-        session(const int _fd, std::unique_ptr<reader_t>&& r)
+        internal_session(const int _fd, recv_cache_t* rc)
             : fd(_fd)
+            , generation(_session_generation_counter.fetch_add(1, std::memory_order_relaxed))
             , status(session_status::normal)
-            , rdr(__fwd__(r))
-            , user_data(nullptr) {
+            , _recv_cache(rc) {
+        }
+
+        [[nodiscard]] auto* get_recv_cache() noexcept { return _recv_cache; }
+
+        auto
+        release() {
+            _recv_cache->release();
         }
 
         void
-        clear() {
-            rdr.clear();
-            rdr.release();
+        close() {
+            ::close(fd);
+            release();
+            status.store(session_status::closed);
         }
     };
 

@@ -11,15 +11,16 @@
 #include "pump/core/compute_sender_type.hh"
 
 #include "../common/struct.hh"
+#include "../common/error.hh"
 namespace pump::scheduler::net::senders::join {
     template <typename scheduler_t>
     struct
     op {
         constexpr static bool net_sender_join_op = true;
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        op(scheduler_t* s, uint64_t sid)
+        op(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
@@ -40,7 +41,7 @@ namespace pump::scheduler::net::senders::join {
                             core::op_pusher<pos + 1, scope_t>::push_value(context, scope);
                         }
                         else {
-                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(std::logic_error("")));
+                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(common::join_failed_error()));
                         }
                     }
                 }
@@ -52,9 +53,9 @@ namespace pump::scheduler::net::senders::join {
     struct
     sender {
         scheduler_t* scheduler;
-        uint64_t session_id;
+        common::session_id_t session_id;
 
-        sender(scheduler_t* s, uint64_t sid)
+        sender(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
             , session_id(sid) {
         }
