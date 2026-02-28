@@ -1,407 +1,578 @@
-# PUMP Net 客户端功能需求文档
+# PUMP RPC 层需求文档
 
 ## 一、背景与目标
 
 ### 1.1 现状
 
-当前 `src/env/scheduler/net/` 下的代码仅支持**服务端**功能，核心架构如下：
+Net 层已实现底层网络收发：
 
-| 组件 | 职责 | 关键操作 |
-|------|------|----------|
-| `accept_scheduler` | 监听端口，接受连接 | `bind` → `listen` → `accept` → 产生 `session_id_t` |
-| `session_scheduler` | 管理已建立连接的 IO | `join` / `recv` / `send` / `stop` |
+| 组件 | 能力 |
+|------|------|
+| accept_scheduler / connect_scheduler | 服务端监听、客户端连接，产出 `session_id_t` |
+| session_scheduler | `join / recv / send / stop`，管理会话 IO |
+| 消息帧 | 2 字节 `uint16_t` 长度前缀 + payload（应用层手动构造） |
+| 接收 | SPSC ring buffer，零拷贝包解析（`has_full_pkt / get_recv_pkt`） |
+| 发送 | iovec scatter-gather，`writev` 直接写入（不自动加长度前缀） |
 
-服务端使用模式（echo.cc）：
+### 1.2 分层规划
+
 ```
-wait_connection()                          // accept_scheduler 接受连接
-  >> join(session_sched, sid)              // session_scheduler 注册会话
-  >> recv(session_sched, sid)              // 异步接收数据
-  >> send(session_sched, sid, vec, cnt)    // 异步发送数据
-  >> stop(session_sched, sid)              // 关闭会话
+┌────────────────────────────────────────────┐
+│   应用协议层 (Raft / RESP / MQ / ...)      │
+│   实现具体协议逻辑，定义方法和业务编解码     │
+├────────────────────────────────────────────┤
+│   RPC 层（本文档的设计目标）                │
+│   异步请求-响应 · 消息分发 · 编解码框架     │
+│   会话管理 · 接收循环 · 通知推送            │
+├────────────────────────────────────────────┤
+│   Net 层（已实现）                          │
+│   TCP 连接管理 · 字节流收发 · 消息帧        │
+└────────────────────────────────────────────┘
 ```
 
-### 1.2 目标
+### 1.3 目标
 
-加入**客户端**功能，使 PUMP 框架同时支持服务端和客户端网络编程。客户端功能需要：
+在 Net 层之上构建 RPC 层：
+1. **异步请求-响应**：核心 RPC 能力，发送请求、异步等待响应，返回 sender 可组合
+2. **消息分发**：根据消息类型/方法 ID 路由到处理器
+3. **编解码框架**：可插拔，不绑定任何序列化格式
+4. **协议扩展性**：Raft/RESP/MQ 等不同模式的协议都能在 RPC 层之上实现
 
-1. **与服务端对等的使用体验**：声明式异步管道组合，如 `connect() >> send()/recv() >> then()`
-2. **极致的效率**：零拷贝、无锁、单线程 scheduler 设计，与服务端保持一致
-3. **对异步操作的抽象**：复用 Sender/Op 语义，客户端操作同样是可组合的 sender
-4. **双后端支持**：同时支持 epoll 和 io_uring 后端
+### 1.4 设计原则
+
+| 原则 | 要求 |
+|------|------|
+| 极致效率 | 零拷贝读写、无锁、热路径无堆分配、编译期分发 |
+| 异步抽象 | 所有操作返回 sender，可与 PUMP pipeline 组合 |
+| 协议无关 | RPC 层不绑定具体序列化格式或方法体系 |
+| PUMP 一致 | 遵循 Lock-Free、Single-Thread Scheduler、Sender 语义 |
 
 ---
 
-## 二、架构设计
+## 二、各层职责边界
 
-### 2.1 核心思路：connect_scheduler 替代 accept_scheduler
+| 层 | 负责 | 不负责 |
+|----|------|--------|
+| **Net** | TCP 连接管理、字节流收发、消息帧（长度前缀 + payload） | 消息语义、序列化、路由 |
+| **RPC** | 消息模型、请求关联、分发框架、编解码抽象、接收循环 | 具体协议逻辑、业务方法实现 |
+| **协议** | 定义方法/命令、实现编解码、业务逻辑 | 底层网络、消息帧、请求跟踪 |
 
-客户端与服务端的唯一本质差异在于**连接建立方式**：
-
-| | 服务端 | 客户端 |
-|---|---|---|
-| 连接建立 | `accept_scheduler`：被动等待连接 | `connect_scheduler`：主动发起连接 |
-| 会话 IO | `session_scheduler`：join/recv/send/stop | **完全复用** `session_scheduler` |
-
-因此，客户端架构 = **新增 `connect_scheduler`** + **完全复用现有 `session_scheduler`**。
-
-### 2.2 组件拓扑
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    客户端 runtime_schedulers                         │
-├──────────────────────────┬──────────────────────────────────────────┤
-│        Core 0            │       Core 1 ... Core N-1               │
-│  ┌──────────────────┐    │  ┌────────────────┐                     │
-│  │ task_scheduler    │    │  │ task_scheduler  │                    │
-│  └──────────────────┘    │  └────────────────┘                     │
-│  ┌──────────────────┐    │                                         │
-│  │connect_scheduler  │    │       nullptr                          │
-│  │ (主动连接)        │    │                                         │
-│  │ io_uring/epoll    │    │                                         │
-│  └──────────────────┘    │                                         │
-│  ┌──────────────────┐    │  ┌────────────────┐                     │
-│  │session_scheduler  │    │  │session_scheduler│                    │
-│  │ io_uring/epoll    │    │  │ io_uring/epoll  │                    │
-│  └──────────────────┘    │  └────────────────┘                     │
-├──────────────────────────┴──────────────────────────────────────────┤
-│  connect_scheduler 仅在一个核心上运行（类似 accept_scheduler）       │
-│  session_scheduler 在所有核心上运行，按 sid % N 分配                 │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 2.3 与服务端架构的对称性
-
-| 服务端 | 客户端 | 说明 |
-|--------|--------|------|
-| `accept_scheduler<conn_op_t>` | `connect_scheduler<conn_op_t>` | 模板参数一致，复用 `conn_op_t` |
-| `wait_connection(accept_sched)` | `connect(connect_sched, addr, port)` | 返回类型相同：`session_id_t` |
-| `session_scheduler<join_op, recv_op, send_op, stop_op>` | **完全复用** | 无需任何修改 |
-| `net::join / recv / send / stop` | **完全复用** | 无需任何修改 |
+**关键边界问题**：消息帧（长度前缀）是属于 Net 层还是 RPC 层？
+- 当前 Net 层：recv 端解析 2 字节长度前缀（`has_full_pkt`），send 端不自动加前缀
+- RPC 层可能需要更大的帧（>64KB），或不同的帧格式
+- **建议**：RPC 层接管消息帧定义，Net 层提供纯字节流收发；或将帧格式参数化
 
 ---
 
-## 三、新增组件详细设计
+## 三、RPC 消息模型
 
-### 3.1 `connect_scheduler`（epoll 后端）
+### 3.1 消息类型
 
-**文件位置**：`src/env/scheduler/net/epoll/scheduler.hh`（在现有文件中新增，或独立文件 `connect_scheduler.hh`）
+| 类型 | 语义 | 方向 | 需要关联 ID |
+|------|------|------|-------------|
+| **Request** | 请求，期待 Response | 双向均可发起 | 是 |
+| **Response** | 对 Request 的回复 | 反向 | 是（匹配 Request） |
+| **Notification** | 单向通知，不期待回复 | 双向均可发起 | 否 |
+| **Error** | 错误响应（特殊的 Response） | 反向 | 是（匹配 Request） |
 
-**类定义**：
-```cpp
-namespace pump::scheduler::net::epoll {
-    template <template<typename> class conn_op_t>
-    struct connect_scheduler {
-        // 与 accept_scheduler 相同的模板签名，便于泛型代码统一处理
-    };
-}
+**为什么需要 Notification**：
+- 心跳/keepalive
+- MQ 消息推送
+- Raft leader 通知
+- 事件广播
+
+### 3.2 消息需要携带的信息
+
+不规定具体的二进制编码（由 Codec 决定），但每条 RPC 消息在逻辑上需要以下字段：
+
+| 字段 | 说明 | Request | Response | Notification |
+|------|------|---------|----------|-------------|
+| type | 消息类型标识 | ✓ | ✓ | ✓ |
+| request_id | 请求关联 ID | ✓ | ✓ | ✗ |
+| method_id | 方法/命令标识 | ✓ | 可选 | ✓ |
+| payload | 业务数据 | ✓ | ✓ | ✓ |
+| error_code | 错误码 | ✗ | 仅 Error | ✗ |
+
+### 3.3 消息大小
+
+**需求**：必须支持大消息（>64KB）。
+
+理由：
+- Raft InstallSnapshot 传输完整状态快照，可能达到 MB 级别
+- MQ 消息体可能较大
+- 当前 Net 层 `uint16_t` 长度前缀最大 65535 字节，不够用
+
+**方案选项**（待讨论）：
+1. 将 Net 层长度前缀扩展为 4 字节（`uint32_t`），最大 ~4GB
+2. RPC 层使用自己的帧格式，Net 层退化为纯字节流
+3. 长度前缀大小参数化（模板参数或配置）
+
+---
+
+## 四、核心功能需求
+
+### 4.1 编解码框架（Codec）
+
+#### 4.1.1 需求
+
+1. 提供 Codec concept/trait，由协议层实现具体编解码
+2. RPC 框架通过 Codec 操作消息，不假设任何固定格式
+3. Codec 负责 RPC 头部 + payload 的完整编解码
+
+#### 4.1.2 Codec 必须提供的能力
+
+| 能力 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `decode_header` | buffer 视图 | `{type, request_id, method_id, payload_offset, total_len}` | 从原始字节解析消息头 |
+| `decode_payload<T>` | buffer 视图 + payload 区域 | `T` | 反序列化 payload 为类型 T |
+| `encode` | 消息头字段 + payload | `iovec[]` | 将完整消息序列化为可发送的 iovec |
+| `header_size` | — | `size_t` | 消息头固定长度（用于预读判断） |
+
+#### 4.1.3 零拷贝约束
+
+- **decode 必须支持零拷贝**：直接从 `packet_buffer`（ring buffer）读取，返回视图/引用而非拷贝
+- **ring buffer 环绕处理**：Codec 需要处理数据跨 ring buffer 边界的情况（或由 RPC 层提供线性化辅助）
+- **encode 直接写入 iovec**：避免中间缓冲区，直接构造可 writev 的 iovec 数组
+- 对于跨步骤需要持有的数据，由上层决定是否拷贝
+
+#### 4.1.4 扩展性
+
+- 不同协议使用不同的 Codec：
+  - Raft: 紧凑的二进制 Codec
+  - RESP: Redis 行协议 Codec（`+OK\r\n`、`$5\r\nhello\r\n` 等）
+  - MQ: 可能使用 protobuf 或 flatbuffers
+- Codec 通过模板参数注入到 RPC Channel
+
+### 4.2 请求-响应关联
+
+#### 4.2.1 核心需求
+
+1. **请求 ID 生成**：每个 Channel 维护单调递增的 `uint32_t` 请求 ID
+2. **Pending Request Map**：
+   - 发送 Request 时注册：`{request_id → callback}`
+   - 收到 Response 时查找并匹配
+   - 匹配成功后通过 callback 继续调用方的 sender pipeline（类似 scheduler 的 req/cb 模式）
+3. **超时**：
+   - 支持 per-request 超时配置
+   - 超时后自动移除 pending entry，向调用方传播超时异常
+   - 利用 `task_scheduler` 的 `delay` sender 实现超时检测
+4. **连接复用**：
+   - 单连接支持多个并发 in-flight 请求（不同 request_id）
+   - 响应可以乱序到达（按 request_id 匹配，而非按顺序）
+5. **Pipelining**：
+   - 支持连续发送多个请求而不等待前一个响应
+   - RESP 等协议需要此能力
+
+#### 4.2.2 性能约束
+
+- Pending map 在单线程（session 所在 core 的 scheduler）上操作，**无需锁**
+- 查找复杂度 O(1)（数组索引 或 open-addressing hash map）
+- 热路径无堆分配：预分配固定大小的 pending slot 数组
+- 最大并发请求数可配置（预分配大小的上限）
+
+#### 4.2.3 生命周期
+
+- Channel 关闭时，所有未完成的 pending request 收到 `connection_closed` 异常
+- 请求超时后，即使后来响应到达也应丢弃（request_id 已从 map 中移除）
+
+### 4.3 消息分发（Dispatch）
+
+#### 4.3.1 需求
+
+1. **按 method_id 路由**：收到 Request/Notification 后，查找 method_id 对应的处理器
+2. **处理器注册**：
+   - 运行期注册：callback 表（`method_id → handler`）
+   - 编译期注册（可选）：模板特化，零运行时开销
+3. **处理器签名**：
+   - 同步处理器：接收 Request payload，返回 Response 值
+   - 异步处理器：接收 Request payload，返回 `sender<Response>`
+4. **自动响应**：Request handler 返回后，框架自动 encode Response 并发送（使用原 request_id）
+5. **默认处理器**：未注册 method 的请求交给默认处理器，或自动回复 `MethodNotFound` Error
+
+#### 4.3.2 分发流程
+
+```
+收到消息 → Codec::decode_header →
+  type == Response/Error → 查找 pending_map[request_id] → 执行 callback → 继续调用方 pipeline
+  type == Request        → 查找 handler[method_id] → 执行 handler → encode Response → send
+  type == Notification   → 查找 handler[method_id] → 执行 handler（无 Response）
 ```
 
-**核心成员**：
+#### 4.3.3 性能约束
 
-| 成员 | 类型 | 说明 |
+- method_id 路由查找 O(1)（数组或编译期 switch）
+- 分发过程无堆分配
+- 处理器调用无虚函数（模板或 `move_only_function`）
+
+### 4.4 接收循环（Recv Loop）
+
+#### 4.4.1 需求
+
+1. 每个 RPC Channel 启动一个持续运行的接收循环
+2. 不断调用 `net::recv` 读取数据
+3. 每次 recv 返回后，从 `packet_buffer` 中解析出所有完整消息（一次可能有多条）
+4. 对每条消息执行 4.3 的分发逻辑
+5. 接收循环生命周期与 Channel 绑定
+
+#### 4.4.2 消息批处理
+
+ring buffer 一次 recv 可能包含多个完整消息。接收循环必须在一次 advance 中处理所有可用消息，而非每次只处理一条。
+
+#### 4.4.3 与发送的关系
+
+- 接收和发送是独立的 pipeline
+- 接收循环通过 pending request callback 与发送方的 pipeline 交互
+- 两者运行在同一个 scheduler 线程上（session 所在 core），无竞态
+- 发送可以从任意 core 发起（通过 session_scheduler 的 lock-free send queue 跨核投递）
+
+### 4.5 RPC Channel（会话管理）
+
+#### 4.5.1 概念
+
+一个 **RPC Channel** 对应一个 net session，封装该连接上所有 RPC 层状态。
+
+#### 4.5.2 Channel 状态
+
+| 状态 | 说明 |
+|------|------|
+| `session_id` | 底层 net session 标识 |
+| `request_id_counter` | 单调递增，用于生成请求 ID |
+| `pending_requests` | `{request_id → callback}` 映射 |
+| `dispatcher` | 消息处理器注册表 |
+| `codec` | 编解码器实例（模板参数） |
+| `protocol_state` | 上层协议附加的 per-session 状态（模板参数注入） |
+| `status` | Channel 状态（active / draining / closed） |
+
+#### 4.5.3 Channel 生命周期
+
+| 阶段 | 触发 | 行为 |
 |------|------|------|
-| `conn_request_q` | `mpsc::queue<common::connect_req*>` | 连接请求队列 |
-| `session_q` | `mpmc::queue<session_id_t>` | 已建立连接的会话队列（与 accept_scheduler 对称） |
-| `poller` | `detail::poller_epoll` | epoll 实例，监听 connect 完成事件 |
-| `_recv_buffer_size` | `size_t` | 接收缓冲区大小 |
-| `_shutdown` | `atomic<bool>` | 关闭标志 |
+| 创建 | connect/accept 成功后 | 初始化状态，绑定 session_id |
+| 启动 | 调用 `serve()` 或第一次 `call()` | 启动接收循环 |
+| 运行 | 正常工作 | 收发消息、分发处理 |
+| 关闭 | 连接断开 / 主动 close | 停止接收循环，清理所有 pending requests（异常通知），释放资源 |
 
-**核心方法**：
+#### 4.5.4 双向 RPC
 
-| 方法 | 签名 | 说明 |
-|------|------|------|
-| `init` | `int init(const scheduler_config& cfg)` | 初始化（不需要 bind/listen） |
-| `schedule` | `void schedule(common::connect_req* req)` | 接收连接请求，发起非阻塞 connect |
-| `handle_connect_completion` | `void handle_connect_completion(epoll_event* e)` | 处理 connect 完成事件 |
-| `create_internal_session` | `auto create_internal_session(int fd)` | 连接成功后创建 session（与 accept_scheduler 相同） |
-| `advance` | `auto advance()` | 事件循环推进（处理 connect 完成 + 派发请求） |
-| `shutdown` | `void shutdown()` | 关闭调度器 |
-| `drain_on_shutdown` | `void drain_on_shutdown()` | 清理待处理请求 |
+Channel 必须支持**双向通信**——两端都可以发起 Request：
+- Raft: Leader 向 Follower 发 AppendEntries，Follower 也可以向 Leader 发 RequestVote
+- MQ: Broker 主动推送消息给 Subscriber，Subscriber 也可以发 ACK
 
-**connect 流程**：
-```
-schedule(connect_req) 
-  → socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)
-  → ::connect(fd, addr, ...) 
-  → 如果返回 EINPROGRESS：注册 EPOLLOUT 到 poller，等待可写事件
-  → 如果立即成功：直接 create_internal_session(fd)
-  → advance() 中 epoll_wait 检测到 EPOLLOUT
-  → getsockopt(SO_ERROR) 检查连接是否真正成功
-  → 成功：create_internal_session(fd)，回调 session_id_t
-  → 失败：回调错误（异常或空 session_id_t）
-```
+这意味着 Channel 的两端角色对等，每端都有：dispatcher（处理收到的 Request）+ 发起 call（发送 Request 等待 Response）。
 
-### 3.2 `connect_scheduler`（io_uring 后端）
+### 4.6 通知/推送（Notification）
 
-**文件位置**：`src/env/scheduler/net/io_uring/scheduler.hh`（在现有文件中新增，或独立文件）
+#### 4.6.1 需求
 
-**核心差异**（相比 epoll 后端）：
-- 使用 `io_uring_prep_connect` 提交异步 connect 请求
-- 通过 CQE 获取 connect 完成通知
-- 新增 `uring_event_type::CONNECT` 枚举值
+1. 发送方可以发送不需要回复的单向消息
+2. 接收方通过注册的 notification handler 处理
+3. 不分配 request ID，不进入 pending map
+4. 发送后立即完成（fire-and-forget），不阻塞
 
-**connect 流程**：
-```
-schedule(connect_req)
-  → socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK)
-  → io_uring_prep_connect(sqe, fd, addr, addrlen)
-  → io_uring_sqe_set_data(sqe, io_uring_request{CONNECT, ...})
-  → io_uring_submit()
-  → advance() 中 io_uring_peek_cqe / io_uring_wait_cqe 获取 CQE
-  → CQE res == 0：连接成功，create_internal_session(fd)
-  → CQE res < 0：连接失败，回调错误
-```
+#### 4.6.2 用途
 
-### 3.3 新增请求结构体 `connect_req`
+- Heartbeat/Keepalive
+- 事件通知
+- MQ 消息推送
+- 状态变更广播
 
-**文件位置**：`src/env/scheduler/net/common/struct.hh`
+### 4.7 连接管理
+
+#### 4.7.1 心跳/保活（可选）
+
+| 需求 | 说明 |
+|------|------|
+| 可配置 | Channel 可选启用/禁用心跳 |
+| 间隔可调 | 心跳间隔由协议决定 |
+| 超时检测 | 连续 N 次未收到心跳/任何消息则判定死连接 |
+| 实现 | 利用 task_scheduler 的 delay sender 定时发送 Notification |
+
+#### 4.7.2 优雅关闭
+
+1. 停止接受新的 RPC 请求（drain 模式）
+2. 等待已发送的 pending requests 完成或超时
+3. 发送关闭通知（可选，协议层决定）
+4. 调用 `net::stop` 关闭底层 session
+
+#### 4.7.3 连接断开处理
+
+1. 检测到连接断开时（recv 返回异常/EOF）
+2. 所有 pending requests 收到 `connection_lost` 异常
+3. 接收循环终止
+4. Channel 状态置为 closed
+5. 通知上层协议（callback 或 exception 传播）
+
+---
+
+## 五、Sender API 需求
+
+### 5.1 客户端 RPC 调用
 
 ```cpp
-struct connect_req {
-    const char* address;       // 目标地址
-    uint16_t port;             // 目标端口
-    std::move_only_function<void(session_id_t)> cb;  // 回调，与 conn_req 签名一致
+// 发起请求，等待响应（返回 sender<ResponseType>）
+rpc::call(channel, method_id, request)
+    >> then([](auto&& response) { /* 处理响应 */ });
+
+// 带超时的调用
+rpc::call(channel, method_id, request, timeout_ms)
+    >> then([](auto&& response) { ... })
+    >> any_exception([](auto e) { /* 超时或其他错误 */ });
+
+// 发送通知（fire-and-forget，返回 sender<void>）
+rpc::notify(channel, method_id, message);
+```
+
+### 5.2 服务端注册与启动
+
+```cpp
+// 注册方法处理器
+dispatcher.on(METHOD_FOO, [](FooRequest&& req) {
+    return FooResponse{...};  // 同步处理器
+});
+
+dispatcher.on(METHOD_BAR, [](BarRequest&& req) {
+    return just() >> async_process(req);  // 异步处理器，返回 sender
+});
+
+// 启动 RPC 服务（接收循环 + 分发）
+rpc::serve(channel, dispatcher) >> submit(ctx);
+```
+
+### 5.3 Channel 创建
+
+```cpp
+// 从 net session 创建 RPC channel
+auto channel = rpc::make_channel<MyCodec>(session_id, session_scheduler);
+
+// 在 pipeline 中使用
+connect(sched, addr, port)
+    >> then([sched](session_id_t sid) {
+        return net::join(sched, sid)
+            >> then([sid, sched]() {
+                auto ch = rpc::make_channel<MyCodec>(sid, sched);
+                return rpc::call(ch, METHOD_HELLO, HelloReq{});
+            }) >> flat();
+    }) >> flat()
+    >> then([](HelloResp&& resp) { ... });
+```
+
+### 5.4 组合能力要求
+
+RPC 操作必须是可组合的 sender，支持所有 PUMP pipeline 算子：
+
+```cpp
+// 并发 RPC 调用
+when_all(
+    rpc::call(ch, METHOD_A, req_a),
+    rpc::call(ch, METHOD_B, req_b),
+    rpc::call(ch, METHOD_C, req_c)
+) >> then([](auto&& results) { ... });
+
+// 流式处理中的 RPC
+for_each(items) >> concurrent(N)
+    >> then([ch](auto item) {
+        return rpc::call(ch, METHOD_PROCESS, ProcessReq{item});
+    }) >> flat() >> reduce();
+
+// 扇出：同一请求发给多个 peer
+for_each(peers) >> concurrent()
+    >> then([req](auto& peer_ch) {
+        return rpc::call(peer_ch, METHOD_VOTE, req);
+    }) >> flat() >> reduce();
+```
+
+---
+
+## 六、性能约束
+
+| 约束 | 具体要求 |
+|------|----------|
+| **零拷贝 decode** | 从 ring buffer 直接读取消息头和 payload，不 memcpy |
+| **高效 encode** | 直接构造 iovec 数组，writev 发送 |
+| **无锁** | 所有 RPC 状态（pending map、dispatcher）在 session 所属 core 的单线程 scheduler 上操作 |
+| **热路径无堆分配** | pending slot 预分配；消息对象栈上或预分配 |
+| **编译期分发** | method dispatch 尽量通过模板或 constexpr if 实现 |
+| **批处理** | 一次 recv 处理所有可用消息，不逐条 recv |
+| **最小跨核开销** | 跨核 RPC 调用仅通过 lock-free queue 传递指针/ID |
+| **cache 友好** | pending request 数组线性存储，避免指针追逐 |
+
+---
+
+## 七、错误处理
+
+### 7.1 RPC 级错误
+
+| 错误 | 触发条件 | 传播方式 |
+|------|----------|----------|
+| `rpc_timeout` | 请求超时未收到响应 | 通过 pending callback 传播 exception |
+| `method_not_found` | 收到未注册 method 的请求 | 自动回复 Error 消息 |
+| `remote_error` | 对端 handler 返回/抛出错误 | 作为 Error 消息传回，调用方收到 exception |
+| `codec_error` | 编解码失败 | exception 传播到当前 pipeline |
+| `connection_lost` | 连接断开 | 所有 pending requests 收到 exception |
+| `channel_closed` | Channel 已关闭，尝试调用 | 立即 exception |
+| `pending_overflow` | pending requests 数量超过上限 | 拒绝新请求，exception |
+
+### 7.2 错误消息格式
+
+- Error 消息使用独立的 type 标识
+- 包含 request_id（匹配原始请求）
+- 包含 error_code（数值）和可选 error_message
+- 编码方式由 Codec 决定
+
+### 7.3 Handler 异常处理
+
+- Handler 抛出异常时，框架捕获并自动构造 Error Response 发回
+- Handler 返回的 sender 产生异常时，同样转为 Error Response
+- 框架不吞掉异常，异常信息应完整传回调用方
+
+---
+
+## 八、上层协议扩展分析
+
+### 8.1 各协议需求对照
+
+| 能力 | Raft | RESP | MQ |
+|------|------|------|-----|
+| Request-Response | ✓ | ✓ | ✓ |
+| 双向发起 | ✓ (vote/append) | ✗ (client→server) | ✓ (push) |
+| Notification | ✓ (heartbeat) | ✓ (pub/sub push) | ✓ (message push) |
+| 连接复用 | 低（通常 1 inflight） | 高（pipelining） | 中 |
+| 大消息 | ✓ (InstallSnapshot) | ✗ (通常 <1MB) | ✓ |
+| 自定义 wire format | 可用标准格式 | ✓ (RESP 行协议) | 取决于设计 |
+| 流式传输 | ✓ (日志复制) | ✗ | ✓ (消费流) |
+| Per-session 状态 | ✓ (term/index) | ✓ (auth/selected_db) | ✓ (subscriptions) |
+
+### 8.2 扩展点
+
+| 扩展点 | 机制 | 说明 |
+|--------|------|------|
+| **Codec** | 模板参数 | 协议实现自己的编解码 |
+| **Protocol State** | 模板参数注入到 Channel | 协议附加 per-session 状态 |
+| **Handler** | 注册表 | 协议注册方法处理器 |
+| **Connection Policy** | 配置 | 心跳间隔、超时、最大并发请求数 |
+| **Message Type** | Codec 内扩展 | 协议可以定义额外的消息类型 |
+
+### 8.3 RESP 特殊考量
+
+RESP 有完全不同的 wire format（行协议，`+OK\r\n`、`$5\r\nhello\r\n`）：
+- 不使用通用的二进制 RPC 头
+- 自己的长度语义和分隔符
+- Pipelining：连续发送多条命令，响应按序返回
+
+RPC 层需要的灵活性：**Codec 必须能完全控制消息帧的解析**，RPC 层不硬编码任何帧格式。对于 RESP 这类协议，Codec 自己处理行协议解析，RPC 层只负责提供请求关联和分发框架。
+
+### 8.4 协议实现方式
+
+上层协议通过以下方式使用 RPC 层：
+
+```cpp
+// 1. 定义 Codec
+struct RaftCodec {
+    // 实现 decode_header, decode_payload, encode ...
 };
-```
 
-**设计要点**：
-- 回调签名与 `conn_req` 完全一致（都返回 `session_id_t`），确保下游管道可以无差异对待服务端和客户端连接
-- 连接失败时回调空 `session_id_t{}`（与 accept_scheduler 的错误处理方式一致）
+// 2. 定义 Protocol State（可选）
+struct RaftSessionState {
+    uint64_t current_term;
+    uint64_t last_log_index;
+    // ...
+};
 
-### 3.4 新增 Sender：`connect` sender
+// 3. 创建 Channel
+auto ch = rpc::make_channel<RaftCodec, RaftSessionState>(session_id, scheduler);
 
-**文件位置**：`src/env/scheduler/net/senders/connect.hh`（新文件）
+// 4. 注册 Handler
+ch.dispatcher().on(APPEND_ENTRIES, [](AppendEntriesReq&& req) { ... });
+ch.dispatcher().on(REQUEST_VOTE, [](RequestVoteReq&& req) { ... });
 
-**结构**（与 `conn.hh` 对称）：
+// 5. 启动服务
+rpc::serve(ch) >> submit(ctx);
 
-```cpp
-namespace pump::scheduler::net::senders::connect {
-    template <typename scheduler_t>
-    struct op {
-        using request_t = common::connect_req;
-        constexpr static bool net_sender_connect_op = true;
-        scheduler_t* scheduler;
-        const char* address;
-        uint16_t port;
-
-        template<uint32_t pos, typename context_t, typename scope_t>
-        auto start(context_t &context, scope_t &scope) {
-            return scheduler->schedule(
-                new common::connect_req{
-                    address, port,
-                    [context = context, scope = scope](common::session_id_t sid) mutable {
-                        core::op_pusher<pos + 1, scope_t>::push_value(context, scope, sid);
-                    }
-                }
-            );
-        }
-    };
-
-    template<typename scheduler_t>
-    struct sender {
-        scheduler_t* scheduler;
-        const char* address;
-        uint16_t port;
-        // ... make_op(), connect() 方法
-    };
-}
-```
-
-**op_pusher 特化**和 **compute_sender_type 特化**：
-- 与 `conn.hh` 中的模式完全一致
-- `compute_sender_type::get_value_type_identity()` 返回 `session_id_t`（与 conn 相同）
-
-### 3.5 API 层：`net.hh` 新增
-
-**文件位置**：`src/env/scheduler/net/net.hh`
-
-```cpp
-namespace pump::scheduler::net {
-    // 显式 scheduler 版本
-    template <typename scheduler_t>
-    inline auto
-    connect(scheduler_t* sche, const char* address, uint16_t port) {
-        return senders::connect::sender<scheduler_t>(sche, address, port);
-    }
-
-    // flat_map 版本（从上下文获取 scheduler）
-    inline auto
-    connect(const char* address, uint16_t port) {
-        return pump::sender::flat_map([address, port]<typename scheduler_t>(scheduler_t* sche) {
-            return connect(sche, address, port);
-        });
-    }
-}
+// 6. 发起调用
+rpc::call(ch, APPEND_ENTRIES, AppendEntriesReq{...})
+    >> then([](AppendEntriesResp&& resp) { ... });
 ```
 
 ---
 
-## 四、使用示例
+## 九、流式传输需求（Phase 2）
 
-### 4.1 基本客户端用法
+以下需求不要求第一版实现，但架构设计时应预留扩展空间。
 
-```cpp
-// 连接到服务器并发送数据
-connect(connect_sched, "127.0.0.1", 8080)
-    >> then([session_sched](session_id_t sid) {
-        return join(session_sched, sid)
-            >> send(session_sched, sid, vec, cnt)
-            >> recv(session_sched, sid)
-            >> then([](packet_buffer* buf) {
-                // 处理响应
-            })
-            >> stop(session_sched, sid);
-    })
-    >> submit(core::make_root_context());
-```
+### 9.1 服务端流（Server Streaming）
 
-### 4.2 Echo 客户端示例（与 echo.cc 服务端对应）
-
-```cpp
-template <typename connect_scheduler_t, typename session_scheduler_t>
-void run_echo_client() {
-    using rs_t = runtime_schedulers<connect_scheduler_t, session_scheduler_t>;
-    just()
-        >> get_context<rs_t*>()
-        >> then([](rs_t* rs) {
-            auto* connect_sched = rs->template get_schedulers<connect_scheduler_t>()[0];
-            return scheduler::net::connect(connect_sched, "127.0.0.1", 8080)
-                >> then([rs](scheduler::net::common::session_id_t sid) {
-                    client_session_proc(rs, sid)
-                        >> submit(core::make_root_context());
-                })
-                >> submit(core::make_root_context(rs));
-        })
-        >> get_context<rs_t*>()
-        >> then([](rs_t* rs) {
-            env::runtime::start(rs->schedulers_by_core);
-        })
-        >> submit(core::make_root_context(
-            create_client_runtime_schedulers<connect_scheduler_t, session_scheduler_t>()
-        ));
-}
-```
-
-### 4.3 连接池模式（多连接）
-
-```cpp
-// 建立 N 个连接
-just()
-    >> forever()    // 或 repeat(N)
-    >> flat_map([connect_sched, addr, port](...) {
-        return scheduler::net::connect(connect_sched, addr, port);
-    })
-    >> then([rs](session_id_t sid) {
-        // 每个连接独立的会话处理管道
-        client_session_proc(rs, sid)
-            >> submit(core::make_root_context());
-    })
-    >> count()
-    >> submit(core::make_root_context(rs));
-```
-
-### 4.4 客户端与服务端对称性展示
+一个 Request 触发多个 Response：
+- Raft 日志复制：一次请求返回多条日志条目
+- MQ 消费：订阅后持续收到消息
 
 ```cpp
 // 服务端
-wait_connection(accept_sched)           >> then([](session_id_t sid) { ... });
+dispatcher.on_stream(METHOD_SUBSCRIBE, [](SubscribeReq&& req) {
+    return for_each(messages) >> then([](auto& msg) { return msg; });
+    // 返回 sender 流，每个值自动作为一条 Response 发送
+});
 
 // 客户端
-connect(connect_sched, addr, port)      >> then([](session_id_t sid) { ... });
-
-// 连接建立之后，服务端和客户端的会话处理代码完全相同：
-join(session_sched, sid)
-    >> recv(session_sched, sid)
-    >> send(session_sched, sid, vec, cnt)
-    >> stop(session_sched, sid)
+rpc::call_stream(ch, METHOD_SUBSCRIBE, req)
+    >> for_each([](SubscribeResp&& resp) { /* 处理每条消息 */ });
 ```
 
----
+### 9.2 双向流（Bidirectional Streaming）
 
-## 五、实现计划与优先级
-
-### P0 — 核心基础设施
-
-1. **新增 `connect_req` 结构体**（`common/struct.hh`）
-2. **新增 `connect` sender**（`senders/connect.hh`），包含 op、sender、op_pusher 特化、compute_sender_type 特化
-3. **更新 `net.hh`**，新增 `connect()` API 函数，新增 `#include "./senders/connect.hh"`
-
-### P1 — 后端实现
-
-4. **实现 epoll `connect_scheduler`**（`epoll/scheduler.hh` 或新文件 `epoll/connect_scheduler.hh`）
-   - 非阻塞 connect + EPOLLOUT 监听
-   - getsockopt(SO_ERROR) 验证连接结果
-   - create_internal_session 复用 accept_scheduler 的 session 创建逻辑
-5. **实现 io_uring `connect_scheduler`**（`io_uring/scheduler.hh` 或新文件）
-   - io_uring_prep_connect 异步连接
-   - 新增 `uring_event_type::CONNECT`
-   - CQE 处理连接完成
-
-### P2 — 示例与验证
-
-6. **编写 echo 客户端示例**（`apps/example/echo_client/` 或在 echo.cc 中增加 `--client` 模式）
-7. **验证**：echo 客户端连接 echo 服务端，发送数据并验证回显正确
-
-### P3 — 健壮性
-
-8. **连接超时处理**：connect_scheduler 内部可选超时机制
-9. **连接失败重试**：可在 sender 管道层面通过 `repeat` + 异常处理实现，无需侵入 scheduler
-10. **多目标地址连接**：DNS 解析后尝试多个地址（后续扩展，初期可不实现）
+建立流通道后，双方持续收发消息。需要：stream_id、flow control、背压机制。
 
 ---
 
-## 六、设计约束与注意事项
+## 十、待讨论问题
 
-### 6.1 必须遵循的框架原则
+### Q1: 消息帧归属
 
-| 原则 | 客户端实现要求 |
-|------|---------------|
-| **Single-Thread Scheduler** | `connect_scheduler` 只能被单个线程运行，所有 connect 事件在同一线程处理 |
-| **Lock-Free** | 使用 `mpsc::queue` / `mpmc::queue` 做请求/结果传递，不引入锁 |
-| **Flat OpTuple** | `connect` sender 的 op 必须支持被编译期平铺到 tuple 中 |
-| **Position-based Pushing** | `connect` op 的 `start` 方法通过 `op_pusher<pos+1>` 推进 |
-| **Scheduler Isolation** | connect_scheduler 与 session_scheduler 保持执行域隔离 |
+当前 Net 层 recv 端硬编码 2 字节长度前缀（`has_full_pkt`），send 端不自动加前缀。
 
-### 6.2 session_scheduler 零修改
+- **选项 A**：扩展 Net 层，长度前缀参数化（2/4 字节），RPC 层复用 Net 层的帧
+- **选项 B**：RPC 层完全接管帧，Net 层退化为纯字节流（recv 直接返回 buffer，RPC 层自己解析帧）
+- **选项 C**：保持现状，RPC 层在 64KB payload 内工作，大消息在 RPC 层分片重组
 
-客户端连接建立后产生的 `session_id_t` 与服务端 accept 产生的 `session_id_t` 格式完全一致（ptr + generation 编码），因此 `session_scheduler` 的 `join / recv / send / stop` 操作**无需任何修改**即可服务客户端会话。
+哪种方案更符合你的预期？
 
-### 6.3 connect_req 与 conn_req 的关系
+### Q2: RPC 头格式
 
-- `conn_req`：accept_scheduler 的接口，语义为"等待一个新连接"
-- `connect_req`：connect_scheduler 的接口，语义为"主动建立一个连接到指定地址"
-- 两者的回调签名相同（`void(session_id_t)`），确保下游管道处理的统一性
-- `connect` sender 可复用 `conn_op_t` 模板参数的模式，也可定义独立的 `connect_op_t`
+- **选项 A（标准头）**：RPC 层定义固定二进制头 `[type:1B][req_id:4B][method_id:2B]`，框架直接解析，Codec 只负责 payload
+  - 优点：框架可以通用处理关联/分发，Codec 更简单
+  - 缺点：RESP 等自定义 wire format 的协议无法使用
 
-### 6.4 错误处理
+- **选项 B（Codec 全权）**：RPC 头部也由 Codec 定义和解析，框架通过 Codec trait 获取 type/req_id/method_id
+  - 优点：最大灵活性，任何协议都能适配
+  - 缺点：Codec 实现更复杂，框架难以做通用优化
 
-客户端连接可能遇到的错误：
+倾向哪种？
 
-| 错误场景 | 处理方式 |
-|----------|----------|
-| 连接被拒绝（ECONNREFUSED） | 回调空 `session_id_t{}`，上层通过 `any_exception` 捕获 |
-| 连接超时 | 由 connect_scheduler 内部定时器触发超时，回调错误 |
-| 网络不可达（ENETUNREACH） | 同连接被拒绝 |
-| socket 创建失败 | 同连接被拒绝 |
+### Q3: 流式传输优先级
 
-### 6.5 与 `scheduler_config` 的关系
+流式传输（Server Streaming / Bidirectional Streaming）是否在第一版就需要？还是先完成 Request-Response + Notification，后续迭代加入？
 
-现有 `scheduler_config` 中的 `address` 和 `port` 字段在服务端表示监听地址。对于客户端，这两个字段语义变为目标连接地址。可以考虑：
-- 方案 A：复用 `scheduler_config`，语义由使用方决定（推荐，最小改动）
-- 方案 B：新增 `client_config` 结构体（如果未来客户端需要额外配置项）
+### Q4: 跨核 RPC 调用
 
-初期推荐方案 A。
+当 core 0 上的代码需要通过 core 2 上的 session 发送 RPC 请求：
+- 发送通过 session_scheduler 的 lock-free send queue 跨核投递（已有机制）
+- 响应到达 core 2（session 所在 core），需要将结果传回 core 0
 
----
+如何高效完成最后一步？选项：
+- **A**：响应 callback 直接在 core 2 上执行（调用方 pipeline 在 core 2 继续）
+- **B**：通过 task_scheduler 将结果投递回 core 0（额外一次跨核，但调用方在原 core 继续）
 
-## 七、文件变更清单
+### Q5: 背压
 
-| 操作 | 文件路径 | 变更内容 |
-|------|----------|----------|
-| 修改 | `common/struct.hh` | 新增 `connect_req` 结构体 |
-| 新增 | `senders/connect.hh` | `connect` 的 op、sender、op_pusher、compute_sender_type |
-| 修改 | `net.hh` | 新增 `connect()` API，新增 `#include` |
-| 修改或新增 | `epoll/scheduler.hh` 或 `epoll/connect_scheduler.hh` | epoll 后端 `connect_scheduler` |
-| 修改或新增 | `io_uring/scheduler.hh` 或 `io_uring/connect_scheduler.hh` | io_uring 后端 `connect_scheduler` |
-| 新增 | `apps/example/echo_client/` | echo 客户端示例 |
-| 修改 | `apps/CMakeLists.txt` | 新增 echo_client 构建目标 |
+当 pending requests 过多时：
+- **A**：hard limit + 拒绝新请求（简单，符合无锁设计）
+- **B**：流控协商（复杂，可能需要协议配合）
+
+### Q6: 请求取消
+
+是否需要支持取消已发送但未收到响应的请求？
+- 本地取消（从 pending map 移除，后续响应丢弃）？
+- 远程取消（通知对端停止处理）？
+
+### Q7: 连接池
+
+客户端是否需要内置连接池（多个连接到同一目标，自动负载均衡）？还是由应用层自行管理？
