@@ -58,7 +58,7 @@ namespace pump::sender {
                 explicit
                 sender(prev_t&& s, value_t&& v)
                     : prev(__fwd__(s))
-                    , value(__fwd__(value)){
+                    , value(__fwd__(v)){
                 }
 
                 sender(sender&& o)noexcept
