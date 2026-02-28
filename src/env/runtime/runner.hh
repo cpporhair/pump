@@ -56,6 +56,11 @@ namespace pump::env::runtime {
         std::tuple<std::vector<Schedulers*>...> schedulers;
         runtime_preemption_queues<Schedulers...> preemption_queues;
 
+        explicit
+        runtime_schedulers_base()
+            : schedulers_by_core(std::thread::hardware_concurrency()) {
+        }
+
         template<typename T>
         [[nodiscard]]
         auto get_by_core(uint32_t core) const {
@@ -90,8 +95,11 @@ namespace pump::env::runtime {
             return preemption_queues.template get<T>();
         }
 
-        void add_core_schedulers(Schedulers*... scheds) {
-            schedulers_by_core.emplace_back(scheds...);
+        void
+        add_core_schedulers(uint32_t core, Schedulers*... scheds) {
+            assert(core < schedulers_by_core.size());
+            assert(std::apply([](auto *... sche) { return (... && (sche == nullptr)); }, schedulers_by_core[core]));
+            schedulers_by_core[core] = std::tuple<Schedulers *...>{scheds...};
             (std::get<std::vector<Schedulers *> >(schedulers).push_back(scheds), ...);
         }
     };
