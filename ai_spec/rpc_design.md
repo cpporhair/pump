@@ -20,7 +20,7 @@ src/env/scheduler/rpc/
 ├── channel/
 │   ├── channel.hh              # RPC Channel 核心结构
 │   ├── pending_map.hh          # 请求-响应关联表
-│   └── dispatcher.hh           # 消息分发器
+│   └── dispatcher.hh           # 静态分发器（service 模板 + visit dispatch）
 ├── senders/
 │   ├── call.hh                 # rpc::call sender（请求-响应）
 │   ├── notify.hh               # rpc::notify sender（单向通知）
@@ -38,7 +38,7 @@ rpc::call / rpc::notify / rpc::serve
          ▼
    RPC Channel (channel.hh)
    ├── pending_map.hh     ─── 请求-响应关联
-   ├── dispatcher.hh      ─── method_id → handler 分发
+   ├── dispatcher.hh      ─── service<sid> 模板 + visit() 静态分发
    ├── header.hh          ─── RPC 固定头解析/构造
    └── Codec<T>           ─── payload 编解码（模板参数）
          │
@@ -440,243 +440,367 @@ namespace pump::rpc {
 
 ---
 
-## 五、消息分发器（Dispatcher）
 
-### 5.1 设计原则：Handler 统一返回 Sender
+## 五、消息分发器（Dispatcher）— 静态注册与编译期分发
 
-**所有 handler 统一返回 sender**，无论业务逻辑是同步还是异步：
+### 5.1 设计原则
 
-| 场景 | handler 写法 | 说明 |
-|------|-------------|------|
-| 同步处理 | `return just(FooResponse{...});` | 用 `just()` 包装同步结果 |
-| 异步处理 | `return just() >> on(sched) >> then(process);` | 直接返回 sender pipeline |
-| 查表处理 | `return just(req) >> flat_map(lookup) >> then(build_resp);` | 任意组合 |
+| 原则 | 说明 |
+|------|------|
+| 静态注册 | 服务通过模板特化注册，编译期确定分发表 |
+| 编译期分发 | 利用 PUMP `visit()` 算子将运行时 service_id 提升为编译期类型分支 |
+| Handler 返回 Sender | 同步/异步统一返回 sender，与 PUMP pipeline 无缝组合 |
+| 零运行时开销 | 无虚函数、无 `move_only_function`、无数组查找 |
+| 应用层扩展 | 应用层只需特化 `service<sid>` 模板，定义 `handle()` 方法 |
 
-**优势**：
-- 统一接口：`on()` 只有一个注册方法，handler 签名一致
-- PUMP 原生：handler 返回值就是 sender，与框架无缝组合
-- 无歧义：框架不需要判断 handler 返回值是 sender 还是普通值
-- 灵活性：handler 内部可以切换 scheduler、并发、异常处理
-
-### 5.2 Handler 接口
+### 5.2 框架提供的基础设施
 
 ```cpp
 // channel/dispatcher.hh
 namespace pump::rpc {
 
-    // 传递给 handler 的请求上下文
-    struct handler_context {
-        uint32_t     request_id;  // 原始请求 ID（Request 有效，Notification 为 0）
-        uint16_t     method_id;   // 方法 ID
-        payload_view payload;     // payload 视图（指向 ring buffer，零拷贝）
+    // ─── 1. 服务类型枚举 ───
+    // 由应用层定义，数值直接对应 RPC header 中的 method_id 字段
+    // 例：
+    //   enum class service_type : uint16_t {
+    //       raft_append = 1,
+    //       raft_vote   = 2,
+    //       kv_get      = 3,
+    //       kv_put      = 4,
+    //       max_service
+    //   };
+
+    // ─── 2. Handler concept ───
+    // 检查 service 是否有处理 Req 类型的 handle 方法
+    template<typename T, typename Req>
+    concept has_handle = requires(Req&& r) {
+        T::handle(std::forward<Req>(r));
     };
 
-    // handler 签名：接收 handler_context，返回 sender
-    //
-    // 对于 Request handler：
-    //   sender 产生的值作为 Response payload 发送回调用方
-    //   sender 产生的异常转为 Error Response 发送回调用方
-    //
-    // 对于 Notification handler：
-    //   sender 产生的值被忽略（无 Response）
-    //   sender 产生的异常由框架记录/忽略
-    //
-    // 用法示例：
-    //   // 同步：直接返回结果
-    //   dispatcher.on(METHOD_ADD, [](handler_context&& ctx) {
-    //       auto req = codec.decode_payload<AddReq>(ctx.payload);
-    //       return just(AddResp{.result = req.a + req.b});
-    //   });
-    //
-    //   // 异步：返回 sender pipeline
-    //   dispatcher.on(METHOD_GET, [sched](handler_context&& ctx) {
-    //       auto key = codec.decode_payload<GetReq>(ctx.payload).key;
-    //       return just(key)
-    //           >> on(sched->as_task())
-    //           >> flat_map([](auto&& k) { return db_lookup(k); })
-    //           >> then([](auto&& val) { return GetResp{.value = val}; });
-    //   });
-
-    // 运行期分发表：method_id → handler
-    template<typename channel_t>
-    struct dispatcher {
-        // handler_fn：类型擦除的 handler 包装
-        // 接收 channel 引用 + handler_context
-        // 内部执行：handler(ctx) >> encode_response >> send
-        using handler_fn = std::move_only_function<void(channel_t&, handler_context&&)>;
-
-        static constexpr uint16_t MAX_METHODS = 256;
-
-        std::array<handler_fn, MAX_METHODS> request_handlers;
-        std::array<handler_fn, MAX_METHODS> notification_handlers;
-        handler_fn default_handler;
-
-        dispatcher() {
-            default_handler = [](channel_t& ch, handler_context&& ctx) {
-                ch.send_error(ctx.request_id, error_code::method_not_found,
-                              "method not found");
-            };
-        }
-
-        // ─── 注册 Request handler ───
-        // Func 签名：auto handler(handler_context&&) -> sender<ResponsePayload>
-        // 框架自动：handler(ctx) >> encode >> send_response
-        template<typename Func>
-        void on(uint16_t method_id, Func&& handler) {
-            request_handlers[method_id] = wrap_request_handler(
-                std::forward<Func>(handler));
-        }
-
-        // ─── 注册 Notification handler ───
-        // Func 签名：auto handler(handler_context&&) -> sender<T>（T 被忽略）
-        // 框架自动：handler(ctx) >> ignore_results >> submit
-        template<typename Func>
-        void on_notification(uint16_t method_id, Func&& handler) {
-            notification_handlers[method_id] = wrap_notification_handler(
-                std::forward<Func>(handler));
-        }
-
-        // ─── 分发 Request ───
-        void dispatch_request(channel_t& ch, handler_context&& ctx) {
-            auto& h = request_handlers[ctx.method_id];
-            if (h) {
-                h(ch, std::move(ctx));
-            } else {
-                default_handler(ch, std::move(ctx));
-            }
-        }
-
-        // ─── 分发 Notification ───
-        void dispatch_notification(channel_t& ch, handler_context&& ctx) {
-            auto& h = notification_handlers[ctx.method_id];
-            if (h) {
-                h(ch, std::move(ctx));
-            }
-            // 未注册的 notification 静默丢弃
-        }
-
-    private:
-        // 包装 Request handler：
-        // handler 返回的 sender 产生值 → encode + send_response
-        // handler 返回的 sender 产生异常 → send_error
-        template<typename Func>
-        handler_fn wrap_request_handler(Func&& f) {
-            return [f = std::forward<Func>(f)](
-                channel_t& ch, handler_context&& ctx
-            ) mutable {
-                auto request_id = ctx.request_id;
-                auto method_id  = ctx.method_id;
-                auto ch_ptr     = ch.shared_from_this();
-
-                // handler 返回 sender，进入 pipeline 执行
-                f(std::move(ctx))
-                    >> then([ch_ptr, request_id, method_id](auto&& response) {
-                        auto encoded = ch_ptr->codec().encode_payload(response);
-                        ch_ptr->send_response(request_id, method_id,
-                                              std::move(encoded));
-                    })
-                    >> any_exception([ch_ptr, request_id](std::exception_ptr e) {
-                        ch_ptr->send_error(request_id, error_code::remote_error,
-                                           "handler exception");
-                        return just();
-                    })
-                    >> submit(ch.context());
-            };
-        }
-
-        // 包装 Notification handler：
-        // handler 返回的 sender 执行即可，不发送 Response
-        template<typename Func>
-        handler_fn wrap_notification_handler(Func&& f) {
-            return [f = std::forward<Func>(f)](
-                channel_t& ch, handler_context&& ctx
-            ) mutable {
-                f(std::move(ctx))
-                    >> ignore_all_exception()
-                    >> submit(ch.context());
-            };
-        }
+    // ─── 3. Service 基模板 ───
+    // 默认 is_service = false，表示未注册的服务
+    template<auto sid>
+    struct service {
+        static constexpr bool is_service = false;
     };
+
+    // ─── 4. 运行时 service_id → 编译期 service 类型 ───
+    // 将运行时 service_id 转为 variant<service<s1>, service<s2>, ...>
+    // 后续通过 PUMP visit() 展开为编译期分支
+    template<auto ...service_ids>
+    auto get_service_by_id(auto sid) {
+        using res_t = std::variant<service<service_ids>...>;
+        std::optional<res_t> result;
+        (void)((sid == service_ids
+                && (result.emplace(service<service_ids>{}), true)) || ...);
+        if (result)
+            return result.value();
+        throw method_not_found_error(static_cast<uint16_t>(sid));
+    }
+
+    // ─── 5. 分发算子 ───
+    // 返回一个 flat_map 算子，可直接嵌入 pipeline
+    // 上游需提供 (service_id, msg)
+    template<auto ...service_ids>
+    auto dispatch() {
+        return flat_map([](uint16_t service_id, auto&& msg) {
+            return just()
+                >> visit(get_service_by_id<service_ids...>(
+                       static_cast<service_type>(service_id)))
+                >> flat_map([req = std::forward<decltype(msg)>(msg)](
+                       auto&& svc) mutable {
+                    using svc_t = std::decay_t<decltype(svc)>;
+                    if constexpr (svc_t::is_service) {
+                        if constexpr (has_handle<svc_t, decltype(req)>)
+                            return svc_t::handle(std::move(req));
+                        else
+                            return just_exception(
+                                method_not_found_error(0));
+                    } else {
+                        return just_exception(
+                            method_not_found_error(0));
+                    }
+                });
+        });
+    }
 }
 ```
 
-### 5.3 使用示例
+### 5.3 分发机制详解
 
-```cpp
-auto ch = rpc::make_channel<MyCodec>(sid, session_sched, task_sched);
-
-// ─── 同步 handler：用 just() 包装返回值 ───
-ch->dispatcher().on(METHOD_PING, [](rpc::handler_context&& ctx) {
-    return just(PongResponse{.timestamp = now()});
-});
-
-// ─── 同步 handler：需要解码请求 ───
-ch->dispatcher().on(METHOD_ADD, [codec](rpc::handler_context&& ctx) {
-    auto req = codec.decode_payload<AddRequest>(ctx.payload);
-    return just(AddResponse{.result = req.a + req.b});
-});
-
-// ─── 异步 handler：涉及 IO 操作 ───
-ch->dispatcher().on(METHOD_GET, [sched, &db](rpc::handler_context&& ctx) {
-    auto key = codec.decode_payload<GetRequest>(ctx.payload).key;
-    return just(std::move(key))
-        >> on(sched->as_task())
-        >> then([&db](auto&& k) { return db.get(k); })
-        >> then([](auto&& val) { return GetResponse{.value = val}; });
-});
-
-// ─── 异步 handler：需要跨 scheduler ───
-ch->dispatcher().on(METHOD_STORE, [task_sched, nvme_sched](rpc::handler_context&& ctx) {
-    auto req = codec.decode_payload<StoreRequest>(ctx.payload);
-    return just(std::move(req))
-        >> on(task_sched->as_task())
-        >> then([](auto&& r) { return prepare_write(r); })
-        >> on(nvme_sched->put(page))    // 切换到 NVMe scheduler
-        >> then([]() { return StoreResponse{.ok = true}; });
-});
-
-// ─── Notification handler ───
-ch->dispatcher().on_notification(METHOD_HEARTBEAT, [](rpc::handler_context&& ctx) {
-    // 更新心跳时间戳
-    return just();  // 无返回值，sender<void>
-});
+```
+                          运行时                    编译期
+                            │                        │
+  recv → parse_header ──► service_id (uint16_t) ──┐  │
+                                                   │  │
+  get_service_by_id<s1,s2,s3>(service_id)          │  │
+        │                                          │  │
+        ▼                                          │  │
+  variant<service<s1>, service<s2>, service<s3>>   │  │
+        │                                          │  │
+  ── visit() ──────────────────────────────────────┼──┤
+        │                                          │  │
+        ├── service<s1>  ── if constexpr ──► handle(req)  → sender
+        ├── service<s2>  ── if constexpr ──► handle(req)  → sender
+        └── service<s3>  ── if constexpr ──► handle(req)  → sender
+                                                      │
+                                              flat() 展开 sender
 ```
 
-### 5.4 编译期分发（可选优化）
+**原理**：PUMP 的 `visit()` 为 variant 的每个备选类型分别实例化后续 lambda。每个实例化分支中 `svc` 是具体的 `service<sN>` 类型，因此可以使用 `if constexpr` 进行编译期检查和调用。
 
-对于方法数量固定且编译期已知的协议，可通过模板特化实现零开销分发：
+### 5.4 应用层实现 Service
 
 ```cpp
-// 编译期分发器（协议层可选使用）
-template<typename ProtocolDef>
-struct static_dispatcher {
-    // ProtocolDef 需提供：
-    //   static constexpr auto method_table = std::tuple{
-    //       method_entry<METHOD_A, HandlerA>{},
-    //       method_entry<METHOD_B, HandlerB>{},
-    //   };
+// ─── 应用层定义服务类型 ───
+enum class service_type : uint16_t {
+    math_service  = 1,
+    store_service = 2,
+    max_service
+};
 
-    template<typename channel_t>
-    static void dispatch(channel_t& ch, handler_req&& req) {
-        dispatch_impl(ch, std::move(req),
-                      std::make_index_sequence<
-                          std::tuple_size_v<decltype(ProtocolDef::method_table)>>{});
+// ─── 应用层特化 service<math_service> ───
+template<>
+struct pump::rpc::service<service_type::math_service> {
+    // 请求类型定义
+    struct add_req {
+        int a;
+        int b;
+    };
+
+    struct sleep_and_add_req {
+        int a;
+        int b;
+        int sleep_ms;
+    };
+
+    static constexpr bool is_service = true;
+
+    // 同步 handler：返回 just(result)
+    static auto handle(add_req&& req) {
+        return just(req.a + req.b);
     }
 
-private:
-    template<typename channel_t, size_t... Is>
-    static void dispatch_impl(channel_t& ch, handler_req&& req,
-                               std::index_sequence<Is...>) {
-        // 展开为 if-else chain（编译器通常优化为 jump table）
-        bool matched = ((std::get<Is>(ProtocolDef::method_table).method_id == req.method_id
-            && (std::get<Is>(ProtocolDef::method_table).handle(ch, std::move(req)), true))
-            || ...);
-        if (!matched) {
-            ch.send_error(req.request_id, error_code::method_not_found, "method not found");
+    // 异步 handler：返回 sender pipeline
+    static auto handle(sleep_and_add_req&& req) {
+        return just()
+            >> on(get_task_sched()->delay(req.sleep_ms))
+            >> then([a = req.a, b = req.b]() {
+                return a + b;
+            });
+    }
+};
+
+// ─── 应用层特化 service<store_service> ───
+template<>
+struct pump::rpc::service<service_type::store_service> {
+    struct get_req { uint64_t key; };
+    struct put_req { uint64_t key; uint64_t value; };
+
+    static constexpr bool is_service = true;
+
+    static auto handle(get_req&& req) {
+        return just(std::move(req))
+            >> on(nvme_sched->as_task())
+            >> flat_map([](auto&& r) { return db_lookup(r.key); });
+    }
+
+    static auto handle(put_req&& req) {
+        return just(std::move(req))
+            >> on(nvme_sched->as_task())
+            >> flat_map([](auto&& r) { return db_put(r.key, r.value); });
+    }
+};
+```
+
+### 5.5 请求类型解析（decode 层）
+
+`dispatch()` 算子接收 `(service_id, msg)`，其中 `msg` 的类型决定了 `has_handle` 的匹配。有两种实现策略：
+
+#### 策略 A：统一上下文类型（推荐 v1）
+
+所有 handler 接收统一的 `handler_context`，Service 内部完成解码和二级路由：
+
+```cpp
+namespace pump::rpc {
+    // 传递给 handler 的请求上下文
+    struct handler_context {
+        uint32_t     request_id;  // 原始请求 ID
+        uint16_t     service_id;  // 一级路由：服务类型
+        payload_view payload;     // payload 视图（零拷贝）
+    };
+}
+
+// Service 使用统一签名 handle(handler_context&&)
+template<>
+struct pump::rpc::service<service_type::math_service> {
+    static constexpr bool is_service = true;
+
+    // 内部方法 ID 定义
+    enum method : uint16_t { ADD = 0, SLEEP_ADD = 1 };
+
+    static auto handle(handler_context&& ctx) {
+        // 从 payload 头部读取 sub_method_id，进行二级路由
+        auto method_id = read_method_id(ctx.payload);
+        switch (method_id) {
+            case ADD: {
+                auto req = codec.decode_payload<add_req>(ctx.payload);
+                return just(req.a + req.b);
+            }
+            case SLEEP_ADD: {
+                auto req = codec.decode_payload<sleep_and_add_req>(ctx.payload);
+                return just()
+                    >> on(task_sched->delay(req.sleep_ms))
+                    >> then([a=req.a, b=req.b]() { return a + b; });
+            }
+            default:
+                return just_exception(method_not_found_error(method_id));
         }
     }
 };
 ```
+
+- **优势**：简单直接，`has_handle` 检查统一（所有 service 都 handle(handler_context&&)）
+- **适用**：v1 快速实现
+- **注意**：Service 内部 switch 的不同分支返回不同 sender 类型时，需要用 `visit()` 处理
+
+#### 策略 B：类型化请求 + 二级 visit（完全类型安全）
+
+每个 Service 定义 `decode` 方法返回请求 variant，框架做两级 visit：
+
+```cpp
+template<>
+struct pump::rpc::service<service_type::math_service> {
+    struct add_req { int a; int b; };
+    struct sleep_and_add_req { int a; int b; int sleep_ms; };
+
+    // 请求类型 variant
+    using request_types = std::variant<add_req, sleep_and_add_req>;
+
+    static constexpr bool is_service = true;
+
+    // decode: method_id → 具体请求类型
+    template<typename Codec>
+    static auto decode(uint16_t method_id, payload_view pv, Codec& codec)
+        -> request_types
+    {
+        switch (method_id) {
+            case 0: return codec.template decode_payload<add_req>(pv);
+            case 1: return codec.template decode_payload<sleep_and_add_req>(pv);
+            default: throw method_not_found_error(method_id);
+        }
+    }
+
+    // 类型化 handler（重载），即 rpc.md 中描述的方式
+    static auto handle(add_req&& req) {
+        return just(req.a + req.b);
+    }
+
+    static auto handle(sleep_and_add_req&& req) {
+        return just()
+            >> on(get_task_sched()->delay(req.sleep_ms))
+            >> then([a = req.a, b = req.b]() { return a + b; });
+    }
+};
+```
+
+框架侧的两级 visit 分发：
+
+```cpp
+// 二级 visit dispatch
+template<auto ...service_ids>
+auto dispatch() {
+    return flat_map([](handler_context&& ctx) {
+        return just()
+            // 第一级 visit：service_id → 具体 service 类型
+            >> visit(get_service_by_id<service_ids...>(ctx.service_id))
+            >> flat_map([ctx = std::move(ctx)](auto&& svc) mutable {
+                using svc_t = std::decay_t<decltype(svc)>;
+                if constexpr (svc_t::is_service) {
+                    // 解码为 request variant
+                    auto req_var = svc_t::decode(
+                        ctx.method_id, ctx.payload, codec);
+                    return just(std::move(req_var))
+                        // 第二级 visit：request variant → 具体请求类型
+                        >> visit()
+                        >> flat_map([](auto&& req) {
+                            using req_t = std::decay_t<decltype(req)>;
+                            if constexpr (has_handle<svc_t, req_t>)
+                                return svc_t::handle(std::move(req));
+                            else
+                                return just_exception(
+                                    method_not_found_error(0));
+                        });
+                } else {
+                    return just_exception(method_not_found_error(0));
+                }
+            });
+    });
+}
+```
+
+- **优势**：完全类型安全，handle 重载自动匹配；与 rpc.md 描述一致
+- **劣势**：每个 Service 需提供 `decode()` + `request_types`；两级 visit 编译开销略高
+- **适用**：协议稳定后的优化版本
+
+**推荐**：v1 使用策略 A 快速推进，后续迭代到策略 B 获得完全类型安全。
+
+### 5.6 服务端 serve 集成
+
+```cpp
+namespace pump::rpc {
+
+    // session 连接检查（协程生成器）
+    template<typename session_data_t>
+    auto check_session(const session_data_t& sd) -> coro::return_yields<bool> {
+        while (!sd.closed.load())
+            co_yield true;
+        co_return false;
+    }
+
+    // 完整的接收-分发-响应 pipeline
+    template<auto ...service_ids>
+    auto dispatch_proc(auto& sd) {
+        return for_each(coro::make_view_able(check_session(sd)))
+            >> flat_map([&sd](auto&&) {
+                return scheduler::net::recv(sd.scheduler, sd.id);
+            })
+            >> decode_msg()     // → (service_id, handler_context / typed_msg)
+            >> dispatch<service_ids...>()
+            >> then([&sd](auto&& response) {
+                // encode response → net::send
+                return encode_and_send(sd, std::forward<decltype(response)>(response));
+            }) >> flat()
+            >> any_exception([](std::exception_ptr e) {
+                // 单条消息处理异常不中断整个 serve 循环
+                // 记录日志或发送 Error Response
+                return just();
+            })
+            >> reduce();
+    }
+
+    // 对外接口：启动 RPC 服务
+    template<auto ...service_ids>
+    auto serv(auto* session_sched, net::session_id_t sid) {
+        return scheduler::net::join(session_sched, sid)
+            >> then([session_sched, sid]() {
+                session_data sd{session_sched, sid};
+                return dispatch_proc<service_ids...>(sd);
+            }) >> flat();
+    }
+}
+```
+
+### 5.7 性能分析
+
+| 对比项 | 运行期 dispatcher（数组） | 静态 dispatch（visit） |
+|--------|--------------------------|------------------------|
+| 分发开销 | 数组索引 + `move_only_function` 调用 | variant match + 编译期分支（零间接调用） |
+| 内存 | 预分配 256×handler 数组 | 零额外内存（编译期展开） |
+| 类型安全 | 运行期类型擦除 | 编译期 concept 检查 |
+| 扩展方式 | `ch->dispatcher().on(id, handler)` | 模板特化 `service<sid>` |
+| 虚函数 | `move_only_function` 有间接调用 | 无间接调用 |
+| 适用场景 | 动态协议、插件化 | 编译期确定的协议（Raft/KV/MQ） |
 
 ---
 
@@ -718,8 +842,9 @@ namespace pump::rpc {
         uint32_t                next_request_id = 1;  // 单调递增
         channel_status          status = channel_status::active;
         pending_map<>           pending;              // 请求-响应关联表
-        dispatcher<channel>     dispatch;             // 消息分发器
         Codec                   _codec;               // 编解码器实例
+        // 注意：无 dispatcher 成员——分发通过 dispatch<service_ids...>()
+        //       编译期静态分发，零运行时状态
 
         // ─── 协议层状态 ───
         [[no_unique_address]]
@@ -735,7 +860,6 @@ namespace pump::rpc {
 
         // ─── 访问器 ───
         Codec& codec() { return _codec; }
-        auto& dispatcher() { return dispatch; }
 
         // ─── 发送 Response ───
         void send_response(uint32_t request_id, uint16_t method_id,
@@ -849,155 +973,131 @@ void channel<Codec, SessionScheduler, TaskScheduler, PS>::send_response(
 
 ### 7.1 设计概述
 
-接收循环是一个持续运行的 pipeline，使用 `forever()` + `net::recv` 不断接收数据，对每次 recv 返回的 `packet_buffer` 解析所有完整消息并分发。
+接收循环有两种模式，取决于消息类型：
+- **Request/Notification**：走 `dispatch<service_ids...>()` 静态分发 pipeline（见 5.6）
+- **Response/Error**：通过 pending_map 回调直接唤醒调用方 pipeline
 
-### 7.2 Pipeline 结构
+接收循环的核心职责是：从 `packet_buffer` 中解析完整消息，按 type 字段分流。
+
+### 7.2 Pipeline 结构（完整版）
+
+结合第五章静态分发，完整的服务端 serve pipeline：
 
 ```cpp
 // senders/serve.hh
 namespace pump::rpc {
 
-    template<typename channel_ptr_t>
+    // 完整 serve：recv → parse → 分流（Response 走 pending_map，Request 走 dispatch）
+    template<auto ...service_ids, typename channel_ptr_t>
     auto serve(channel_ptr_t ch) {
-        auto* sched = ch->session_sched;
-        auto  sid   = ch->session_id;
+        auto& sd = ch->session_data();
 
-        return forever()                           // 无限循环
-            >> net::recv(sched, sid)               // 等待 recv 事件
-            >> then([ch](net::packet_buffer* buf) {
-                // 一次 recv 可能包含多条完整消息，全部处理
-                process_all_messages(ch, buf);
+        return for_each(coro::make_view_able(check_session(sd)))
+            >> flat_map([&sd, ch](auto&&) {
+                return scheduler::net::recv(sd.scheduler, sd.id);
             })
-            >> any_exception([ch](std::exception_ptr e) {
-                // recv 异常（连接断开等）
-                ch->on_connection_lost(e);
-                return just(); // 终止循环——通过设置 channel 状态
-            });
+            >> then([ch](net::packet_buffer* buf) {
+                // 处理 Response/Error（直接走 pending_map，不进 dispatch pipeline）
+                // 处理 Request/Notification（提取为 handler_context 流）
+                return extract_requests(ch, buf);
+            })
+            >> dispatch<service_ids...>()
+            >> then([ch](auto&& response) {
+                return encode_and_send(ch, std::forward<decltype(response)>(response));
+            }) >> flat()
+            >> any_exception([](std::exception_ptr) {
+                return just();  // 单条消息异常不中断 serve
+            })
+            >> reduce();
     }
 }
 ```
 
-### 7.3 消息解析与分发
+### 7.3 消息解析与分流
 
 ```cpp
 namespace pump::rpc {
 
+    // 从 packet_buffer 提取所有完整消息
+    // Response/Error → 直接处理（pending_map callback）
+    // Request/Notification → 收集为 handler_context 供 dispatch pipeline 消费
     template<typename channel_ptr_t>
-    void process_all_messages(channel_ptr_t& ch, net::packet_buffer* buf) {
-        // 循环处理 buffer 中所有完整消息
+    void process_buffer(channel_ptr_t& ch, net::packet_buffer* buf) {
         while (net::detail::has_full_pkt(*buf)) {
-            // 获取当前消息的 pkt_iovec（已去掉长度前缀的 payload）
             auto pkt = net::detail::get_recv_pkt(*buf);
 
-            // pkt 指向 Net payload = [rpc_header(7B) | rpc_payload]
-            // 需要从 iovec 中提取 header
-            dispatch_message(ch, pkt);
+            // 解析 RPC header
+            uint8_t header_buf[rpc_header::size];
+            const uint8_t* header_data = extract_header_bytes(pkt, header_buf);
+            auto header = parse_header(header_data);
+            payload_view pv = make_payload_view(pkt, rpc_header::size);
 
-            // 前进 buffer head，释放已处理的数据
+            switch (header.type) {
+                case message_type::response:
+                case message_type::error:
+                    // Response/Error：直接走 pending_map
+                    handle_response(ch, header, pv);
+                    break;
+
+                case message_type::request:
+                case message_type::notification:
+                    // Request/Notification：走静态 dispatch pipeline
+                    // 由上层 dispatch<service_ids...>() 处理
+                    handle_via_dispatch(ch, header, pv);
+                    break;
+            }
+
             buf->forward_head(pkt_total_len);
         }
+
+        // 顺便检查超时
+        ch->pending.check_timeouts(scheduler::task::scheduler::now_ms());
     }
 
-    template<typename channel_ptr_t>
-    void dispatch_message(channel_ptr_t& ch, const net::pkt_iovec& pkt) {
-        // 1. 解析 RPC header（前 7 字节）
-        // 需要处理 header 可能跨越 iovec 边界的情况
-        uint8_t header_buf[rpc_header::size];
-        const uint8_t* header_data = extract_header_bytes(pkt, header_buf);
-        auto header = parse_header(header_data);
-
-        // 2. 构造 payload_view（跳过 header 后的数据）
-        payload_view pv = make_payload_view(pkt, rpc_header::size);
-
-        // 3. 按消息类型分发
-        switch (header.type) {
-            case message_type::response:
-            case message_type::error:
-                handle_response(ch, header, pv);
-                break;
-
-            case message_type::request:
-                handle_request(ch, header, pv);
-                break;
-
-            case message_type::notification:
-                handle_notification(ch, header, pv);
-                break;
-        }
-    }
-
-    // 处理 Response/Error：查找 pending_map，执行 callback
+    // Response/Error：查找 pending_map，执行 callback，唤醒调用方 pipeline
     template<typename channel_ptr_t>
     void handle_response(channel_ptr_t& ch, const rpc_header& header,
                          const payload_view& pv) {
         auto cb = ch->pending.remove(header.request_id);
-        if (!cb) return; // 已超时移除或重复响应，丢弃
+        if (!cb) return; // 已超时或重复，丢弃
 
         if (header.type == message_type::error) {
-            // 解析 error payload，构造异常
             auto err = parse_error_payload(pv);
             (*cb)(std::make_exception_ptr(remote_error(err.code, err.message)));
         } else {
             (*cb)(pv);
         }
     }
-
-    // 处理 Request：分发到 handler，handler 返回 sender → encode → send_response
-    template<typename channel_ptr_t>
-    void handle_request(channel_ptr_t& ch, const rpc_header& header,
-                        const payload_view& pv) {
-        handler_context ctx{
-            .request_id = header.request_id,
-            .method_id  = header.method_id,
-            .payload    = pv,
-        };
-        ch->dispatch.dispatch_request(*ch, std::move(ctx));
-    }
-
-    // 处理 Notification：分发到 handler，handler 返回 sender → 执行即可
-    template<typename channel_ptr_t>
-    void handle_notification(channel_ptr_t& ch, const rpc_header& header,
-                             const payload_view& pv) {
-        handler_context ctx{
-            .request_id = 0, // Notification 无 request_id
-            .method_id  = header.method_id,
-            .payload    = pv,
-        };
-        ch->dispatch.dispatch_notification(*ch, std::move(ctx));
-    }
 }
 ```
 
-### 7.4 超时检测集成
+### 7.4 两种消息的处理路径对比
 
-超时检测有两种实现方式：
-
-**方案 A：per-request 定时器（精确但有开销）**
-
-每个 `rpc::call` 启动一个 `task_scheduler::delay` 定时器。超时后检查 pending_map 中是否还存在该 request_id。
-
-**方案 B：周期性扫描（批量但有延迟）** ← **推荐**
-
-在接收循环中定期调用 `pending.check_timeouts(now_ms)`：
-
-```cpp
-// 在 serve 的 pipeline 中集成超时检测
-auto serve(channel_ptr_t ch) {
-    return forever()
-        >> net::recv(sched, sid)
-        >> then([ch](net::packet_buffer* buf) {
-            process_all_messages(ch, buf);
-            // 每次 recv 返回后顺便检查超时
-            ch->pending.check_timeouts(scheduler::task::scheduler::now_ms());
-        })
-        >> any_exception(...);
-}
+```
+                        recv(packet_buffer*)
+                              │
+                    process_buffer (while has_full_pkt)
+                              │
+                 ┌────────────┴────────────┐
+                 │                         │
+          type=Response/Error         type=Request/Notification
+                 │                         │
+          pending_map.remove(rid)     静态 dispatch pipeline
+                 │                         │
+          callback(payload_view)      visit(service_id)
+                 │                         │
+          op_pusher<pos+1>            service<sid>::handle(ctx)
+          (唤醒调用方 pipeline)             │
+                                      返回 sender → encode → send
 ```
 
-**推荐方案 B 的理由**：
+### 7.5 超时检测
+
+**方案 B（推荐）**：每次 `process_buffer` 末尾调用 `check_timeouts(now_ms)`。
+
 - 无额外定时器开销
 - recv 返回频率通常足够高，超时精度可接受
-- 对于空闲连接（长时间无 recv 返回），可额外启动一个低频定时器补充扫描
+- 对于空闲连接，可额外启动低频定时器补充扫描
 
 ---
 
@@ -1240,54 +1340,52 @@ namespace pump::rpc {
 
 ## 九、典型使用流程
 
-### 9.1 服务端
+### 9.1 服务端（静态 Service 注册 + serve）
 
 ```cpp
-// 1. 已有 net 层 scheduler
-auto* accept_sched  = get_accept_scheduler();
-auto* session_sched = get_session_scheduler();
-auto* task_sched    = get_task_scheduler();
+// ─── 1. 定义服务类型 ───
+enum class service_type : uint16_t {
+    hello = 1,
+    math  = 2,
+    max_service
+};
 
-// 2. 定义 Codec（或使用 raw_codec）
-using MyCodec = pump::rpc::raw_codec;
+// ─── 2. 实现 service（模板特化）───
+template<>
+struct pump::rpc::service<service_type::hello> {
+    struct hello_req { char name[32]; };
+    struct hello_resp { char message[64]; };
 
-// 3. 等待连接并创建 Channel
+    static constexpr bool is_service = true;
+
+    static auto handle(rpc::handler_context&& ctx) {
+        auto req = codec.decode_payload<hello_req>(ctx.payload);
+        hello_resp resp{};
+        snprintf(resp.message, sizeof(resp.message), "hello %s", req.name);
+        return just(std::move(resp));
+    }
+};
+
+template<>
+struct pump::rpc::service<service_type::math> {
+    struct add_req { int a; int b; };
+
+    static constexpr bool is_service = true;
+
+    static auto handle(rpc::handler_context&& ctx) {
+        auto req = codec.decode_payload<add_req>(ctx.payload);
+        return just(req.a + req.b);
+    }
+};
+
+// ─── 3. 服务端启动 ───
 net::wait_connection(accept_sched)
-    >> then([session_sched, task_sched](net::session_id_t sid) {
-        // 创建 RPC Channel
-        auto ch = rpc::make_channel<MyCodec>(sid, session_sched, task_sched);
-
-        // 注册 handler —— 统一返回 sender
-        ch->dispatcher().on(METHOD_HELLO, [](rpc::handler_context&& ctx) {
-            auto req = MyCodec{}.decode_payload<HelloRequest>(ctx.payload);
-            return just(HelloResponse{.message = "world"});
-        });
-
-        ch->dispatcher().on(METHOD_ADD, [](rpc::handler_context&& ctx) {
-            auto req = MyCodec{}.decode_payload<AddRequest>(ctx.payload);
-            return just(AddResponse{.result = req.a + req.b});
-        });
-
-        // 异步 handler（也返回 sender，完全一致的注册接口）
-        ch->dispatcher().on(METHOD_GET, [task_sched](rpc::handler_context&& ctx) {
-            auto key = MyCodec{}.decode_payload<GetRequest>(ctx.payload).key;
-            return just(std::move(key))
-                >> on(task_sched->as_task())
-                >> then([](auto&& k) { return db_lookup(k); })
-                >> then([](auto&& val) { return GetResponse{.value = val}; });
-        });
-
-        // Notification handler（也返回 sender）
-        ch->dispatcher().on_notification(METHOD_HEARTBEAT,
-            [](rpc::handler_context&& ctx) {
-                return just(); // fire-and-forget
-            });
-
-        // 启动接收循环
-        return net::join(session_sched, sid)
-            >> then([ch]() {
-                return rpc::serve(ch);
-            }) >> flat();
+    >> then([session_sched](net::session_id_t sid) {
+        // 使用静态 dispatch，service 列表在模板参数中
+        return rpc::serv<
+            service_type::hello,
+            service_type::math
+        >(session_sched, sid);
     }) >> flat()
     >> submit(core::make_root_context(runtime_scope));
 ```
@@ -1295,22 +1393,24 @@ net::wait_connection(accept_sched)
 ### 9.2 客户端
 
 ```cpp
-// 1. 连接到服务端
+// 客户端调用 rpc::call，指定 service_type
 net::connect(connect_sched, "127.0.0.1", 8080)
-    >> then([session_sched, task_sched](net::session_id_t sid) {
-        auto ch = rpc::make_channel<MyCodec>(sid, session_sched, task_sched);
-
+    >> then([session_sched](net::session_id_t sid) {
         return net::join(session_sched, sid)
-            >> then([ch]() {
+            >> then([session_sched, sid]() {
                 // 启动接收循环（后台，处理 Response）
-                rpc::serve(ch) >> submit(/* ctx */);
+                rpc::serve<>(session_sched, sid) >> submit(/* ctx */);
 
                 // 发起 RPC 调用
-                return rpc::call(ch, METHOD_HELLO, HelloRequest{.name = "pump"}, 5000);
+                using hello_svc = rpc::service<service_type::hello>;
+                return rpc::call<service_type::hello>(
+                    session_sched, sid,
+                    hello_svc::hello_req{.name = "pump"},
+                    5000 /* timeout_ms */);
             }) >> flat();
     }) >> flat()
     >> then([](rpc::payload_view pv) {
-        auto resp = MyCodec{}.decode_payload<HelloResponse>(pv);
+        auto resp = codec.decode_payload<hello_svc::hello_resp>(pv);
         // 处理响应...
     })
     >> any_exception([](std::exception_ptr e) {
@@ -1320,27 +1420,42 @@ net::connect(connect_sched, "127.0.0.1", 8080)
     >> submit(ctx);
 ```
 
-### 9.3 双向 RPC
+### 9.3 双向 RPC（Raft 示例）
 
 ```cpp
-// 两端都注册 handler + 都可以发起 call
-auto ch = rpc::make_channel<RaftCodec, RaftState>(sid, session_sched, task_sched);
+// 定义 Raft 服务
+enum class raft_service : uint16_t {
+    append_entries = 1,
+    request_vote   = 2,
+};
 
-// 作为服务端：处理对方的请求——统一返回 sender
-ch->dispatcher().on(APPEND_ENTRIES, [](rpc::handler_context&& ctx) {
-    auto req = RaftCodec{}.decode_payload<AppendEntriesReq>(ctx.payload);
-    return just(handle_append_entries(std::move(req)));
-});
-ch->dispatcher().on(REQUEST_VOTE, [](rpc::handler_context&& ctx) {
-    auto req = RaftCodec{}.decode_payload<RequestVoteReq>(ctx.payload);
-    return just(handle_request_vote(std::move(req)));
-});
+template<>
+struct pump::rpc::service<raft_service::append_entries> {
+    static constexpr bool is_service = true;
+    static auto handle(rpc::handler_context&& ctx) {
+        auto req = RaftCodec{}.decode_payload<AppendEntriesReq>(ctx.payload);
+        return just(handle_append_entries(std::move(req)));
+    }
+};
 
-// 启动接收循环
-rpc::serve(ch) >> submit(ctx);
+template<>
+struct pump::rpc::service<raft_service::request_vote> {
+    static constexpr bool is_service = true;
+    static auto handle(rpc::handler_context&& ctx) {
+        auto req = RaftCodec{}.decode_payload<RequestVoteReq>(ctx.payload);
+        return just(handle_request_vote(std::move(req)));
+    }
+};
 
-// 作为客户端：向对方发起请求
-rpc::call(ch, APPEND_ENTRIES, AppendEntriesReq{...})
+// 两端都启动 serve（处理对方的 Request）
+rpc::serv<
+    raft_service::append_entries,
+    raft_service::request_vote
+>(session_sched, sid) >> submit(ctx);
+
+// 同时作为客户端发起 call
+rpc::call<raft_service::append_entries>(
+    session_sched, sid, AppendEntriesReq{...})
     >> then([](rpc::payload_view pv) { ... })
     >> submit(ctx);
 ```
@@ -1543,7 +1658,7 @@ Handler 执行
 | 组件 | 分配策略 |
 |------|----------|
 | pending_map | 预分配固定数组（MaxPending 个 slot） |
-| dispatcher | 预分配固定数组（MAX_METHODS 个 handler） |
+| dispatcher | 编译期展开，零运行时内存（静态 visit dispatch） |
 | rpc_header | 栈上 7 字节 |
 | encode_result | 小 payload 内联 64 字节；超出时堆分配（冷路径） |
 | send_req | `new` 分配 ← 唯一热路径堆分配（与 Net 层一致） |
@@ -1554,8 +1669,8 @@ Handler 执行
 ### 12.4 Cache 友好性
 
 - `pending_map`: `std::array` 线性存储，O(1) 查找（open addressing）
-- `dispatcher`: `std::array` 连续存储，method_id 直接索引
-- 无指针追逐（无链表、无 `std::unordered_map`）
+- `dispatcher`: 编译期 visit 展开，无运行时数据结构，零间接调用
+- 无指针追逐（无链表、无 `std::unordered_map`、无虚函数表）
 
 ---
 
@@ -1627,6 +1742,7 @@ Handler 执行
 | D6 | call 使用自定义 op/sender/op_pusher | 核心异步操作，需要精确控制 pipeline 挂起/恢复 |
 | D7 | Response callback 在 session 所在 core 执行 | 与 command.md Q4 一致，避免跨核同步 |
 | D8 | Error response 使用独立消息类型 | 与普通 Response 区分，便于框架层统一处理 |
-| D9 | dispatcher 数组大小固定 256 | method_id 为 uint16_t，但实际协议方法数通常 <256；如需更多可调整 |
+| D9 | 静态 dispatch（模板特化 + visit） | 替代运行期数组 dispatcher；零间接调用、编译期类型安全、无 `move_only_function` 开销；`service<sid>` 模板特化注册，`visit()` 编译期分发 |
 | D10 | encode_result 内联 64 字节 | 大多数小消息（<64B payload）零堆分配 |
-| D11 | Handler 统一返回 sender | 同步/异步统一接口，`on()` 只有一个注册方法；同步用 `just()` 包装，异步直接返回 pipeline；与 PUMP sender 语义一致，无需区分 `on()` / `on_async()` |
+| D11 | Handler 统一返回 sender | 同步用 `just()` 包装，异步直接返回 pipeline；与 PUMP sender 语义一致 |
+| D12 | v1 统一 `handler_context` 类型 | handler 接收统一上下文（含 service_id + payload_view），Service 内部做二级路由；后续可迭代为类型化请求 + 二级 visit |
