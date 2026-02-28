@@ -9,11 +9,20 @@
 共 4 个阶段、18 个步骤。每步产出可编译的增量代码。
 
 ```
-Phase 1: 核心骨架（Step 1-6）   → 基础类型、数据结构
-Phase 2: Sender 实现（Step 7-10） → call / notify / serve + 对外头文件
-Phase 3: 集成测试（Step 11-14）   → echo 示例 + 功能测试
-Phase 4: 优化扩展（Step 15-18）   → 心跳、优雅关闭、pool allocator、静态 dispatcher 优化
+Phase 1: 核心骨架（Step 1-6）   → 基础类型、数据结构              ✅ 已完成
+Phase 2: Sender 实现（Step 7-10） → call / notify / serve + 对外头文件 ✅ 已完成
+Phase 3: 集成测试（Step 11-14）   → echo 示例 + 功能测试            ✅ 已完成
+Phase 4: 优化扩展（Step 15-18）   → 心跳、优雅关闭、pool allocator、静态 dispatcher 优化  ⬚ 未开始
 ```
+
+### 实现过程中的重要修复
+
+| 问题 | 位置 | 修复 |
+|------|------|------|
+| timer timestamp 未传递给 op | `tasks_scheduler.hh` `_timer::sender::make_op()` | 传递 timestamp 到 op |
+| `\|\|` fold 短路导致 scheduler 未全部 advance | `env::runtime::run()` | 测试中使用 comma-fold advance 循环 |
+| send_message 中 encode_result::inline_buf 是栈变量 | `channel.hh` `send_message()` | 数据线性化到堆 buffer |
+| handle_stop_request 关闭 fd 未通知 pending recv | `io_uring/scheduler.hh` | 关闭 fd 前 exchange+通知 recv callback |
 
 目标目录结构：
 
@@ -41,9 +50,9 @@ src/env/scheduler/rpc/
 
 ---
 
-## Phase 1: 核心骨架
+## Phase 1: 核心骨架 ✅
 
-### Step 1 — 消息类型枚举 + RPC Header
+### Step 1 — 消息类型枚举 + RPC Header ✅
 
 **产出文件**：
 - `src/env/scheduler/rpc/common/message_type.hh`
@@ -67,7 +76,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 2 — 错误类型定义
+### Step 2 — 错误类型定义 ✅
 
 **产出文件**：`src/env/scheduler/rpc/common/error.hh`
 
@@ -91,7 +100,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 3 — Codec 抽象 + payload_view + Raw Codec
+### Step 3 — Codec 抽象 + payload_view + Raw Codec ✅
 
 **产出文件**：
 - `src/env/scheduler/rpc/common/codec_concept.hh`
@@ -120,7 +129,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 4 — Pending Request Map
+### Step 4 — Pending Request Map ✅
 
 **产出文件**：`src/env/scheduler/rpc/channel/pending_map.hh`
 
@@ -150,7 +159,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 5 — 静态分发器（Dispatcher）
+### Step 5 — 静态分发器（Dispatcher） ✅
 
 **产出文件**：`src/env/scheduler/rpc/channel/dispatcher.hh`
 
@@ -184,7 +193,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 6 — Channel 结构 + make_channel + config
+### Step 6 — Channel 结构 + make_channel + config ✅
 
 **产出文件**：
 - `src/env/scheduler/rpc/common/config.hh`
@@ -219,9 +228,9 @@ src/env/scheduler/rpc/
 
 ---
 
-## Phase 2: Sender 实现
+## Phase 2: Sender 实现 ✅
 
-### Step 7 — rpc::call Sender
+### Step 7 — rpc::call Sender ✅
 
 **产出文件**：`src/env/scheduler/rpc/senders/call.hh`
 
@@ -272,7 +281,7 @@ src/env/scheduler/rpc/
 
 ---
 
-### Step 8 — rpc::notify Sender
+### Step 8 — rpc::notify Sender ✅
 
 **产出文件**：`src/env/scheduler/rpc/senders/notify.hh`
 
@@ -295,7 +304,7 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-### Step 9 — rpc::serve 接收循环 + reply 辅助
+### Step 9 — rpc::serve 接收循环 + reply 辅助 ✅
 
 **产出文件**：
 - `src/env/scheduler/rpc/senders/reply.hh`
@@ -370,7 +379,7 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-### Step 10 — 统一对外头文件
+### Step 10 — 统一对外头文件 ✅
 
 **产出文件**：`src/env/scheduler/rpc/rpc.hh`
 
@@ -400,9 +409,9 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-## Phase 3: 集成测试
+## Phase 3: 集成测试 ✅
 
-### Step 11 — Echo RPC 示例
+### Step 11 — Echo RPC 示例 ✅
 
 **产出文件**：
 - `apps/example/rpc_echo/main.cc`
@@ -435,7 +444,7 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-### Step 12 — 超时测试
+### Step 12 — 超时测试 ✅
 
 **产出文件**：`apps/test/rpc_timeout_test.cc`
 
@@ -449,7 +458,7 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-### Step 13 — 并发 RPC 调用测试
+### Step 13 — 并发 RPC 调用测试 ✅
 
 **产出文件**：`apps/test/rpc_concurrent_test.cc`
 
@@ -463,7 +472,7 @@ notify 是 fire-and-forget，不进入 pending_map，不需要自定义 op（设
 
 ---
 
-### Step 14 — 连接断开恢复测试
+### Step 14 — 连接断开恢复测试 ✅
 
 **产出文件**：`apps/test/rpc_disconnect_test.cc`
 

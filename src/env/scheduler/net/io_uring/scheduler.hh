@@ -451,6 +451,11 @@ namespace pump::scheduler::net::io_uring {
                     continue;
                 }
                 s->status.store(common::detail::session_status::closed);
+                // Notify pending recv before closing fd
+                if (auto* r = recv_cache(s)->req.exchange(nullptr); r != nullptr) {
+                    r->cb(std::make_exception_ptr(common::session_closed_error()));
+                    delete r;
+                }
                 ::close(s->fd);
                 opt.value()->cb(true);
                 delete opt.value();

@@ -6,6 +6,8 @@ add_executable(example.share_nothing ./example/share_nothing/main.cc)
 add_executable(example.nvme ./example/nvme/nvme_test.cc)
 add_executable(example.coro ./example/coro/main.cc)
 add_executable(example.concurrent ./example/concurrent/main.cc)
+add_executable(example.rpc_echo_server ./example/rpc_echo/server.cc)
+add_executable(example.rpc_echo_client ./example/rpc_echo/client.cc)
 add_executable(apps.aisaq ./aisaq/main.cc)
 add_executable(apps.kv ./kv/main.cc)
 add_executable(test.sequential ./test/sequential_test.cc)
@@ -13,8 +15,19 @@ target_link_libraries(test.sequential PRIVATE pthread numa)
 add_executable(test.when_any ./test/when_any_test.cc)
 target_link_libraries(test.when_any PRIVATE pthread numa)
 
+add_executable(test.rpc_timeout ./test/rpc_timeout_test.cc)
+target_link_libraries(test.rpc_timeout PRIVATE ${URING_LIBRARY})
+
+add_executable(test.rpc_concurrent ./test/rpc_concurrent_test.cc)
+target_link_libraries(test.rpc_concurrent PRIVATE ${URING_LIBRARY})
+
+add_executable(test.rpc_disconnect ./test/rpc_disconnect_test.cc)
+target_link_libraries(test.rpc_disconnect PRIVATE ${URING_LIBRARY})
+
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.echo_client PRIVATE ${URING_LIBRARY})
+target_link_libraries(example.rpc_echo_server PRIVATE ${URING_LIBRARY})
+target_link_libraries(example.rpc_echo_client PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.share_nothing PRIVATE numa)
 target_link_libraries(example.pump PRIVATE numa)
 target_link_libraries(example.nvme PRIVATE 

@@ -124,7 +124,7 @@ namespace pump::scheduler::task {
             inline
             auto
             make_op() {
-                return op<scheduler_t>(scheduler);
+                return op<scheduler_t>{scheduler, timestamp};
             }
 
             template<typename context_t>
