@@ -224,7 +224,23 @@ namespace pump::scheduler::net::common {
         iovec* vec;
         size_t cnt;  // 2.2: unified to size_t
         std::move_only_function<void(bool)> cb;
+        uint16_t pkt_len = 0;
+        iovec* _send_vec = nullptr;
+        ~send_req() { delete[] _send_vec; }
     };
+
+    // build combined iovec: [uint16_t length prefix][user payload...]
+    inline void
+    prepare_send_vec(send_req* req) {
+        uint16_t payload_len = 0;
+        for (size_t i = 0; i < req->cnt; i++)
+            payload_len += req->vec[i].iov_len;
+        req->pkt_len = static_cast<uint16_t>(sizeof(uint16_t) + payload_len);
+        req->_send_vec = new iovec[req->cnt + 1];
+        req->_send_vec[0] = {&req->pkt_len, sizeof(uint16_t)};
+        for (size_t i = 0; i < req->cnt; i++)
+            req->_send_vec[i + 1] = req->vec[i];
+    }
 
     struct
     join_req {

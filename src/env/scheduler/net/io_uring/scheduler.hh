@@ -466,7 +466,8 @@ namespace pump::scheduler::net::io_uring {
             io_req->user_data = req;
             ::io_uring_sqe_set_data(sqe, io_req);
             if (s) {
-                ::io_uring_prep_writev(sqe, s->fd, req->vec, req->cnt, 0);
+                common::prepare_send_vec(req);
+                ::io_uring_prep_writev(sqe, s->fd, req->_send_vec, req->cnt + 1, 0);
             } else {
                 // session decode 失败，提交 NOP 避免未定义行为
                 ::io_uring_prep_nop(sqe);

@@ -39,12 +39,11 @@ session_proc(const runtime_schedulers<connect_scheduler_t, session_scheduler_t> 
     auto core_idx = sid.raw() % session_count;
     auto* session_sched = rs->template get_schedulers<session_scheduler_t>()[core_idx];
 
-    // build a message: 2-byte length prefix + "hello from pump client"
+    // send payload only - length prefix is auto-prepended by scheduler
     const char* msg = "hello from pump client";
-    uint16_t msg_len = static_cast<uint16_t>(strlen(msg) + sizeof(uint16_t));
+    auto msg_len = strlen(msg);
     auto* send_buf = new char[msg_len];
-    memcpy(send_buf, &msg_len, sizeof(uint16_t));
-    memcpy(send_buf + sizeof(uint16_t), msg, strlen(msg));
+    memcpy(send_buf, msg, msg_len);
     auto* vec = new iovec{send_buf, msg_len};
 
     return scheduler::net::join(session_sched, sid)

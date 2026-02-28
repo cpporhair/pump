@@ -40,10 +40,18 @@ auto
 read_packet_coro(scheduler::net::common::packet_buffer* buf) -> coro::return_yields<pkt_iovec_ex> {
     bool run = true;
     do {
-        if (auto pio = scheduler::net::common::detail::get_recv_pkt(buf); pio.cnt > 0) {
-            co_yield pkt_iovec_ex{pio, buf, pio.len()};
-            // forward_head 在 co_yield 恢复后调用：无 concurrent 时 send 已完成，数据安全
-            buf->forward_head(pio.len());
+        if (scheduler::net::common::detail::has_full_pkt(buf)) {
+            // read total packet length from prefix
+            auto total_len = buf->handle_data(sizeof(uint16_t), scheduler::net::common::detail::read_pkt_len);
+            auto payload_len = static_cast<size_t>(total_len - sizeof(uint16_t));
+            // skip length prefix (send auto-prepends it)
+            buf->forward_head(sizeof(uint16_t));
+            if (payload_len > 0) {
+                auto pio = buf->handle_data(payload_len, scheduler::net::common::detail::recv_pkt_getter);
+                co_yield pkt_iovec_ex{pio, buf, payload_len};
+                // forward_head 在 co_yield 恢复后调用：无 concurrent 时 send 已完成，数据安全
+                buf->forward_head(payload_len);
+            }
         }
         else {
             run = false;
