@@ -10,9 +10,9 @@ Net 层已实现底层网络收发：
 |------|------|
 | accept_scheduler / connect_scheduler | 服务端监听、客户端连接，产出 `session_id_t` |
 | session_scheduler | `join / recv / send / stop`，管理会话 IO |
-| 消息帧 | 2 字节 `uint16_t` 长度前缀 + payload（应用层手动构造） |
+| 消息帧 | 2 字节 `uint16_t` 长度前缀 + payload（send 端自动添加前缀） |
 | 接收 | SPSC ring buffer，零拷贝包解析（`has_full_pkt / get_recv_pkt`） |
-| 发送 | iovec scatter-gather，`writev` 直接写入（不自动加长度前缀） |
+| 发送 | iovec scatter-gather，`writev` 写入，自动添加 `uint16_t` 长度前缀 |
 
 ### 1.2 分层规划
 
@@ -57,10 +57,10 @@ Net 层已实现底层网络收发：
 | **RPC** | 消息模型、请求关联、分发框架、编解码抽象、接收循环 | 具体协议逻辑、业务方法实现 |
 | **协议** | 定义方法/命令、实现编解码、业务逻辑 | 底层网络、消息帧、请求跟踪 |
 
-**关键边界问题**：消息帧（长度前缀）是属于 Net 层还是 RPC 层？
-- 当前 Net 层：recv 端解析 2 字节长度前缀（`has_full_pkt`），send 端不自动加前缀
-- RPC 层可能需要更大的帧（>64KB），或不同的帧格式
-- **建议**：RPC 层接管消息帧定义，Net 层提供纯字节流收发；或将帧格式参数化
+**消息帧归属（已决定）**：消息帧属于 Net 层。
+- Net 层：recv 端解析 2 字节 `uint16_t` 长度前缀，send 端自动添加长度前缀
+- RPC 层在 64KB payload 限制内工作
+- 大消息分片重组暂不支持，后续版本再考虑
 
 ---
 
@@ -95,17 +95,12 @@ Net 层已实现底层网络收发：
 
 ### 3.3 消息大小
 
-**需求**：必须支持大消息（>64KB）。
+**决定**：本版本使用 `uint16_t` 长度前缀，最大 64KB payload，暂不支持大消息分片。
 
-理由：
-- Raft InstallSnapshot 传输完整状态快照，可能达到 MB 级别
-- MQ 消息体可能较大
-- 当前 Net 层 `uint16_t` 长度前缀最大 65535 字节，不够用
-
-**方案选项**（待讨论）：
-1. 将 Net 层长度前缀扩展为 4 字节（`uint32_t`），最大 ~4GB
-2. RPC 层使用自己的帧格式，Net 层退化为纯字节流
-3. 长度前缀大小参数化（模板参数或配置）
+后续版本可考虑：
+- 扩展为 `uint32_t` 长度前缀
+- RPC 层分片重组
+- Raft InstallSnapshot 等大消息场景届时再处理
 
 ---
 
@@ -115,33 +110,38 @@ Net 层已实现底层网络收发：
 
 #### 4.1.1 需求
 
-1. 提供 Codec concept/trait，由协议层实现具体编解码
-2. RPC 框架通过 Codec 操作消息，不假设任何固定格式
-3. Codec 负责 RPC 头部 + payload 的完整编解码
+1. RPC 层定义固定二进制头，框架直接解析
+2. Codec 只负责 payload 的编解码，不处理 RPC 头
+3. 不支持 RESP 等自定义 wire format（这类协议直接构建在 Net 层之上）
 
-#### 4.1.2 Codec 必须提供的能力
+#### 4.1.2 RPC 固定头格式
+
+```
+[type:1B][request_id:4B][method_id:2B][payload...]
+```
+
+总计 7 字节 RPC 头，由框架统一解析和构造。
+
+#### 4.1.3 Codec 必须提供的能力
 
 | 能力 | 输入 | 输出 | 说明 |
 |------|------|------|------|
-| `decode_header` | buffer 视图 | `{type, request_id, method_id, payload_offset, total_len}` | 从原始字节解析消息头 |
-| `decode_payload<T>` | buffer 视图 + payload 区域 | `T` | 反序列化 payload 为类型 T |
-| `encode` | 消息头字段 + payload | `iovec[]` | 将完整消息序列化为可发送的 iovec |
-| `header_size` | — | `size_t` | 消息头固定长度（用于预读判断） |
+| `decode_payload<T>` | payload buffer 视图 | `T` | 反序列化 payload 为类型 T |
+| `encode_payload` | payload 对象 | `iovec[]` | 序列化 payload 为 iovec |
 
-#### 4.1.3 零拷贝约束
+#### 4.1.4 零拷贝约束
 
 - **decode 必须支持零拷贝**：直接从 `packet_buffer`（ring buffer）读取，返回视图/引用而非拷贝
 - **ring buffer 环绕处理**：Codec 需要处理数据跨 ring buffer 边界的情况（或由 RPC 层提供线性化辅助）
 - **encode 直接写入 iovec**：避免中间缓冲区，直接构造可 writev 的 iovec 数组
-- 对于跨步骤需要持有的数据，由上层决定是否拷贝
 
-#### 4.1.4 扩展性
+#### 4.1.5 扩展性
 
 - 不同协议使用不同的 Codec：
   - Raft: 紧凑的二进制 Codec
-  - RESP: Redis 行协议 Codec（`+OK\r\n`、`$5\r\nhello\r\n` 等）
   - MQ: 可能使用 protobuf 或 flatbuffers
 - Codec 通过模板参数注入到 RPC Channel
+- RESP 等自定义 wire format 协议不经过 RPC 层
 
 ### 4.2 请求-响应关联
 
@@ -341,10 +341,10 @@ rpc::serve(channel, dispatcher) >> submit(ctx);
 ### 5.3 Channel 创建
 
 ```cpp
-// 从 net session 创建 RPC channel
+// 应用层提供已建立的 session，RPC 层不管理连接
 auto channel = rpc::make_channel<MyCodec>(session_id, session_scheduler);
 
-// 在 pipeline 中使用
+// 应用层负责连接管理（可来自连接池或直连）
 connect(sched, addr, port)
     >> then([sched](session_id_t sid) {
         return net::join(sched, sid)
@@ -454,12 +454,11 @@ for_each(peers) >> concurrent()
 
 ### 8.3 RESP 特殊考量
 
-RESP 有完全不同的 wire format（行协议，`+OK\r\n`、`$5\r\nhello\r\n`）：
+RESP 不经过 RPC 层，直接构建在 Net 层之上。原因：
+- 完全不同的 wire format（行协议，`+OK\r\n`、`$5\r\nhello\r\n`）
 - 不使用通用的二进制 RPC 头
 - 自己的长度语义和分隔符
-- Pipelining：连续发送多条命令，响应按序返回
-
-RPC 层需要的灵活性：**Codec 必须能完全控制消息帧的解析**，RPC 层不硬编码任何帧格式。对于 RESP 这类协议，Codec 自己处理行协议解析，RPC 层只负责提供请求关联和分发框架。
+- Pipelining 语义与 RPC 请求关联模式不同（按序返回而非按 ID 匹配）
 
 ### 8.4 协议实现方式
 
@@ -525,54 +524,34 @@ rpc::call_stream(ch, METHOD_SUBSCRIBE, req)
 
 ## 十、待讨论问题
 
-### Q1: 消息帧归属
+### Q1: 消息帧归属 ✅ 已决定
 
-当前 Net 层 recv 端硬编码 2 字节长度前缀（`has_full_pkt`），send 端不自动加前缀。
+**选择 C**：保持 Net 层 `uint16_t` 长度前缀，RPC 层在 64KB payload 内工作。本版本暂不支持大包分片。
 
-- **选项 A**：扩展 Net 层，长度前缀参数化（2/4 字节），RPC 层复用 Net 层的帧
-- **选项 B**：RPC 层完全接管帧，Net 层退化为纯字节流（recv 直接返回 buffer，RPC 层自己解析帧）
-- **选项 C**：保持现状，RPC 层在 64KB payload 内工作，大消息在 RPC 层分片重组
+已实现：send 端自动添加 `uint16_t` 长度前缀（`prepare_send_vec`），recv 端已有解析。
 
-哪种方案更符合你的预期？
+### Q2: RPC 头格式 ✅ 已决定
 
-### Q2: RPC 头格式
+**选择 A**：RPC 层定义固定二进制头 `[type:1B][req_id:4B][method_id:2B]`，框架直接解析，Codec 只负责 payload。
 
-- **选项 A（标准头）**：RPC 层定义固定二进制头 `[type:1B][req_id:4B][method_id:2B]`，框架直接解析，Codec 只负责 payload
-  - 优点：框架可以通用处理关联/分发，Codec 更简单
-  - 缺点：RESP 等自定义 wire format 的协议无法使用
+RESP 等自定义 wire format 协议不经过 RPC 层，直接构建在 Net 层之上。
 
-- **选项 B（Codec 全权）**：RPC 头部也由 Codec 定义和解析，框架通过 Codec trait 获取 type/req_id/method_id
-  - 优点：最大灵活性，任何协议都能适配
-  - 缺点：Codec 实现更复杂，框架难以做通用优化
+### Q3: 流式传输优先级 ✅ 已决定
 
-倾向哪种？
+本版本不支持流式传输。先完成 Request-Response + Notification，后续版本再加入。
 
-### Q3: 流式传输优先级
+### Q4: 跨核 RPC 调用 ✅ 已决定
 
-流式传输（Server Streaming / Bidirectional Streaming）是否在第一版就需要？还是先完成 Request-Response + Notification，后续迭代加入？
+**选择 A**：响应 callback 直接在 session 所在 core 上执行，调用方 pipeline 在该 core 继续。
 
-### Q4: 跨核 RPC 调用
+### Q5: 背压 ✅ 已决定
 
-当 core 0 上的代码需要通过 core 2 上的 session 发送 RPC 请求：
-- 发送通过 session_scheduler 的 lock-free send queue 跨核投递（已有机制）
-- 响应到达 core 2（session 所在 core），需要将结果传回 core 0
+本版本不支持背压。
 
-如何高效完成最后一步？选项：
-- **A**：响应 callback 直接在 core 2 上执行（调用方 pipeline 在 core 2 继续）
-- **B**：通过 task_scheduler 将结果投递回 core 0（额外一次跨核，但调用方在原 core 继续）
+### Q6: 请求取消 ✅ 已决定
 
-### Q5: 背压
+本版本不支持请求取消。
 
-当 pending requests 过多时：
-- **A**：hard limit + 拒绝新请求（简单，符合无锁设计）
-- **B**：流控协商（复杂，可能需要协议配合）
+### Q7: 连接池 ✅ 已决定
 
-### Q6: 请求取消
-
-是否需要支持取消已发送但未收到响应的请求？
-- 本地取消（从 pending map 移除，后续响应丢弃）？
-- 远程取消（通知对端停止处理）？
-
-### Q7: 连接池
-
-客户端是否需要内置连接池（多个连接到同一目标，自动负载均衡）？还是由应用层自行管理？
+RPC 层不管理连接。连接由应用层提供并维护（可以是连接池，也可以是单连接）。RPC 层仅接收一个连接（session_id）然后发送，不关心连接来源。
