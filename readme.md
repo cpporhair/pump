@@ -1,133 +1,164 @@
-# Pump: High-Performance Composable Asynchronous Pipeline Library
+# Pump
 
-Pump is a C++ asynchronous library specifically designed for high-performance scenarios, built upon **Sender/Operator** semantics. It enables developers to compose complex asynchronous logic declaratively and switch between different execution domains (e.g., compute threads, NVMe IO, network event loops) via **Schedulers**.
+Pump 是一个 C++26 异步流水线框架。用 `>>` 运算符把异步操作串成线性管道，编译期确定内存布局，运行期零分配。
 
-## 1. Technical Architecture Overview
-
-The architecture of Pump is divided into four core layers:
-
-### 1.1 Orchestration Layer (Sender & Pipeline)
-*   **Sender**: The fundamental building block of Pump, describing a deferred operation. It is declarative and performs no action until it is connected and started.
-*   **Pipeline (`>>`)**: By overloading the `>>` operator, multiple Senders are chained into a linear pipeline. This avoids nested callback structures and presents business logic in a linear topology.
-
-### 1.2 Execution Engine (Op & OpPusher)
-The core implementation characteristics of Pump:
-*   **Op (Operator)**: When a Sender is connected, a set of Ops is generated based on the context. Pump maps the Ops of the entire pipeline into a flattened `std::tuple`.
-*   **OpPusher**: A lightweight execution pusher that manages the execution flow using compile-time position indices (Position).
-    *   **Position Advancing**: `push_value(pos)` triggers the operation at `pos + 1`, reducing runtime virtual function dispatch and recursion depth.
-    *   **Control Flow**: Supports jumping and rollback, enabling efficient implementation of `repeat`, `retry`, or exception branching.
-
-### 1.3 Resources and Context (Scope & Context)
-*   **Scope**: Defines the lifecycle boundary of asynchronous operations, managing the memory and hierarchy of the Op list.
-*   **Context**: Utilizes a stack-based management mechanism. It supports direct access to high-level defined objects from deep within the pipeline via `push_context<T>` and `get_context<T>`, eliminating the need for explicit parameter passing in every function signature.
-
-### 1.4 Scheduling Layer (Scheduler)
-Pump emphasizes isolation and switching between execution domains:
-*   **Task Scheduler**: General-purpose task scheduling and timers.
-*   **NVMe Scheduler**: Integrated with SPDK, providing zero-copy disk IO scheduling.
-*   **Net Scheduler**: Supports network event loops using `io_uring` and `epoll`.
-*   **Runtime**: `env/runtime/share_nothing.hh` provides a multi-core execution model (starting scheduler combinations per core).
-
----
-
-## 2. Core Semantic Layer
-
-The project provides a rich set of Sender operators covering various aspects of flow control:
-
-*   **Entry Points**: `just(...)`, `submit(context)`
-*   **Transformation/Expansion**: `then`, `transform`, `flat/flat_map`
-*   **Concurrency/Sequencing**: `concurrent(max)`, `sequential()`, `with_concurrent(...)`
-*   **Streaming**: `for_each`, `generate`, `repeat`
-*   **Aggregation**: `when_all`, `reduce`, `to_container`
-*   **Exceptions and Skipping**: `catch_exception`, `any_exception`, `when_skipped`, `visit`
-*   **Context Operations**: `push_context`, `pop_context`, `get_context`
-*   **Coroutine Bridge**: `await_able()` or `await_able(context)` for `co_await` on senders
-
----
-
-## 3. Comparison with Traditional Asynchronous Methods
-
-### 3.1 Limitations of Traditional Approaches
-1.  **Callbacks**: Lead to "Callback Hell," where logic is torn across multiple functions. Error handling is complex, and managing concurrency counts across steps is difficult.
-2.  **Future/Promise**: Typically single-value centric, with composition limited to basic operations like `then/when_all`. In high-frequency scenarios, `std::future` may incur overhead from heap allocation and atomic reference counting.
-3.  **Bare Coroutines**: While offering better readability, execution domain switching and concurrency control still require developers to manually wrap scheduling logic.
-
-### 3.2 Improvements in Pump
-1.  **Linear Declarative Flow**: Maintains logical continuity through Pipelines, making it easier to read and maintain.
-2.  **Explicit Scheduling Switches**: Uses `on(...)` to clearly define execution contexts, reducing implicit jumps.
-3.  **Resource Overhead Optimization**: The Op chain size is determined statically at connection time, resulting in almost zero runtime memory allocation.
-4.  **Built-in Concurrency Control**: Native support for the `for_each + concurrent + reduce` pattern to express "fan-out/fan-in."
-
-### 3.3 Code Comparison: KV Store Write Process
-In a high-performance KV store, a write request involves: allocating an ID -> updating the index -> allocating disk space -> concurrent NVMe writes -> rollback on failure.
-
-**Pump Approach (Flattened logic, composable failure paths):**
 ```cpp
-auto apply_request = 
-    get_context<batch*>()
-    >> then(allocate_id)
-    >> then(update_index_concurrently) // Internally uses for_each + concurrent
-    >> then(allocate_disk_pages)
-    >> then([](auto res) {
-        return just()
-            >> write_nvme_data(res->spans)
-            >> write_metadata(res)
-            // Automatic concurrent rollback on failure
-            >> catch_exception<write_failed>([res](...) {
-                return free_disk_spans(res->spans); 
-            });
+just(10)
+    >> then([](int x) { return x * 2; })
+    >> then([](int x) { printf("%d\n", x); })  // 输出 20
+    >> submit(make_root_context());
+```
+
+## 为什么需要 Pump
+
+传统异步编程的核心困境：**逻辑是线性的，但代码是碎片化的。**
+
+回调把连续流程撕裂到多个函数里。Future 在高频场景下有堆分配和原子计数开销。裸协程需要手工封装调度和并发控制。
+
+Pump 的解法很直接：**让异步代码的拓扑结构和业务逻辑的拓扑结构一致。** 你想的是"先做 A，再做 B，并发做 C"，写出来的代码就是 `A >> B >> concurrent >> C`。
+
+## 核心机制
+
+### Sender 与 Pipeline
+
+Sender 是一个延迟操作的描述。它不执行任何动作，直到被 `submit` 启动。
+
+`>>` 把多个 Sender 串联成 Pipeline。Pipeline 被连接（connect）时，所有 Sender 的 Op 被展平到一个 `std::tuple` 中——不是递归嵌套，是扁平数组。这个 tuple 的大小在编译期就确定了。
+
+### OpPusher：位置驱动的执行引擎
+
+这是 Pump 和 stdexec 最根本的区别。
+
+stdexec 用递归 Receiver 模型：每个操作完成后调用下一个 Receiver 的 `set_value`，形成深层嵌套的调用栈。Pump 的 OpPusher 用编译期位置索引：`push_value<pos>` 直接跳到 `pos+1` 的操作，整个执行过程在一个扁平 tuple 上线性推进。
+
+这带来三个好处：
+- 没有递归深度问题，长流水线不会栈溢出
+- 缓存局部性好，所有 Op 在连续内存中
+- 支持跳转和回滚——`repeat`、异常恢复等控制流只需调整位置索引
+
+OpPusher 传播四种信号：
+- `push_value` — 正常值向下传递
+- `push_exception` — 异常向下传播，直到被 `any_exception` 捕获
+- `push_skip` — 跳过当前元素（用于 `maybe` 等条件算子）
+- `push_done` — 流结束
+
+### Context：栈式上下文
+
+在复杂流水线中，多个步骤需要访问同一份状态。传统做法是在每个 lambda 的参数列表中传递，Pump 用类型化的上下文栈解决这个问题：
+
+```cpp
+just()
+    >> push_context(std::make_shared<MyState>())
+    >> get_context<std::shared_ptr<MyState>>()
+    >> then([](std::shared_ptr<MyState>& state) {
+        state->update();
     })
-    >> flat();
+    >> pop_context()
+    >> submit(context);
 ```
 
-**Traditional Callback Approach:**
-Requires maintaining multiple counters, handling nested error branches, and highly fragmented state passing.
+`push_context` 压栈，`get_context<T>` 按类型查找并追加到当前值列表，`pop_context` 弹栈。对称使用，生命周期由栈管理。
 
----
+## 算子速查
 
-## 4. Comparison with stdexec (P2300)
+### 起点与终点
+| 算子 | 作用 |
+|------|------|
+| `just(v...)` | 创建携带初始值的 Sender |
+| `submit(context)` | 启动 Pipeline 执行 |
 
-`stdexec` is the cornerstone of the C++26 asynchronous standard. Pump aligns with its design philosophy but differs in implementation strategy and application focus.
+### 变换
+| 算子 | 作用 |
+|------|------|
+| `then(f)` | 同步变换：`f(上游值) -> 下游值` |
+| `transform(f)` | 同 `then` |
+| `flat_map(f)` | `f` 返回一个新 Sender，展平后继续执行 |
+| `flat()` | 上游值本身是 Sender 时，展平执行 |
 
-| Feature | stdexec (P2300) | Pump |
-| :--- | :--- | :--- |
-| **Execution Model** | Recursive Receiver Model | Flattened OpTuple + Position Advancing |
-| **Memory Layout** | Nested State Machine Structure | Flattened Tuple Structure |
-| **Context Passing** | Weak; usually requires explicit passing via parameters | Strong; supports typed Context stacks |
-| **Compilation Performance** | Extremely heavy template recursion | Optimized template expansion; lower compilation overhead |
-| **Hardware Integration** | General abstraction | Deep integration with high-performance components (NVMe/SPDK, io_uring) |
-| **Type Dispatch** | Traditional static matching (requires `variant` or `any_sender`) | **visit** operator (promotes runtime values to compile-time types for `if constexpr` branching) |
-| **Signaling Mechanism** | `set_value/error/stopped` | `push_value/exception/skip/done` |
+### 流式处理
+| 算子 | 作用 |
+|------|------|
+| `for_each(range)` | 将 range 的每个元素作为独立的流元素发射 |
+| `for_each_by_args()` | 将上游容器拆成流 |
+| `as_stream()` | `for_each` 的别名（`generate.hh`） |
+| `repeat(n)` | 产生 n 个流元素（值为 0..n-1） |
+| `forever()` | 无限流 |
+| `reduce()` | 收集流的所有元素到容器 |
+| `count()` | 统计流元素个数 |
+| `all()` | 等待所有流元素完成，返回 bool（全部成功则 true） |
 
-**Summary of Differences:**
-*   `stdexec` aims for **maximum generality**, serving as a universal asynchronous foundation for the C++ standard.
-*   `Pump` focuses on **engineering performance and development efficiency in specific scenarios (storage/networking)**. Its `OpPusher` mechanism is particularly suited for long pipelines, while the `Context` mechanism significantly simplifies parameter passing in complex business logic.
+### 并发控制
+| 算子 | 作用 |
+|------|------|
+| `concurrent(max)` | 声明最大并发数。**必须配合调度器使用才有真正并发。** |
+| `sequential()` | 将并发流收束为串行流 |
+| `on(sender)` | 将当前值转移到另一个 Sender 上执行（通常是调度器 Sender） |
 
----
+### 条件与分支
+| 算子 | 作用 |
+|------|------|
+| `maybe()` | `optional<T>` 有值时解包继续，无值时跳过 |
+| `maybe_not()` | 与 `maybe` 相反 |
+| `when_skipped(f)` | 处理跳过信号，`f` 返回新 Sender 作为替代路径 |
+| `visit(...)` | 将运行时类型（`bool`/`variant`/`T*`）提升为编译期分支，配合 `if constexpr` 使用 |
 
-## 5. Project Structure
+### 聚合
+| 算子 | 作用 |
+|------|------|
+| `when_all(s1, s2, ...)` | 并行执行多个 Sender，收集所有结果 |
+| `when_any(s1, s2, ...)` | 并行执行，第一个完成的胜出 |
+
+### 异常处理
+| 算子 | 作用 |
+|------|------|
+| `any_exception(f)` | 捕获所有异常，`f(exception_ptr)` 返回恢复 Sender |
+| `catch_exception<T>(f)` | 按类型捕获 |
+| `ignore_all_exception()` | 吞掉所有异常，继续执行 |
+
+### 协程桥接
+| 算子 | 作用 |
+|------|------|
+| `await_able(context)` | 将 Sender 转为 `co_await` 对象 |
+
+## 调度层
+
+Pump 采用 Share-Nothing 架构：每个调度器实例只在一个线程上运行，不需要任何内部同步。多核并行通过每个核心持有独立的调度器实例实现，线程内循环调用 `advance()` 驱动所有调度器。
+
+| 调度器 | 用途 |
+|--------|------|
+| **Task Scheduler** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
+| **Net Scheduler** | 网络 IO，支持 io_uring（推荐）和 epoll 两个后端 |
+| **NVMe Scheduler** | 集成 SPDK 的零拷贝磁盘 IO，以页为单位操作 |
+| **RPC** | 基于 Net Scheduler 的轻量 RPC 框架，支持 pipelining 和并发服务端 |
+
+完整示例见 `apps/example/`（echo server、rpc、并发控制等）。
+
+## 项目结构
 
 ```
-src/pump/              # Orchestration Layer Core: sender, op_pusher, context, coro
-src/env/               # Scheduling Layer & Runtime: task/nvme/net scheduler, runtime
-apps/example/          # Examples: hello_world, echo, nvme, share_nothing
-apps/kv/               # Application Example: High-performance KV store built with Pump
-3rd/                   # Third-party dependencies
+src/pump/
+  core/           # 核心抽象：op_pusher, context, scope, op_tuple_builder
+  sender/         # 算子实现：just, then, for_each, concurrent, visit 等
+  coro/           # 协程支持：return_yields, await_able
+
+src/env/
+  scheduler/
+    task/         # 任务调度器 + 定时器
+    net/          # 网络调度器（io_uring / epoll）
+    nvme/         # NVMe 调度器（SPDK）
+    rpc/          # RPC 框架（client/server）
+  runtime/        # Share-Nothing 多核运行时
+
+apps/
+  example/
+    hello_world/  # 基础用法：just, then, for_each, context, exception, coroutine
+    echo/         # 网络 Echo Server
+    echo_client/  # Echo 客户端
+    concurrent/   # 并发控制测试
+    share_nothing/# 多核并发测试
+    coro/         # 协程桥接
+    nvme/         # NVMe 调度器示例
+    rpc/          # RPC 示例
+  test/           # 测试（sequential, when_any）
+  kv/             # 基于 Pump 的高性能 KV 存储
 ```
-
-## 6. Build and Dependencies
-
-### Key Dependencies
-*   **C++26 Compiler** (GCC 13+ or Clang 17+)
-*   **liburing** (For network io_uring scheduling)
-*   **SPDK + DPDK** (For NVMe scheduling)
-*   **numa, pthread, ssl, crypto** (For related applications)
-
-### Build Steps
-```bash
-cmake -S . -B build
-cmake --build build
-```
-
----
-> **Note**: This project currently contains some operators that are under development or should be used with caution (see `src/pump/sender`). It is recommended to refer to `apps/example` for standard usage.
