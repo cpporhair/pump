@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <variant>
 
-namespace pump::scheduler::rpc::server {
+namespace pump::scheduler::rpc {
     template<typename T>
     concept uint16_enum_concept = std::is_enum_v<T> && std::same_as<std::underlying_type_t<T>, uint16_t>;
 
@@ -25,9 +25,6 @@ namespace pump::scheduler::rpc::server {
         else
             return res_t(std::monostate{});
     }
-
-    template<typename T, typename Req>
-    concept has_handle_concept = requires(Req &&r) { T::handle(std::forward<Req>(r)); };
 }
 
 #endif //PUMP_ENV_SCHEDULER_RPC_SERVER_SERVICE_HH

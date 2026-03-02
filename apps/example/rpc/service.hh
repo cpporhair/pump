@@ -37,7 +37,7 @@ namespace apps::rpc::service {
     };
 }
 
-namespace pump::scheduler::rpc::server {
+namespace pump::scheduler::rpc {
     template <apps::rpc::service::type sid>
     struct
     service<sid> : apps::rpc::service::compute_service<sid> {
@@ -51,7 +51,7 @@ namespace pump::scheduler::rpc::server {
             rpc_res.realloc_frame(sizeof(res_struct));
             auto res = reinterpret_cast<res_struct *>(rpc_res.get_payload());
             res->v = service::compute(req->a , req->b);
-            return just();
+            return pump::sender::just();
         }
 
         static auto

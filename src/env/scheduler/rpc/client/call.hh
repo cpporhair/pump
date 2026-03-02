@@ -19,7 +19,7 @@ namespace pump::scheduler::rpc::client {
             scheduler_t *sche,
             net::common::session_id_t ssid
         ) {
-            return server::call_runtime_context<scheduler_t>(sche, ssid, server::request_id().value);
+            return call_runtime_context<scheduler_t>(sche, ssid, request_id().value);
         }
 
         template <bool mine>
@@ -29,16 +29,16 @@ namespace pump::scheduler::rpc::client {
         };
     }
 
-    template <server::uint16_enum_concept auto service_id, typename scheduler_t, typename ...args_t>
+    template <uint16_enum_concept auto service_id, typename scheduler_t, typename ...args_t>
     auto
     send_req(args_t&& ...args) {
-        using ctx_t = server::call_runtime_context<scheduler_t>;
+        using ctx_t = call_runtime_context<scheduler_t>;
         return sender::get_context<ctx_t>()
             >> sender::flat_map([...args = __fwd__(args)](ctx_t &ctx) mutable {
-                server::service<service_id>::req_to_pkt(ctx.req, __fwd__(args)...);
+                service<service_id>::req_to_pkt(ctx.req, __fwd__(args)...);
                 ctx.req.frame->header.service_id = static_cast<uint16_t>(service_id);
                 ctx.req.frame->header.request_id = ctx.request_id;
-                ctx.req.frame->header.flags = static_cast<uint08_t>(server::rpc_flags::request);
+                ctx.req.frame->header.flags = static_cast<uint08_t>(rpc_flags::request);
                 auto len = ctx.req.get_len();
                 auto* f = ctx.req.frame;
                 ctx.req.frame = nullptr;
@@ -48,15 +48,17 @@ namespace pump::scheduler::rpc::client {
 
     inline uint64_t
     get_request_id_from(net::common::net_frame& frame) {
-        return reinterpret_cast<server::rpc_frame *>(frame._data)->header.request_id;
+        return reinterpret_cast<rpc_frame *>(frame._data)->header.request_id;
     }
 
-    template <server::uint16_enum_concept auto service_id, typename scheduler_t>
+    template <uint16_enum_concept auto service_id, typename scheduler_t>
     auto
     wait_res() {
-        using ctx_t = server::call_runtime_context<scheduler_t>;
+        using ctx_t = call_runtime_context<scheduler_t>;
         return sender::get_context<ctx_t>()
             >> sender::flat_map([](ctx_t &ctx, bool ok) {
+                if (!ok)
+                    throw std::runtime_error("rpc send failed");
                 return net::recv(ctx.scheduler, ctx.sid)
                     >> sender::then([&ctx](net::common::net_frame &&frame) {
                         if (get_request_id_from(frame) == ctx.request_id)
@@ -75,20 +77,32 @@ namespace pump::scheduler::rpc::client {
                             return sender::just() >> sender::forward_value(__mov__(res.frame));
                         } else {
                             trigger.on_response(get_request_id_from(res.frame), __mov__(res.frame));
-                            return trigger.wait_response(ctx.request_id);
+                            return trigger.wait_response(ctx.request_id, ctx.sid._value);
                         }
                     })
                     >> sender::then([&ctx](net::common::net_frame &&frame) {
-                        ctx.res.frame = reinterpret_cast<server::rpc_frame *>(frame.release());
-                        return server::service<service_id>::pkt_to_res(ctx.res);
+                        ctx.res.frame = reinterpret_cast<rpc_frame *>(frame.release());
+                        if (ctx.res.frame->header.flags == static_cast<uint08_t>(rpc_flags::error)) {
+                            auto code = *reinterpret_cast<rpc_error_code*>(ctx.res.get_payload());
+                            throw rpc_error(code);
+                        }
+                        return service<service_id>::pkt_to_res(ctx.res);
+                    })
+                    >> sender::any_exception([&ctx](std::exception_ptr e) {
+                        static thread_local detail::trigger trigger(2048);
+                        trigger.fail_session(ctx.sid._value, e);
+                        using res_t = decltype(service<service_id>::pkt_to_res(ctx.res));
+                        return sender::just() >> sender::then([e]() -> res_t {
+                            std::rethrow_exception(e);
+                        });
                     });
             });
     }
 
-    template <server::uint16_enum_concept auto service_id, typename scheduler_t, typename ...args_t>
+    template <uint16_enum_concept auto service_id, typename scheduler_t, typename ...args_t>
     auto
     call(scheduler_t* sche, net::common::session_id_t sid, args_t&& ...args) {
-        using ctx_t = server::call_runtime_context<scheduler_t>;
+        using ctx_t = call_runtime_context<scheduler_t>;
         return sender::with_context(detail::make_call_context(sche,sid))([...args = __fwd__(args)]() mutable {
             return send_req<service_id, scheduler_t, args_t...>(__fwd__(args)...)
                 >> wait_res<service_id, scheduler_t>();

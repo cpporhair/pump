@@ -6,16 +6,18 @@
 #include "env/scheduler/net/common/struct.hh"
 
 
-namespace pump::scheduler::rpc::server {
-    using completion_callback = std::move_only_function<void(net::common::net_frame&&)>;
+namespace pump::scheduler::rpc {
+    using completion_result = std::variant<net::common::net_frame, std::exception_ptr>;
+    using completion_callback = std::move_only_function<void(completion_result&&)>;
 
     struct
     pending_requests_map {
-        enum class slot_state : uint08_t { empty,wait_frame,wait_callback,done };
+        enum class slot_state : uint08_t { empty, wait_frame, wait_callback };
         struct slot {
             slot_state state = slot_state::empty;
             net::common::net_frame frame;
             completion_callback cb;
+            uint64_t session_raw = 0;
         };
 
         std::vector<slot> slots;
@@ -26,24 +28,23 @@ namespace pump::scheduler::rpc::server {
         pending_requests_map& operator=(pending_requests_map&&) noexcept = default;
 
         std::optional<slot>
-        on_callback(uint64_t rid, completion_callback&& cb) {
+        on_callback(uint64_t rid, uint64_t session_raw, completion_callback&& cb) {
             auto idx = rid % slots.size();
             switch (slots[idx].state) {
                 case slot_state::empty: {
-                    slots[idx] = {slot_state::wait_frame, {}, std::move(cb)};
+                    slots[idx] = {slot_state::wait_frame, {}, std::move(cb), session_raw};
                     return std::nullopt;
                 }
                 case slot_state::wait_frame: {
-                    throw std::runtime_error("invalid state : wait_frame");
+                    throw std::runtime_error("duplicate callback for slot in wait_frame state");
                 }
                 case slot_state::wait_callback: {
-                    auto old = slot{slot_state::empty, __mov__(slots[idx].frame), __fwd__(cb)};
+                    auto old = slot{slot_state::empty, __mov__(slots[idx].frame), __fwd__(cb), session_raw};
                     slots[idx] = {};
                     return __mov__(old);
                 }
-                default:
-                    throw std::runtime_error("invalid state : done");
             }
+            __builtin_unreachable();
         }
 
         std::optional<slot>
@@ -55,30 +56,40 @@ namespace pump::scheduler::rpc::server {
                     return std::nullopt;
                 }
                 case slot_state::wait_callback: {
-                    throw std::runtime_error("invalid state : wait_frame");
+                    throw std::runtime_error("duplicate frame for slot in wait_callback state");
                 }
                 case slot_state::wait_frame: {
                     auto old = slot{slot_state::empty, __fwd__(frame), __mov__(slots[idx].cb)};
                     slots[idx] = {};
                     return __mov__(old);
                 }
-                default:
-                    throw std::runtime_error("invalid state : done");
             }
+            __builtin_unreachable();
         }
 
         void
         fail_all(std::exception_ptr ex) {
-            // todo 传播异常未实现
+            for (auto& s : slots) {
+                if (s.state == slot_state::wait_frame && s.cb) {
+                    s.cb(completion_result(ex));
+                }
+                if (s.state != slot_state::empty) {
+                    s = {};
+                }
+            }
         }
-    };
 
-    template <typename session_t>
-    struct
-    rpc_state {
-        uint32_t next_request_id = 0;
-        pending_requests_map pending{256};
-        session_t session;
+        void
+        fail_session(uint64_t session_raw, std::exception_ptr ex) {
+            for (auto& s : slots) {
+                if (s.session_raw == session_raw && s.state != slot_state::empty) {
+                    if (s.state == slot_state::wait_frame && s.cb) {
+                        s.cb(completion_result(ex));
+                    }
+                    s = {};
+                }
+            }
+        }
     };
 }
 

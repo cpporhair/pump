@@ -9,25 +9,26 @@
 #include "pump/core/compute_sender_type.hh"
 
 namespace pump::scheduler::rpc::client::detail {
-    struct
-        req {
-        std::move_only_function<void()> cb;
-    };
-
     template<typename storage_t>
     struct
     op {
         constexpr static bool storage_at_op = true;
         storage_t *store;
         uint64_t request_id = 0;
+        uint64_t session_raw = 0;
 
         template<uint32_t pos, typename context_t, typename scope_t>
         auto
         start(context_t& context, scope_t& scope) {
             store->wait_activate(
                 request_id,
-                [context = context, scope = scope](net::common::net_frame &&frame) mutable {
-                    core::op_pusher<pos + 1, scope_t>::push_value(context, scope, __mov__(frame));
+                session_raw,
+                [context = context, scope = scope](completion_result &&result) mutable {
+                    if (auto* frame = std::get_if<net::common::net_frame>(&result)) {
+                        core::op_pusher<pos + 1, scope_t>::push_value(context, scope, __mov__(*frame));
+                    } else {
+                        core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::get<std::exception_ptr>(result));
+                    }
                 }
             );
         }
@@ -39,10 +40,11 @@ namespace pump::scheduler::rpc::client::detail {
         using storage_type = storage_t;
         storage_type* store;
         uint64_t request_id = 0;
+        uint64_t session_raw = 0;
 
         auto
         make_op() {
-            return op<storage_t>{store, request_id};
+            return op<storage_t>{store, request_id, session_raw};
         }
 
         template<typename context_t>
@@ -54,16 +56,16 @@ namespace pump::scheduler::rpc::client::detail {
 
     struct
     trigger {
-        server::pending_requests_map map;
+        pending_requests_map map;
 
     private:
         friend struct op<trigger>;
 
         template<typename func_t>
         auto
-        wait_activate(uint64_t request_id, func_t&& f) {
-            if (auto res = map.on_callback(request_id, __fwd__(f)))
-                res.value().cb.operator()(__mov__(res.value().frame));
+        wait_activate(uint64_t request_id, uint64_t session_raw, func_t&& f) {
+            if (auto res = map.on_callback(request_id, session_raw, __fwd__(f)))
+                res.value().cb(completion_result(__mov__(res.value().frame)));
         }
 
     public:
@@ -71,14 +73,19 @@ namespace pump::scheduler::rpc::client::detail {
         explicit trigger(size_t map_capacity) : map(map_capacity){}
 
         auto
-        wait_response(uint64_t request_id) {
-            return storage_at_sender<trigger>(this, request_id);
+        wait_response(uint64_t request_id, uint64_t session_raw) {
+            return storage_at_sender<trigger>(this, request_id, session_raw);
+        }
+
+        void
+        fail_session(uint64_t session_raw, std::exception_ptr ex) {
+            map.fail_session(session_raw, ex);
         }
 
         auto
         on_response(uint64_t request_id, net::common::net_frame&& frame) {
             if (auto res = map.on_frame(request_id, __fwd__(frame)))
-                res.value().cb.operator()(__mov__(res.value().frame));
+                res.value().cb(completion_result(__mov__(res.value().frame)));
         }
     };
 }
