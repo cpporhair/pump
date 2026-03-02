@@ -46,7 +46,7 @@ namespace pump::scheduler::net {
 
     template <typename scheduler_t>
     inline auto
-    send(scheduler_t *scheduler, common::session_id_t sid, void* data, uint16_t len) {
+    send(scheduler_t *scheduler, common::session_id_t sid, void* data, uint32_t len) {
         return senders::send::sender<scheduler_t>(
             scheduler,
             sid,

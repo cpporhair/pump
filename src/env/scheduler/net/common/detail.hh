@@ -12,21 +12,20 @@
 namespace pump::scheduler::net::common::detail {
     struct
     _read_pkt_len {
-        uint16_t
+        uint32_t
         operator()() const noexcept {
-            return 0xffff;
+            return 0xffffffff;
         }
-        uint16_t
+        uint32_t
         operator()(const char* data ,const size_t len) const noexcept {
-            return *reinterpret_cast<const uint16_t*>(data);
+            return *reinterpret_cast<const uint32_t*>(data);
         }
-        // 1.8: fix cross-buffer read - use &need[l1] instead of &need[1]
-        uint16_t
+        uint32_t
         operator()(const char* d1 ,const size_t l1,const char* d2,const size_t l2) const noexcept {
-            uint08_t need[2] = {0, 0};
+            uint08_t need[4] = {0, 0, 0, 0};
             memcpy(&need[0],d1,l1) ;
             memcpy(&need[l1],d2,l2);
-            return *reinterpret_cast<const uint16_t*>(need);
+            return *reinterpret_cast<const uint32_t*>(need);
         }
     };
 
@@ -54,8 +53,8 @@ namespace pump::scheduler::net::common::detail {
     [[nodiscard]]
     inline bool
     has_full_pkt(const common::packet_buffer* buf) {
-        const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
-        if (len == 0xffff)
+        const auto len = buf->handle_data(sizeof(uint32_t), read_pkt_len);
+        if (len == 0xffffffff)
             return false;
         return buf->handle_data(len, full_pkt_checker);
     }
@@ -72,7 +71,7 @@ namespace pump::scheduler::net::common::detail {
         operator()(const char* data, const size_t len) const noexcept {
             auto* copy = new char[len];
             memcpy(copy, data, len);
-            return {copy, static_cast<uint16_t>(len)};
+            return {copy, static_cast<uint32_t>(len)};
         }
 
         net_frame
@@ -81,7 +80,7 @@ namespace pump::scheduler::net::common::detail {
             auto* copy = new char[total];
             memcpy(copy, d1, l1);
             memcpy(copy + l1, d2, l2);
-            return {copy, static_cast<uint16_t>(total)};
+            return {copy, static_cast<uint32_t>(total)};
         }
     };
 
@@ -89,15 +88,15 @@ namespace pump::scheduler::net::common::detail {
 
     inline net_frame
     copy_out_frame(common::packet_buffer* buf) {
-        const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
-        if (len == 0xffff)
+        const auto len = buf->handle_data(sizeof(uint32_t), read_pkt_len);
+        if (len == 0xffffffff)
             return {};
         if (buf->used() < len)
             return {};
-        // skip the uint16_t length prefix — net layer handles framing,
+        // skip the uint32_t length prefix — net layer handles framing,
         // net_frame contains only the application payload
-        buf->forward_head(sizeof(uint16_t));
-        auto payload_len = static_cast<size_t>(len) - sizeof(uint16_t);
+        buf->forward_head(sizeof(uint32_t));
+        auto payload_len = static_cast<size_t>(len) - sizeof(uint32_t);
         auto frame = buf->handle_data(payload_len, frame_copier);
         if (frame.size() > 0)
             buf->forward_head(payload_len);

@@ -16,10 +16,10 @@ namespace pump::scheduler::net::common {
     struct
     net_frame {
         char* _data;
-        uint16_t _len;
+        uint32_t _len;
 
         net_frame() : _data(nullptr), _len(0) {}
-        net_frame(char* data, const uint16_t len) : _data(data), _len(len) {}
+        net_frame(char* data, const uint32_t len) : _data(data), _len(len) {}
 
         net_frame(net_frame&& rhs) noexcept : _data(rhs._data), _len(rhs._len) {
             rhs._data = nullptr;
@@ -51,7 +51,7 @@ namespace pump::scheduler::net::common {
         }
 
         [[nodiscard]] const char* data() const { return _data; }
-        [[nodiscard]] uint16_t size() const { return _len; }
+        [[nodiscard]] uint32_t size() const { return _len; }
 
         template <typename T>
         [[nodiscard]] const T* as() const { return reinterpret_cast<const T*>(_data); }
@@ -246,13 +246,13 @@ namespace pump::scheduler::net::common {
         net_frame frame;
         std::move_only_function<void(bool)> cb;
 
-        // net layer auto-prepends uint16_t length prefix on send
-        uint16_t _frame_len = 0;
+        // net layer auto-prepends uint32_t length prefix on send
+        uint32_t _frame_len = 0;
         iovec _send_vec[2] = {};
         size_t _send_cnt = 0;
 
         void prepare_frame() {
-            _frame_len = static_cast<uint16_t>(frame._len + sizeof(uint16_t));
+            _frame_len = static_cast<uint32_t>(frame._len + sizeof(uint32_t));
             _send_vec[0] = {&_frame_len, sizeof(_frame_len)};
             _send_vec[1] = {frame._data, frame._len};
             _send_cnt = 2;
