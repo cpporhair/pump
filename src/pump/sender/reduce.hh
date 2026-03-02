@@ -31,10 +31,7 @@ namespace pump::sender {
                 , func(__fwd__(rhs.func)){
             }
 
-            op(const op& rhs)
-                : result(rhs.result)
-                , func(rhs.func){
-            }
+            op(const op& rhs) = delete;
 
             template<typename ...value_t>
             auto

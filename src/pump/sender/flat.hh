@@ -20,7 +20,7 @@ namespace pump::sender {
 
         template <typename prev_t>
         struct
-        __ncp__(sender) {
+        sender {
             using prev_type = prev_t;
 
             prev_t prev;
@@ -33,6 +33,8 @@ namespace pump::sender {
             sender(sender&& o)noexcept
                 :prev(__fwd__(o.prev)){
             }
+
+            sender(sender const& o) = delete;
 
             inline
             auto

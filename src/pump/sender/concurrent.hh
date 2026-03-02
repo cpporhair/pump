@@ -90,6 +90,8 @@ namespace pump::sender {
 
             }
 
+            concurrent_counter_wrapper(const concurrent_counter_wrapper& rhs) = delete;
+
             concurrent_counter_wrapper(concurrent_counter_wrapper&& rhs) noexcept
                 :impl(__fwd__(rhs.impl))
                 , need_delete_scope(__fwd__(rhs.need_delete_scope)){
@@ -111,7 +113,7 @@ namespace pump::sender {
 
         template <typename stream_op_tuple_t, typename variant_value_t>
         struct
-        __ncp__(starter) {
+        starter {
             using variant_value_type = variant_value_t;
             constexpr static bool concurrent_starter_op = true;
             stream_op_tuple_t stream_op_tuple;
@@ -138,12 +140,14 @@ namespace pump::sender {
                 __must_rval__(o);
             }
 
-            starter(const starter& o) noexcept
-                : stream_op_tuple(o.stream_op_tuple)
-                , counter()
-                , count_of_values(0)
-                , max_pending(o.max_pending)
-                , pending_status(o.pending_status.load()){
+            starter(const starter& o) = delete;
+
+            auto
+            concurrent_copy() const {
+                return starter(
+                    core::concurrent_copy(stream_op_tuple),
+                    max_pending
+                );
             }
 
             [[nodiscard]]
@@ -207,7 +211,7 @@ namespace pump::sender {
     namespace _concurrent {
         template <uint32_t pos, typename variant_value_t, typename parent_builder_t, typename stream_builder_t>
         struct
-        __ncp__(concurrent_starter_builder) {
+        concurrent_starter_builder {
 
             constexpr static uint32_t cur_pos = pos;
 
@@ -223,12 +227,13 @@ namespace pump::sender {
                 __must_rval__(s);
             }
 
-            concurrent_starter_builder(concurrent_starter_builder &&rhs)
+            concurrent_starter_builder(concurrent_starter_builder &&rhs) noexcept
                 : parent_builder(__fwd__(rhs.parent_builder))
                 , stream_builder(__fwd__(rhs.stream_builder))
                 , max(rhs.max) {
-
             }
+
+            concurrent_starter_builder(const concurrent_starter_builder& rhs) = delete;
 
             template<typename pushed_op_t>
             auto
@@ -462,14 +467,17 @@ namespace pump::core {
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
             auto& op = std::get<pos>(scope->get_op_tuple());
             auto new_scope = make_new_scope(
-                    scope,
-                    std::tuple_cat(
-                        __typ__(op.stream_op_tuple)(op.stream_op_tuple),
-                        std::make_tuple(::pump::sender::_concurrent::concurrent_counter_wrapper<pos, variant_value_type>(op.counter)),
-                        std::tie(op),
-                        std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
-                    )
-                );
+                scope,
+                std::tuple_cat(
+                    core::concurrent_copy(op.stream_op_tuple),
+                    std::make_tuple(
+                        sender::_concurrent::concurrent_counter_wrapper<pos, variant_value_type>(op.counter)
+                    ),
+                    std::tie(op),
+                    std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
+                )
+            );
+
             op.count_of_values++;
             op_pusher<0, __typ__(new_scope)>::push_value(context, new_scope, __fwd__(v)...);
             if (op.unlimited()) {

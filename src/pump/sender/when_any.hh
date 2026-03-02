@@ -69,7 +69,7 @@ namespace pump::sender {
         template <uint32_t max, typename result_variant_t, typename parent_pusher_status_t>
         struct
         alignas(64)
-        __ncp__(race_wrapper) {
+        race_wrapper {
             // === packed state: bit 63 = finished flag, bits [0,62] = ref_count ===
             // Merging finished + ref_count into a single atomic<uint64_t> eliminates
             // any observation window between the two operations. For losers, a single
@@ -93,6 +93,8 @@ namespace pump::sender {
             }
 
             race_wrapper(race_wrapper&&) = delete;
+
+            race_wrapper(const race_wrapper&) = delete;
 
             inline
             void
@@ -199,18 +201,21 @@ namespace pump::sender {
         // ================================================================
         template <uint32_t index, typename race_wrapper_t>
         struct
-        __ncp__(reducer) {
+        reducer {
             constexpr static uint32_t pos = index;
             constexpr static bool when_any_reducer = true;
             race_wrapper_t* wrapper;
 
+            explicit
             reducer(race_wrapper_t* c)
                 : wrapper(c) {
             }
 
-            reducer(reducer&& rhs)
+            reducer(reducer&& rhs) noexcept
                 : wrapper(rhs.wrapper) {
             }
+
+            reducer(const reducer& rhs) = delete;
 
             template <typename ...value_t>
             inline
@@ -240,7 +245,7 @@ namespace pump::sender {
         // ================================================================
         template <typename result_t, typename ...op_list_t>
         struct
-        __ncp__(starter) {
+        starter {
             constexpr static bool when_any_starter = true;
             std::tuple<op_list_t...> all_inner_op_list;
 
@@ -252,9 +257,7 @@ namespace pump::sender {
                 : all_inner_op_list(__fwd__(rhs.all_inner_op_list)) {
             }
 
-            starter(const starter& rhs)
-                : all_inner_op_list(rhs.all_inner_op_list) {
-            }
+            starter(const starter& rhs) = delete;
 
             // Multi-branch path: submit with exception safety
             template <uint32_t index, typename context_t, typename scope_t, typename wrapper_t>
@@ -300,7 +303,7 @@ namespace pump::sender {
         // ================================================================
         template <typename prev_t, typename ...sender_t>
         struct
-        __ncp__(sender) {
+        sender {
 
             using prev_type = prev_t;
 
@@ -316,6 +319,8 @@ namespace pump::sender {
                 : prev(__fwd__(o.prev))
                 , inner_senders(__fwd__(o.inner_senders)) {
             }
+
+            sender(const sender& o) = delete;
 
             template <uint32_t index, typename context_t>
             inline

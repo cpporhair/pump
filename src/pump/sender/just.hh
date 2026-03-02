@@ -10,7 +10,7 @@ namespace pump::sender {
     namespace _just {
         template <typename ...value_t>
         struct
-        __ncp__(op) {
+        op {
 
             constexpr static bool just_op = true;
             constexpr static bool empty = (sizeof...(value_t) == 0);
@@ -23,6 +23,7 @@ namespace pump::sender {
 
             ::pump::core::tuple_values<value_t...> values;
 
+            explicit
             op(::pump::core::tuple_values<value_t...>&& v)
                 : values(__fwd__(v)){
             }
@@ -31,9 +32,7 @@ namespace pump::sender {
                 : values(__fwd__(o.values)){
             }
 
-            op(const op& o)noexcept
-                : values(o.values){
-            }
+            op(const op&) = delete;
         };
 
         template <typename ...value_t>

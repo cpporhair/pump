@@ -8,6 +8,7 @@
 
 #include "./flat.hh"
 #include "./submit.hh"
+#include "pump/core/concurrent_copy.hh"
 
 namespace pump::sender {
     namespace _any_exception {
@@ -17,6 +18,7 @@ namespace pump::sender {
             constexpr static bool any_exception_op = true;
             func_t func;
 
+            explicit
             op(func_t&& f)
                 : func(__fwd__(f)){
             }
@@ -25,8 +27,11 @@ namespace pump::sender {
                 : func(__fwd__(rhs.func)) {
             }
 
-            op(const op& rhs)
-                : func(rhs.func) {
+            op(const op& rhs) = delete;
+
+            auto
+            concurrent_copy() const {
+                return op(core::concurrent_copy(func));
             }
         };
 

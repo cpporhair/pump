@@ -15,6 +15,7 @@
 #include "../core/bind_back.hh"
 #include "../core/meta.hh"
 #include "../core/op_pusher.hh"
+#include "../core/concurrent_copy.hh"
 
 namespace pump::sender {
     namespace _for_each_ranges {
@@ -30,6 +31,7 @@ namespace pump::sender {
             // 低32位: token (0=空闲可获取, 1=被持有)
             std::atomic<uint64_t> poll_next_flag{0};
 
+            explicit
             runner(ranges_t&& r)
                 : range(__fwd__(r))
                 , it(range.begin()){
@@ -40,9 +42,11 @@ namespace pump::sender {
                 , it(__mov__(o.it)){
             }
 
-            runner(const runner& o)noexcept
-                : range(o.range)
-                , it(range.begin()){
+            auto
+            concurrent_copy() const {
+                return runner(
+                    core::concurrent_copy(range)
+                );
             }
 
             bool
@@ -157,6 +161,14 @@ namespace pump::sender {
                 , stream_op_tuple(o.stream_op_tuple){
             }
 
+            auto
+            concurrent_copy() const {
+                return runner(
+                    core::concurrent_copy(range),
+                    core::concurrent_copy(stream_op_tuple)
+                );
+            }
+
         };
 
         template <typename range_t>
@@ -238,8 +250,9 @@ namespace pump::sender {
                 : stream_op_tuple(__fwd__(o.stream_op_tuple)){
             }
 
-            starter(const starter& o)noexcept
-                : stream_op_tuple(o.stream_op_tuple){
+            auto
+            concurrent_copy() const {
+                return runner(core::concurrent_copy(stream_op_tuple));
             }
 
         };

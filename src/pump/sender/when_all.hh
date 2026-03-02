@@ -169,18 +169,21 @@ namespace pump::sender {
 
         template <uint32_t index, typename collector_wrapper_t>
         struct
-        __ncp__(reducer) {
+        reducer {
             constexpr static uint32_t pos = index;
             constexpr static bool when_all_reducer = true;
             collector_wrapper_t* wrapper;
 
+            explicit
             reducer(collector_wrapper_t* c)
                 : wrapper(c){
             }
 
-            reducer(reducer&& rhs)
+            reducer(reducer&& rhs) noexcept
                 : wrapper(rhs.wrapper){
             }
+
+            reducer(const reducer&) = delete;
 
             template <typename ...value_t>
             auto
@@ -206,20 +209,17 @@ namespace pump::sender {
 
         template <typename result_t, typename ...op_list_t>
         struct
-        __ncp__(starter) {
+        starter {
             constexpr static bool when_all_starter = true;
             std::tuple<op_list_t...> all_inner_op_list;
 
+            explicit
             starter(op_list_t&& ...opt)
                 : all_inner_op_list(std::make_tuple(__fwd__(opt)...)) {
             }
 
-            starter(starter&& rhs)
+            starter(starter&& rhs) noexcept
                 : all_inner_op_list(__fwd__(rhs.all_inner_op_list)){
-            }
-
-            starter(const starter& rhs)
-                : all_inner_op_list(rhs.all_inner_op_list){
             }
 
             template <uint32_t index, typename context_t, typename scope_t, typename collector_t>
@@ -253,13 +253,14 @@ namespace pump::sender {
 
         template <typename prev_t, typename ...sender_t>
         struct
-        __ncp__(sender) {
+        sender {
 
             using prev_type = prev_t;
 
             std::tuple<sender_t...> inner_senders;
             prev_t prev;
 
+            explicit
             sender(prev_t&& p, sender_t&& ...inner_sender)
                 : prev(__fwd__(p))
                 , inner_senders(std::make_tuple(__fwd__(inner_sender)...)){
@@ -269,6 +270,8 @@ namespace pump::sender {
                 : prev(__fwd__(o.prev))
                 , inner_senders(__fwd__(o.inner_senders)){
             }
+
+            sender(const sender&) = delete;
 
             template<uint32_t index, typename context_t>
             inline

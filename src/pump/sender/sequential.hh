@@ -18,7 +18,7 @@ namespace pump::sender {
 
         template <typename value_t, typename stream_op_tuple_t, size_t max_cache_size = 1024>
         struct
-        __ncp__(source_cache) {
+        source_cache {
             // Adaptive storage: variant stored inline for small types, via unique_ptr for large types
             using storage_type = core::adaptive_storage_t<value_t>;
             constexpr static bool sequential_source_cache = true;
@@ -48,13 +48,15 @@ namespace pump::sender {
                 , drain_requested(o.drain_requested) {
                 __must_rval__(o);
             }
+
+            source_cache(const source_cache&) = delete;
         };
     }
 
     namespace _sequential {
         template <uint32_t pos, typename cache_vaule_t, typename parent_builder_t, typename stream_builder_t>
         struct
-        __ncp__(sequential_starter_builder) {
+        sequential_starter_builder {
 
             constexpr static uint32_t cur_pos = pos;
 
@@ -72,6 +74,8 @@ namespace pump::sender {
                 : parent_builder(__fwd__(rhs.parent_builder))
                 , stream_builder(__fwd__(rhs.stream_builder)){
             }
+
+            sequential_starter_builder(const sequential_starter_builder&) = delete;
 
             template<typename pushed_op_t>
             auto

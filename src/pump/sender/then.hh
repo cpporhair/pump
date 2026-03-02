@@ -11,6 +11,7 @@
 #include "../core//tuple_values.hh"
 #include "../core/compute_sender_type.hh"
 #include "../core/op_pusher.hh"
+#include "../core/concurrent_copy.hh"
 
 #include "./just.hh"
 
@@ -36,6 +37,11 @@ namespace pump::sender {
 
             op(const op& o) noexcept
                 : func(o.func){
+            }
+
+            auto
+            concurrent_copy() const {
+                return op(core::concurrent_copy(func));
             }
         };
 

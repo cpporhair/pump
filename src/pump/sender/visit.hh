@@ -46,11 +46,22 @@ namespace pump::sender {
             op {
                 constexpr static bool visit_op_has_value = true;
                 value_t value;
+
+                explicit
+                op(value_t&& v) : value(__fwd__(v)){}
+                op() = default;
+                op(op&&) noexcept = default;
+                op(const op&) = delete;
+
+                auto
+                concurrent_copy() const {
+                    return op(core::concurrent_copy(value));
+                }
             };
 
             template <typename prev_t, typename value_t>
             struct
-            __ncp__(sender) {
+            sender {
                 using prev_type = prev_t;
                 prev_t prev;
                 value_t value;
@@ -66,10 +77,12 @@ namespace pump::sender {
                     , value(__fwd__(o.value)) {
                 }
 
+                sender(const sender&) = delete;
+
                 inline
                 auto
                 make_op() {
-                    return op{__fwd__(value)};
+                    return op(__mov__(value));
                 }
 
                 template<typename context_t>

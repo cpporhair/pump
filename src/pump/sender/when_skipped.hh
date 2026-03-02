@@ -10,6 +10,7 @@
 #include "../core//tuple_values.hh"
 #include "../core/compute_sender_type.hh"
 #include "../core/op_pusher.hh"
+#include "../core/concurrent_copy.hh"
 
 
 namespace pump::sender {
@@ -24,12 +25,15 @@ namespace pump::sender {
                 : func(__fwd__(f)){
             }
 
-            op(op&& o)noexcept
+            op(op&& o) noexcept
                 : func(__fwd__(o.func)){
             }
 
-            op(const op& o)noexcept
-                : func(o.func){
+            op(const op& o) = delete;
+
+            auto
+            concurrent_copy() const {
+                return op(core::concurrent_copy(func));
             }
         };
 

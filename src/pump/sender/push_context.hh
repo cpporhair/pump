@@ -21,16 +21,20 @@ namespace pump::sender {
 
             std::tuple<content_t...> contents;
 
+            explicit
             op(std::tuple<content_t...>&& c)
                 : contents(__fwd__(c)){
             }
 
-            op(op &&rhs)
+            op(op &&rhs) noexcept
                 : contents(__fwd__(rhs.contents)){
             }
 
-            op(const op &rhs)
-                : contents(rhs.contents) {
+            op(const op &rhs) = delete;
+
+            auto
+            concurrent_copy() const {
+                return op(core::concurrent_copy(contents));
             }
 
             template <typename context_t>
