@@ -48,29 +48,9 @@ namespace pump::scheduler::net::common::detail {
         }
     };
 
-    struct
-    _recv_pkt_getter {
-        auto
-        operator()() const noexcept {
-            return pkt_iovec{0};
-        }
-
-        auto
-        operator()(const char* data ,const size_t len) const noexcept {
-            return pkt_iovec{1, new iovec{(void *)data, len}};
-        }
-
-        auto
-        operator()(const char *d1, const size_t l1, const char *d2, const size_t l2) const noexcept {
-            return pkt_iovec{2, new iovec[2]{{(void *)d1, l1}, {(void *)d2, l2}}};
-        }
-    };
-
     inline constexpr _read_pkt_len read_pkt_len{};
     inline constexpr _full_pkt_checker full_pkt_checker{};
-    inline constexpr _recv_pkt_getter recv_pkt_getter{};
 
-    // 1.7: fix condition - 0xffff means data insufficient, should return false
     [[nodiscard]]
     inline bool
     has_full_pkt(const common::packet_buffer* buf) {
@@ -80,21 +60,7 @@ namespace pump::scheduler::net::common::detail {
         return buf->handle_data(len, full_pkt_checker);
     }
 
-    // 1.7: fix condition - 0xffff means data insufficient
-    inline auto
-    get_recv_pkt(const common::packet_buffer* buf) {
-        const auto len = buf->handle_data(sizeof(uint16_t), read_pkt_len);
-        if (len == 0xffff)
-            return pkt_iovec{0};
-        return buf->handle_data(len, recv_pkt_getter);
-    }
-
-    struct
-    pkt_vec {
-        const char* data = nullptr;
-        const size_t len = 0;
-    };
-
+    // D7: parameter types match handle_data's size_t to avoid narrowing
     struct
     _frame_copier {
         net_frame
@@ -103,19 +69,19 @@ namespace pump::scheduler::net::common::detail {
         }
 
         net_frame
-        operator()(const char* data, const uint16_t len) const noexcept {
+        operator()(const char* data, const size_t len) const noexcept {
             auto* copy = new char[len];
             memcpy(copy, data, len);
-            return {copy, len};
+            return {copy, static_cast<uint16_t>(len)};
         }
 
         net_frame
-        operator()(const char* d1, const uint16_t l1, const char* d2, const uint16_t l2) const noexcept {
-            uint16_t total = l1 + l2;
+        operator()(const char* d1, const size_t l1, const char* d2, const size_t l2) const noexcept {
+            size_t total = l1 + l2;
             auto* copy = new char[total];
             memcpy(copy, d1, l1);
             memcpy(copy + l1, d2, l2);
-            return {copy, total};
+            return {copy, static_cast<uint16_t>(total)};
         }
     };
 
@@ -156,8 +122,7 @@ namespace pump::scheduler::net::common::detail {
                 delete opt.value();
             }
             while (auto opt = ready_q.try_dequeue()) {
-                delete[] opt.value()->_data;
-                delete opt.value();
+                delete opt.value();  // ~net_frame() handles _data
             }
         }
     };
@@ -203,7 +168,10 @@ namespace pump::scheduler::net::common::detail {
 
         void
         close() {
-            ::close(fd);
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
             release();
             status.store(session_status::closed);
         }
@@ -235,47 +203,12 @@ namespace pump::scheduler::net::common::detail {
 
         void
         close() {
-            ::close(fd);
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
             release();
             status.store(session_status::closed);
-        }
-    };
-
-    enum class
-    packet_recv_status {
-        wait_len,
-        wait_data
-    };
-
-    struct
-    reader {
-        packet_recv_status recv_status;
-        uint16_t cur_read;
-        common::packet* buf;
-        core::spsc::queue<common::recv_req*> recv_request_q;
-        core::spsc::queue<common::packet*> pkt_q;
-
-        reader()
-            : recv_status(packet_recv_status::wait_len)
-            , cur_read(0)
-            , buf(nullptr) {
-        }
-
-        void
-        clear() {
-            while (auto opt = recv_request_q.try_dequeue()) {
-                delete opt.value();
-            }
-
-            while (auto opt = pkt_q.try_dequeue()) {
-                opt.value()->clear();
-                delete opt.value();
-            }
-
-            delete buf;
-            buf = nullptr;
-            cur_read = 0;
-            recv_status = packet_recv_status::wait_len;
         }
     };
 }

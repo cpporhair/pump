@@ -97,6 +97,8 @@ namespace pump::scheduler::net::epoll {
 
         // 3.8: add return after exception path
         // 6.3: use session_id_t::decode with generation validation
+        // D2: schedule only touches SPSC queues (recv_q producer, ready_q consumer),
+        //     never calls copy_out_frame — buf consumer is advance() thread only.
         auto
         schedule(common::recv_req* req) {
             auto* s = req->session_id.decode<session_t>();
@@ -110,10 +112,6 @@ namespace pump::scheduler::net::epoll {
             if (auto opt = recv_cache(s)->ready_q.try_dequeue()) {
                 req->cb(std::move(*opt.value()));
                 delete opt.value();
-                delete req;
-            }
-            else if (auto frame = common::detail::copy_out_frame(&recv_cache(s)->buf); frame.size() > 0) {
-                req->cb(std::move(frame));
                 delete req;
             }
             else {
@@ -139,10 +137,10 @@ namespace pump::scheduler::net::epoll {
             }
         }
 
-        // 3.10: clean up close_session logic
         void
         close_session(session_t* s) {
             s->close();
+            delete s;
         }
 
         // 3.2: use session_t; 6.3: use session_id_t::decode
@@ -155,15 +153,14 @@ namespace pump::scheduler::net::epoll {
                     delete opt.value();
                     continue;
                 }
-                auto event = new epoll_event;
-                event->data.ptr = s;
-                event->events = EPOLLIN | EPOLLOUT | EPOLLET;
+                epoll_event event{};
+                event.data.ptr = s;
+                event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 
-                if (poller.add_event(s->fd, event) != -1)[[likely]] {
+                if (poller.add_event(s->fd, &event) != -1)[[likely]] {
                     opt.value()->cb(true);
                 }
                 else {
-                    delete event;
                     opt.value()->cb(false);
                 }
 
@@ -182,41 +179,45 @@ namespace pump::scheduler::net::epoll {
                     continue;
                 }
                 close_session(s);
-                delete s;
                 opt.value()->cb(true);
                 delete opt.value();
             }
         }
 
         // 3.3 + 3.4: fix readv call and add forward_tail
+        // C1: EPOLLET requires reading until EAGAIN
         auto
         handle_read_event(epoll_event* e) {
             auto* s = static_cast<session_t*>(e->data.ptr);
             auto& buf = recv_cache(s)->buf;
-            int iovcnt = buf.make_iovec();
-            if (auto res = readv(s->fd, buf.iov(), iovcnt); res > 0) {
-                // 3.4: update tail after read
-                buf.forward_tail(res);
-                for (auto frame = common::detail::copy_out_frame(&buf);
-                     frame.size() > 0;
-                     frame = common::detail::copy_out_frame(&buf)) {
-                    if (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
-                        opt.value()->cb(std::move(frame));
-                        delete opt.value();
-                    } else {
-                        // no waiting recv, stash frame for later consumption
-                        recv_cache(s)->ready_q.try_enqueue(new common::net_frame(std::move(frame)));
+            while (true) {
+                if (buf.available() == 0) break;  // buffer full
+                int iovcnt = buf.make_iovec();
+                auto res = readv(s->fd, buf.iov(), iovcnt);
+                if (res > 0) {
+                    buf.forward_tail(res);
+                    for (auto frame = common::detail::copy_out_frame(&buf);
+                         frame.size() > 0;
+                         frame = common::detail::copy_out_frame(&buf)) {
+                        if (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
+                            opt.value()->cb(std::move(frame));
+                            delete opt.value();
+                        } else {
+                            recv_cache(s)->ready_q.try_enqueue(new common::net_frame(std::move(frame)));
+                        }
                     }
+                    continue;
                 }
-            }
-            else if (res == 0) {
-                while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
-                    opt.value()->cb(std::make_exception_ptr(common::session_closed_error()));
-                    delete opt.value();
+                if (res == 0) {
+                    while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
+                        opt.value()->cb(std::make_exception_ptr(common::session_closed_error()));
+                        delete opt.value();
+                    }
+                    close_session(s);
+                    e->data.ptr = nullptr;
+                    return;
                 }
-                close_session(s);
-            }
-            else {
+                // res < 0
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     return;
                 while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
@@ -224,10 +225,13 @@ namespace pump::scheduler::net::epoll {
                     delete opt.value();
                 }
                 close_session(s);
+                e->data.ptr = nullptr;
+                return;
             }
         }
 
         // 3.5: batch processing + writev return value check
+        // C2: check for partial write
         auto
         handle_write_event(epoll_event* e) {
             auto *s = static_cast<session_t*>(e->data.ptr);
@@ -245,7 +249,8 @@ namespace pump::scheduler::net::epoll {
                     delete r;
                     return;
                 }
-                r->cb(true);
+                size_t expected = r->_send_vec[0].iov_len + r->_send_vec[1].iov_len;
+                r->cb(static_cast<size_t>(res) == expected);
                 delete r;
             }
         }
@@ -262,7 +267,7 @@ namespace pump::scheduler::net::epoll {
                 else {
                     if (poller.events[i].events & EPOLLIN)
                         handle_read_event(&poller.events[i]);
-                    if (poller.events[i].events & EPOLLOUT)
+                    if (poller.events[i].data.ptr && poller.events[i].events & EPOLLOUT)
                         handle_write_event(&poller.events[i]);
                 }
             }
@@ -413,10 +418,10 @@ namespace pump::scheduler::net::epoll {
                 return -1;
             }
 
-            auto* ev = new epoll_event;
-            ev->events = EPOLLIN;
-            ev->data.fd = listen_fd;
-            poller.add_event(listen_fd, ev);
+            epoll_event ev{};
+            ev.events = EPOLLIN;
+            ev.data.fd = listen_fd;
+            poller.add_event(listen_fd, &ev);
 
             return 0;
         }

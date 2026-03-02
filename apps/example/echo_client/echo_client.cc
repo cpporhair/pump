@@ -46,16 +46,14 @@ session_proc(const runtime_schedulers<connect_scheduler_t, session_scheduler_t> 
     memcpy(send_buf, msg, msg_len);
     return scheduler::net::join(session_sched, sid)
         >> flat_map([session_sched, sid, send_buf, msg_len](...) {
-            return scheduler::net::send(session_sched, sid, send_buf, static_cast<uint32_t>(msg_len))
-                >> then([send_buf](bool) {
-                    delete[] send_buf;
-                });
+            return scheduler::net::send(session_sched, sid, send_buf, static_cast<uint32_t>(msg_len));
+            // send_req 持有 net_frame，析构自动释放 send_buf
         })
         >> flat_map([session_sched, sid](...) {
             return scheduler::net::recv(session_sched, sid)
                 >> then([](scheduler::net::common::net_frame&& frame) {
                     std::println("Received echo response, frame size: {}", frame.size());
-                    delete[] frame._data;
+                    // ~net_frame() 自动释放 _data
                 });
         })
         >> flat_map([session_sched, sid](...) {

@@ -64,7 +64,7 @@ namespace pump::scheduler::net::io_uring {
             auto& pc = pending_connects.back();
             pc.addr.sin_family = AF_INET;
             pc.addr.sin_port = htons(req->port);
-            inet_pton(AF_INET, req->address, &pc.addr.sin_addr);
+            inet_pton(AF_INET, req->address.c_str(), &pc.addr.sin_addr);
 
             ::io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
             if (!sqe) {

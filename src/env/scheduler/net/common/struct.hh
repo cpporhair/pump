@@ -2,42 +2,17 @@
 #ifndef ENV_SCHEDULER_NET_COMMON_STRUCT_HH
 #define ENV_SCHEDULER_NET_COMMON_STRUCT_HH
 
+#include <cassert>
 #include <cstdint>
 #include <atomic>
 #include <functional>
 #include <algorithm>
+#include <string>
 #include <bits/types/struct_iovec.h>
 
 #include "pump/core/meta.hh"
 
 namespace pump::scheduler::net::common {
-    struct
-    packet {
-        uint16_t len;
-        char* data;
-        void
-        clear() const {
-            if (data != nullptr)
-                delete[] data;  // 1.1: fix delete -> delete[]
-        }
-    };
-
-    struct
-    pkt_iovec {
-        uint08_t cnt;
-        iovec* vec;
-
-        [[nodiscard]]
-        auto
-        len() const {
-            size_t len = 0;
-            for (uint08_t i = 0; i < cnt; i++) {
-                len+= vec[i].iov_len;
-            }
-            return len;
-        }
-    };
-
     struct
     net_frame {
         char* _data;
@@ -64,7 +39,16 @@ namespace pump::scheduler::net::common {
         net_frame(const net_frame&) = delete;
         net_frame& operator=(const net_frame&) = delete;
 
-        ~net_frame() = default;
+        ~net_frame() {
+            delete[] _data;
+        }
+
+        [[nodiscard]] char* release() noexcept {
+            auto* p = _data;
+            _data = nullptr;
+            _len = 0;
+            return p;
+        }
 
         [[nodiscard]] const char* data() const { return _data; }
         [[nodiscard]] uint16_t size() const { return _len; }
@@ -178,6 +162,7 @@ namespace pump::scheduler::net::common {
             _tail.store(_tail.load(std::memory_order_relaxed) + len, std::memory_order_release);
         }
 
+        // D3: validate power-of-2 (required by head()/tail() bitwise mask)
         explicit
         packet_buffer(const uint32_t _size)
             : _data(new char[_size])
@@ -185,6 +170,7 @@ namespace pump::scheduler::net::common {
             , _head(0)
             , _tail(0)
             , _iov{} {
+            assert((_size & (_size - 1)) == 0 && "packet_buffer size must be power of 2");
         }
 
         // 1.5: add destructor to release _data
@@ -240,9 +226,10 @@ namespace pump::scheduler::net::common {
         std::move_only_function<void(session_id_t)> cb;
     };
 
+    // D5: std::string avoids dangling pointer from temporary/stack buffers
     struct
     connect_req {
-        const char* address;
+        std::string address;
         uint16_t port;
         std::move_only_function<void(session_id_t)> cb;
     };

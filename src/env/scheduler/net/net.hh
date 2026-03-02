@@ -50,7 +50,7 @@ namespace pump::scheduler::net {
         return senders::send::sender<scheduler_t>(
             scheduler,
             sid,
-            common::net_frame(static_cast<char *>(data), len + sizeof(common::net_frame::_len))
+            common::net_frame(static_cast<char *>(data), len)
         );
     }
 }

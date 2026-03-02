@@ -63,7 +63,7 @@ namespace pump::scheduler::net::epoll {
             sockaddr_in addr{};
             addr.sin_family = AF_INET;
             addr.sin_port = htons(req->port);
-            inet_pton(AF_INET, req->address, &addr.sin_addr);
+            inet_pton(AF_INET, req->address.c_str(), &addr.sin_addr);
 
             int ret = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
             if (ret == 0) {

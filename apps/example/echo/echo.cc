@@ -85,10 +85,9 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                 })
                 >> get_context<session_data<session_scheduler_t>>()
                 >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::net::common::net_frame &&frame) {
-                    return scheduler::net::send(sd.scheduler, sd.id, frame._data, frame._len)
-                        >> then([data =frame.data()](bool) {
-                            delete[] data;
-                        });
+                    auto len = frame.size();
+                    return scheduler::net::send(sd.scheduler, sd.id, frame.release(), len);
+                    // send_req 持有 net_frame，析构自动释放 data
                 })
                 >> any_exception([](std::exception_ptr e) {
                     return just()
@@ -98,6 +97,9 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                         });
                 })
                 >> count();
+        })
+        >> flat_map([session_sched, sid](...) {
+            return scheduler::net::stop(session_sched, sid);
         });
 }
 

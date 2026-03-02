@@ -45,11 +45,11 @@ namespace pump::scheduler::net::io_uring {
         int server_socket = -1;
         struct ::io_uring ring{};
         core::mpsc::queue<common::conn_req*, 2048> request_q;
-        // 6.3: use session_id_t instead of raw uint64_t
         core::mpmc::queue<common::session_id_t, 2048> conn_fd_q;
         size_t _recv_buffer_size = 4096;
+        sockaddr_in _accept_addr{};
+        socklen_t _accept_addr_len = sizeof(sockaddr_in);
 
-        // 6.4: shutdown flag
         std::atomic<bool> _shutdown{false};
     private:
         // 4.2: fix req leak when immediate connection available; 6.3: use session_id_t
@@ -82,52 +82,45 @@ namespace pump::scheduler::net::io_uring {
             return false;
         }
 
-        auto
-        add_accept_request(
-            int socket,
-            sockaddr_in *client_addr,
-            socklen_t *client_addr_len
-        ) {
+        void
+        submit_accept() {
             ::io_uring_sqe *sqe = ::io_uring_get_sqe(&ring);
-            ::io_uring_prep_accept(sqe, socket, reinterpret_cast<struct sockaddr *>(client_addr),
-                                 client_addr_len, 0);
+            if (!sqe) [[unlikely]] return;
+            _accept_addr_len = sizeof(sockaddr_in);
+            ::io_uring_prep_accept(sqe, server_socket,
+                reinterpret_cast<sockaddr *>(&_accept_addr), &_accept_addr_len, 0);
             auto *req = new io_uring_request;
             req->event_type = uring_event_type::accept;
             ::io_uring_sqe_set_data(sqe, req);
             ::io_uring_submit(&ring);
-
-            return 0;
         }
 
-        // 4.3: add break to prevent fallthrough; 4.4: fix new/free mismatch
-        // 6.3: encode accepted fd as session_id_t when no pending request
-        auto
+        void
         handle_io_uring() {
-            sockaddr_in client_addr{};
-            socklen_t client_addr_len = sizeof(client_addr);
             ::io_uring_cqe *cqe;
-            add_accept_request(server_socket, &client_addr, &client_addr_len);
             while (::io_uring_peek_cqe(&ring, &cqe) == 0) {
-                if (cqe->res < 0)[[unlikely]]
-                    break;
                 auto *uring_req = reinterpret_cast<io_uring_request *>(cqe->user_data);
-
-                switch (uring_req->event_type) {
-                    case uring_event_type::accept:
-                        if (!maybe_accept(cqe->res)) {
-                            const int flags = fcntl(cqe->res, F_GETFL, 0);
-                            fcntl(cqe->res, F_SETFL, flags | O_NONBLOCK);
-                            auto s = new session_t(cqe->res, new common::detail::recv_cache(_recv_buffer_size));
-                            conn_fd_q.try_enqueue(common::session_id_t::encode(s));
-                        }
-                        delete uring_req;
-                        break;
-                    default:
-                        delete uring_req;
-                        break;
+                if (cqe->res < 0) [[unlikely]] {
+                    // accept failed, re-submit
+                    delete uring_req;
+                    ::io_uring_cqe_seen(&ring, cqe);
+                    submit_accept();
+                    continue;
                 }
 
+                if (!maybe_accept(cqe->res)) {
+                    const int flags = fcntl(cqe->res, F_GETFL, 0);
+                    fcntl(cqe->res, F_SETFL, flags | O_NONBLOCK);
+                    auto *s = new session_t(cqe->res, new common::detail::recv_cache(_recv_buffer_size));
+                    if (!conn_fd_q.try_enqueue(common::session_id_t::encode(s))) [[unlikely]] {
+                        s->close();
+                        delete s;
+                    }
+                }
+
+                delete uring_req;
                 ::io_uring_cqe_seen(&ring, cqe);
+                submit_accept();
             }
         }
 
@@ -183,6 +176,7 @@ namespace pump::scheduler::net::io_uring {
                 return -1;
             }
 
+            submit_accept();
             return 0;
         }
 
@@ -271,6 +265,8 @@ namespace pump::scheduler::net::io_uring {
         }
 
         // 4.7: add return after exception path; 6.3: use session_id_t::decode
+        // D2: schedule only touches SPSC queues (recv_q producer, ready_q consumer),
+        //     never calls copy_out_frame — buf consumer is advance() thread only.
         auto
         schedule(common::recv_req* req) {
             auto* s = req->session_id.decode<session_t>();
@@ -284,10 +280,6 @@ namespace pump::scheduler::net::io_uring {
             if (auto opt = recv_cache(s)->ready_q.try_dequeue()) {
                 req->cb(std::move(*opt.value()));
                 delete opt.value();
-                delete req;
-            }
-            else if (auto frame = common::detail::copy_out_frame(&recv_cache(s)->buf); frame.size() > 0) {
-                req->cb(std::move(frame));
                 delete req;
             }
             else {
@@ -316,30 +308,26 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
+        // C3: check CQE result against expected write size
         void
-        on_write_event(const io_uring_request *iur) {
+        on_write_event(const io_uring_request *iur, int res) {
             auto r = static_cast<common::send_req*>(iur->user_data);
-            r->cb(true);
+            size_t expected = r->_send_vec[0].iov_len + r->_send_vec[1].iov_len;
+            r->cb(static_cast<size_t>(res) == expected);
             delete r;
         }
 
         void
         close_session(session_t* s) {
             s->close();
+            delete s;
         }
 
-        void
-        close_session(io_uring_request* iur) {
-            close_session(static_cast<session_t *>(iur->user_data));
-        }
-
-        // 4.10: add break + delete for write case; 6.3: use session_id_t::decode
         void
         process_err(::io_uring_cqe *cqe) {
             switch (auto *uring_req = reinterpret_cast<io_uring_request *>(cqe->user_data); uring_req->event_type) {
                 case uring_event_type::read: {
                     auto s = static_cast<session_t*>(uring_req->user_data);
-                    // notify all pending recv callbacks before closing session
                     while (auto opt = recv_cache(s)->recv_q.try_dequeue()) {
                         opt.value()->cb(std::make_exception_ptr(common::session_closed_error()));
                         delete opt.value();
@@ -350,8 +338,6 @@ namespace pump::scheduler::net::io_uring {
                 }
                 case uring_event_type::write: {
                     auto r = static_cast<common::send_req*>(uring_req->user_data);
-                    auto s = r->session_id.decode<session_t>();
-                    if (s) close_session(s);
                     r->cb(false);
                     delete r;
                     delete uring_req;
@@ -383,13 +369,13 @@ namespace pump::scheduler::net::io_uring {
                         submit_read(uring_req, s);
                     }
                     else {
-                        close_session(uring_req);
+                        close_session(s);
                         delete uring_req;
                     }
                     break;
                 }
                 case uring_event_type::write: {
-                    on_write_event(uring_req);
+                    on_write_event(uring_req, cqe->res);
                     delete uring_req;
                     break;
                 }
@@ -452,7 +438,6 @@ namespace pump::scheduler::net::io_uring {
             }
         }
 
-        // 4.8: handle stop requests asynchronously in advance; 6.3: use session_id_t::decode
         void
         handle_stop_request() {
             while (auto opt = stop_q.try_dequeue()) {
@@ -462,8 +447,10 @@ namespace pump::scheduler::net::io_uring {
                     delete opt.value();
                     continue;
                 }
-                s->status.store(common::detail::session_status::closed);
-                ::close(s->fd);
+                // close() releases recv_cache and closes fd (idempotent).
+                // Don't delete s here — pending read CQE will arrive with error,
+                // process_err/process_cqe will call close_session(s) which deletes.
+                s->close();
                 opt.value()->cb(true);
                 delete opt.value();
             }
