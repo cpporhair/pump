@@ -106,8 +106,8 @@ namespace pump::scheduler::net::common::detail {
     struct
     recv_cache {
         packet_buffer buf;
-        core::spsc::queue<common::recv_req*> recv_q;
-        core::spsc::queue<common::net_frame*> ready_q;
+        core::local::queue<common::recv_req*> recv_q;
+        core::local::queue<common::net_frame*> ready_q;
 
         explicit
         recv_cache(size_t size)

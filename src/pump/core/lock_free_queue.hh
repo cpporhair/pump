@@ -208,6 +208,70 @@ namespace pump::core {
         };
     }
 
+    // Single-thread ring buffer: no atomics, no memory barriers.
+    // Use when producer and consumer are guaranteed to be the same thread.
+    namespace local {
+        template<typename T, size_t CAPACITY = 1024>
+        struct queue {
+        private:
+            static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be power of 2");
+            static_assert(std::is_nothrow_move_constructible_v<T> || std::is_nothrow_move_assignable_v<T>,
+                          "T must be nothrow movable for queue safety.");
+            static constexpr size_t MASK = CAPACITY - 1;
+
+            size_t head_ = 0;
+            size_t tail_ = 0;
+            T buffer_[CAPACITY];
+
+        public:
+            queue() {
+                for (size_t i = 0; i < CAPACITY; ++i) buffer_[i] = T{};
+            }
+            ~queue() = default;
+            queue(const queue&) = delete;
+            queue& operator=(const queue&) = delete;
+
+            bool try_enqueue(T&& value) noexcept {
+                size_t next = (tail_ + 1) & MASK;
+                if (next == head_) return false;
+                buffer_[tail_] = std::move(value);
+                tail_ = next;
+                return true;
+            }
+
+            bool try_enqueue(const T& value) noexcept {
+                return try_enqueue(T(value));
+            }
+
+            std::optional<T> try_dequeue() noexcept {
+                T result;
+                if (try_dequeue(result)) {
+                    return std::move(result);
+                }
+                return std::nullopt;
+            }
+
+            bool try_dequeue(T& result) noexcept {
+                if (head_ == tail_) return false;
+                result = std::move(buffer_[head_]);
+                head_ = (head_ + 1) & MASK;
+                return true;
+            }
+
+            bool empty() const noexcept {
+                return head_ == tail_;
+            }
+
+            bool full() const noexcept {
+                return ((tail_ + 1) & MASK) == head_;
+            }
+
+            size_t size() const noexcept {
+                return (tail_ + CAPACITY - head_) & MASK;
+            }
+        };
+    }
+
     namespace spsc {
         template<typename T, size_t CAPACITY = 1024>
         struct queue {
