@@ -218,3 +218,169 @@ for_each(outer) >> concurrent(N) >> on(sched) >> then([](auto item) {
 | IO 密集 | 1000-10000 |
 | 内存受限 | 按内存计算 |
 | 无限制 | `concurrent()` 无参数 |
+
+## 6. 复杂功能实现指南
+
+> 基于 KV 项目（`apps/kv/`）的实践总结。实现跨多个 scheduler 的复杂业务时，遵循以下指南。
+
+### 6.1 Pipeline 与 Scheduler 的职责分工
+
+**核心原则：Pipeline 是编排层，Scheduler 是逻辑层。**
+
+| 职责 | 归属 | 示例 |
+|------|------|------|
+| 决定执行顺序和并发度 | Pipeline（sender 组合） | `concurrent(N) >> on(sched) >> reduce()` |
+| 决定跨域跳转路径 | Pipeline（`on()` / 返回其他 scheduler 的 sender） | `then([](){ return index::update(f); }) >> flat()` |
+| 实际的业务判断和数据操作 | Scheduler 的 `handle_*()` | leader/follower 合并、B-tree 查找、waiter 协调 |
+| 运行时多路分支的决策 | Scheduler（通过 variant 返回） | `req->cb(variant<leader*, follower, failed>{})` |
+| 编译期类型分支的处理 | Pipeline（`visit` + `if constexpr`） | 根据 scheduler 返回的 variant 走不同子 pipeline |
+
+**错误做法：** 把复杂业务逻辑全写在 `then` lambda 中。lambda 应该只做简单的数据变换或返回另一个 scheduler 的 sender。
+
+```cpp
+// ❌ 把业务逻辑塞进 then
+>> then([](auto&& req) {
+    // 50 行复杂逻辑：合并请求、分配资源、协调等待者 ...
+    return result;
+})
+
+// ✅ 业务逻辑在 scheduler 的 handle 中，pipeline 只做编排
+>> then([](auto&& batch) { return fs::allocate_data_page(batch); })  // 进入 fs scheduler
+>> flat()
+>> then([](auto&& res) {  // variant 分支处理
+    if constexpr (is_leader<res>) return just() >> write_data(res) >> notify_follower(res);
+    else return just(__fwd__(res));
+}) >> flat()
+```
+
+### 6.2 Scheduler 设计决策
+
+#### 何时需要自建 Scheduler
+
+核心判断：**是否存在需要被多条并发 pipeline 共享访问的可变状态？**
+
+| 情况 | 方案 | 理由 |
+|------|------|------|
+| 无状态计算 | `on(task_scheduler) >> then(f)` | 不需要保护任何状态 |
+| 状态是 pipeline 私有的 | 值传递或 context | 不存在共享，不需要 scheduler |
+| 状态已被现有 scheduler 管理 | 用现有 scheduler 的 sender | 不需要新建 |
+| **共享可变状态** | **自建 scheduler** | 单线程 `handle_*()` 天然互斥，无需锁 |
+| **跨请求协调**（合并/等待/排序） | **自建 scheduler** | 协调逻辑必须在同一线程中看到多个请求 |
+| **硬件资源绑定**（NVMe qpair、fd） | **自建 scheduler** | 硬件资源必须从固定线程操作 |
+
+简记：`then()` 解决"做计算"，`on(task_scheduler)` 解决"换线程"，自建 scheduler 解决"管状态"。
+
+#### 确定需要自建后，回答以下设计问题
+
+**Q1: 需要多少个实例？如何路由？**
+- 全局唯一（如快照序号） → 单实例，固定路由 `list[0]`
+- 可按 key 分片（如索引） → 多实例，hash 路由 `key_seed % N`
+- 无状态 / 可任意分发 → 多实例，随机路由 `ticks % N`
+
+**Q2: handle 有几种结果路径？**
+- 单一结果 → `cb()` 或 `cb(result)`
+- 多种结果（leader/follower/failed） → `cb(variant<A,B,C>)`，op 中 `std::visit` 展开
+
+**Q3: 是否需要跨请求协调？**
+- 不需要 → 简单 dequeue + process + cb
+- 需要合并（group commit） → Leader/Follower 模式：连续 dequeue 多个请求，第一个为 leader，后续为 follower
+- 需要等待（按需加载） → Waiter 链表：首次访问者成为 reader-leader 执行 IO，后续访问者挂 waiter 等通知
+
+### 6.3 variant 多路返回值模式
+
+Scheduler 需要根据运行时状态返回不同结果时的标准做法：
+
+```
+Scheduler handle_*()
+  │ 判断业务状态
+  ├─ 情况A → req->cb(variant<A*, B, C>{A*指针})
+  ├─ 情况B → req->cb(variant<A*, B, C>{B{}})
+  └─ 情况C → req->cb(variant<A*, B, C>{C{}})
+       │
+       ▼ op::start 中的 callback
+  std::visit([&ctx, &scope](auto&& v) {
+      op_pusher<pos+1>::push_value(ctx, scope, std::forward<decltype(v)>(v));
+  }, std::move(v));
+       │
+       ▼ Pipeline 中
+  >> then([](auto&& res) {
+      if constexpr (std::is_same_v<__typ__(res), A*>)
+          return /* A 的子 pipeline */;
+      else if constexpr (std::is_same_v<__typ__(res), B>)
+          return /* B 的子 pipeline */;
+      else
+          return /* C 的子 pipeline */;
+  }) >> flat()
+```
+
+**关键：** variant 展开不用 `visit()` sender（因为值已在 op 的 callback 中通过 `std::visit` 展开了），后续 then 直接用 `if constexpr` 分支。只有当 pipeline 中间产生的值是 variant/bool 时才用 `visit()` sender。
+
+### 6.4 Context 栈使用策略
+
+| 场景 | 手段 | 示例 |
+|------|------|------|
+| 事务级隐式参数 | `push_context(ptr)` + `get_context<T>()` | batch 指针在整个事务中传递 |
+| 临时资源生命周期保护 | `with_context(value)(pipeline)` | string key 跨异步调用存活 |
+| 同类型多值消歧 | `push_context_with_id<__COUNTER__>` | 嵌套事务中区分不同 batch |
+| 子流程独立数据 | `with_context(data)(子pipeline)` | 每次循环迭代独立的 req/res 帧 |
+
+**原则：** 需要跨多个 `then` / 跨 scheduler 传递的数据放 context，单个 then 内用完的数据直接做参数传递。
+
+### 6.5 异常处理分层策略
+
+从内到外四层，每层有不同职责：
+
+```
+操作级 ─── catch_exception<具体异常>(recovery_sender)
+  │          精确捕获，执行恢复逻辑（如释放已分配的页面）
+  │
+子流程级 ─ ignore_inner_exception(子pipeline)
+  │          隔离子流程异常，不影响外层控制流
+  │
+事务级 ─── ignore_all_exception()  [在资源释放代码之前]
+  │          确保 finish/cleanup 代码一定执行
+  │
+全局级 ─── any_exception([](auto e){ log + just() })
+             顶层兜底，打印/记录后继续
+```
+
+**资源释放的异常安全模式（类 RAII）：**
+```cpp
+// start_xxx() 获取资源
+// >> user_pipeline
+// >> ignore_all_exception()   ← 屏蔽用户异常
+// >> finish_xxx()             ← 确保释放（publish/delete/pop_context）
+```
+
+### 6.6 跨域数据流设计
+
+复杂功能通常涉及多个 scheduler 之间的数据流转。设计时画出完整的跳转路径：
+
+```
+apply() 写路径的跨域流：
+
+  [调用方 thread]
+       │ get_context<batch*>()
+       ▼
+  [batch scheduler]  ← allocate_put_id：分配版本号
+       │ cb()
+       ▼
+  [index scheduler × N]  ← update：并发更新索引（for_each + concurrent）
+       │ cb() × N → reduce()
+       ▼
+  [fs scheduler]  ← allocate_data_page：Leader/Follower 合并
+       │ cb(variant<leader*, follower, failed>)
+       ▼ if constexpr 分支
+  [nvme scheduler × M]  ← write_data：并发 DMA 写（for_each + concurrent）
+       │ cb() × M → reduce()
+       ▼
+  [index scheduler × N]  ← cache：并发缓存数据
+       │ cb() × N → reduce()
+       ▼ done
+```
+
+**要点：**
+- 每次进入新 scheduler = 一次异步跳转（当前线程让出，scheduler 的 advance 线程接管）
+- 从 scheduler 回来 = callback 触发 `op_pusher<pos+1>::push_value`
+- 并发扇出（for_each + concurrent）后必须扇入（reduce/all）
+- 类型在每个跳转点都是编译期确定的
