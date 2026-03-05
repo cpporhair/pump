@@ -7,6 +7,7 @@
 #include <bits/move_only_function.h>
 
 #include "./runner.hh"
+#include "pump/core/lock_free_queue.hh"
 
 namespace pump::env::runtime {
     template <typename ...scheduler_t>
@@ -24,6 +25,7 @@ namespace pump::env::runtime {
     template <typename ...scheduler_t>
     auto
     run(global_runtime_t<scheduler_t...> *runtime, uint32_t core) {
+        pump::core::this_core_id = core;
         const static auto st = std::chrono::milliseconds(1);
         runtime->is_running_by_core[core].store(true);
         while (runtime->is_running_by_core[core].load()) [[likely]] {

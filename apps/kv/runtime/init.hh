@@ -101,8 +101,6 @@ namespace apps::kv::runtime {
                 if (!ssd->nvme_qpairs_by_core[c])
                     continue;
                 auto *sche = new pump::scheduler::nvme::scheduler<data::data_page>(
-                    spdk_ring_create(spdk_ring_type::SPDK_RING_TYPE_MP_SC, runtime::spdk_ring_size, -1),
-                    spdk_ring_create(spdk_ring_type::SPDK_RING_TYPE_MP_SC, runtime::spdk_ring_size, -1),
                     ssd->nvme_qpairs_by_core[c]
                 );
                 nvme_schedulers_per_ssd.back().by_core[c] = sche;

@@ -44,7 +44,7 @@ namespace pump::scheduler::net::io_uring {
     private:
         int server_socket = -1;
         struct ::io_uring ring{};
-        core::mpsc::queue<common::conn_req*, 2048> request_q;
+        core::per_core::queue<common::conn_req*, 2048> request_q;
         core::mpmc::queue<common::session_id_t, 2048> conn_fd_q;
         size_t _recv_buffer_size = 4096;
         sockaddr_in _accept_addr{};
@@ -223,9 +223,9 @@ namespace pump::scheduler::net::io_uring {
         friend struct send_op_t<session_scheduler>;
         friend struct stop_op_t<session_scheduler>;
     private:
-        core::mpsc::queue<common::join_req*, 2048> join_q;
-        core::mpsc::queue<common::send_req*, 2048> send_q;
-        core::mpsc::queue<common::stop_req*, 2048> stop_q;
+        core::per_core::queue<common::join_req*, 2048> join_q;
+        core::per_core::queue<common::send_req*, 2048> send_q;
+        core::per_core::queue<common::stop_req*, 2048> stop_q;
         std::list<common::send_req*> send_list;
         struct ::io_uring ring{};
 
@@ -425,35 +425,35 @@ namespace pump::scheduler::net::io_uring {
         // 4.9: call join callback before delete; 6.3: use session_id_t::decode
         void
         handle_join_request() {
-            while (auto opt = join_q.try_dequeue()) {
-                auto* s = opt.value()->session_id.decode<session_t>();
+            join_q.drain([this](common::join_req* req) {
+                auto* s = req->session_id.decode<session_t>();
                 if (!s) [[unlikely]] {
-                    opt.value()->cb(false);
-                    delete opt.value();
-                    continue;
+                    req->cb(false);
+                    delete req;
+                    return;
                 }
                 submit_read(s);
-                opt.value()->cb(true);
-                delete opt.value();
-            }
+                req->cb(true);
+                delete req;
+            });
         }
 
         void
         handle_stop_request() {
-            while (auto opt = stop_q.try_dequeue()) {
-                auto* s = opt.value()->session_id.decode<session_t>();
+            stop_q.drain([this](common::stop_req* req) {
+                auto* s = req->session_id.decode<session_t>();
                 if (!s) [[unlikely]] {
-                    opt.value()->cb(false);
-                    delete opt.value();
-                    continue;
+                    req->cb(false);
+                    delete req;
+                    return;
                 }
                 // close() releases recv_cache and closes fd (idempotent).
                 // Don't delete s here — pending read CQE will arrive with error,
                 // process_err/process_cqe will call close_session(s) which deletes.
                 s->close();
-                opt.value()->cb(true);
-                delete opt.value();
-            }
+                req->cb(true);
+                delete req;
+            });
         }
 
         // 6.3: use session_id_t::decode
@@ -476,6 +476,9 @@ namespace pump::scheduler::net::io_uring {
         // 4.12: add io_uring_submit after processing send requests
         void
         handle_send_request() {
+            send_q.drain([this](common::send_req* req) {
+                send_list.push_back(req);
+            });
             bool submitted = false;
             while (!send_list.empty()) {
                 if (::io_uring_sqe *sqe = ::io_uring_get_sqe(&ring)) {
@@ -488,16 +491,6 @@ namespace pump::scheduler::net::io_uring {
                     break;
                 }
             }
-            while (auto opt = send_q.try_dequeue()) {
-                if (::io_uring_sqe *sqe = ::io_uring_get_sqe(&ring)) {
-                    submit_write(sqe, opt.value());
-                    submitted = true;
-                }
-                else {
-                    send_list.push_back(opt.value());
-                    break;
-                }
-            }
             if (submitted) {
                 ::io_uring_submit(&ring);
             }
@@ -506,18 +499,10 @@ namespace pump::scheduler::net::io_uring {
         // 6.4: drain all pending queues with error on shutdown
         void
         drain_on_shutdown() {
-            while (auto opt = join_q.try_dequeue()) {
-                opt.value()->cb(false);
-                delete opt.value();
-            }
-            while (auto opt = stop_q.try_dequeue()) {
-                opt.value()->cb(false);
-                delete opt.value();
-            }
-            while (auto opt = send_q.try_dequeue()) {
-                opt.value()->cb(false);
-                delete opt.value();
-            }
+            auto fail_and_delete = [](auto* req) { req->cb(false); delete req; };
+            join_q.drain(fail_and_delete);
+            stop_q.drain(fail_and_delete);
+            send_q.drain(fail_and_delete);
             for (auto* req : send_list) {
                 req->cb(false);
                 delete req;

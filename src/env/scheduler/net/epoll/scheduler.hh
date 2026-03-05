@@ -59,8 +59,8 @@ namespace pump::scheduler::net::epoll {
     private:
         detail::poller_epoll poller;
 
-        core::mpsc::queue<common::join_req*, 2048> join_q;
-        core::mpsc::queue<common::stop_req*, 2048> stop_q;
+        core::per_core::queue<common::join_req*, 2048> join_q;
+        core::per_core::queue<common::stop_req*, 2048> stop_q;
 
         // 6.4: shutdown flag
         std::atomic<bool> _shutdown{false};
@@ -146,42 +146,42 @@ namespace pump::scheduler::net::epoll {
         // 3.2: use session_t; 6.3: use session_id_t::decode
         auto
         handle_join_req() {
-            while (auto opt = join_q.try_dequeue()) {
-                auto* s = opt.value()->session_id.decode<session_t>();
+            join_q.drain([this](common::join_req* req) {
+                auto* s = req->session_id.decode<session_t>();
                 if (!s) [[unlikely]] {
-                    opt.value()->cb(false);
-                    delete opt.value();
-                    continue;
+                    req->cb(false);
+                    delete req;
+                    return;
                 }
                 epoll_event event{};
                 event.data.ptr = s;
                 event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 
                 if (poller.add_event(s->fd, &event) != -1)[[likely]] {
-                    opt.value()->cb(true);
+                    req->cb(true);
                 }
                 else {
-                    opt.value()->cb(false);
+                    req->cb(false);
                 }
 
-                delete opt.value();
-            }
+                delete req;
+            });
         }
 
         // 3.2 + 3.7: use session_t; 6.3: use session_id_t::decode
         auto
         handle_stop_req() {
-            while (auto opt = stop_q.try_dequeue()) {
-                auto* s = opt.value()->session_id.decode<session_t>();
+            stop_q.drain([this](common::stop_req* req) {
+                auto* s = req->session_id.decode<session_t>();
                 if (!s) [[unlikely]] {
-                    opt.value()->cb(false);
-                    delete opt.value();
-                    continue;
+                    req->cb(false);
+                    delete req;
+                    return;
                 }
                 close_session(s);
-                opt.value()->cb(true);
-                delete opt.value();
-            }
+                req->cb(true);
+                delete req;
+            });
         }
 
         // 3.3 + 3.4: fix readv call and add forward_tail
@@ -276,14 +276,9 @@ namespace pump::scheduler::net::epoll {
         // 6.4: drain all pending queues with error on shutdown
         void
         drain_on_shutdown() {
-            while (auto opt = join_q.try_dequeue()) {
-                opt.value()->cb(false);
-                delete opt.value();
-            }
-            while (auto opt = stop_q.try_dequeue()) {
-                opt.value()->cb(false);
-                delete opt.value();
-            }
+            auto fail_and_delete = [](auto* req) { req->cb(false); delete req; };
+            join_q.drain(fail_and_delete);
+            stop_q.drain(fail_and_delete);
         }
 
     public:
@@ -322,7 +317,7 @@ namespace pump::scheduler::net::epoll {
     accept_scheduler {
         friend struct conn_op_t<accept_scheduler>;
     private:
-        core::mpsc::queue<common::conn_req*, 2048> conn_request_q;
+        core::per_core::queue<common::conn_req*, 2048> conn_request_q;
         core::mpmc::queue<common::session_id_t, 2048> session_q;
         detail::poller_epoll poller;
         int listen_fd = -1;

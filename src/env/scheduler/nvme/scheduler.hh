@@ -15,6 +15,7 @@
 #include "./put_page.hh"
 #include "./ssd.hh"
 #include "pump/core/ring_queue.hh"
+#include "pump/core/lock_free_queue.hh"
 
 namespace pump::scheduler::nvme::_scheduler {
     inline auto
@@ -137,19 +138,19 @@ namespace pump::scheduler::nvme {
         friend struct put::op<scheduler<page_t>, page_t>;
     private:
         qpair<page_t>* qp;
-        spdk_ring* put_data_page_req_queue;
-        spdk_ring* get_data_page_req_queue;
+        core::per_core::queue<put::req<page_t>*, 2048> put_data_page_req_queue;
+        core::per_core::queue<get::req<page_t>*, 2048> get_data_page_req_queue;
         core::ring_queue<put::req<page_t>*> local_put_q;
         core::ring_queue<get::req<page_t>*> local_get_q;
     private:
         auto
-        schedule(put::req<page_t>* r) const {
-            return 0 < spdk_ring_enqueue(put_data_page_req_queue, reinterpret_cast<void **>(&r), 1, nullptr);
+        schedule(put::req<page_t>* r) {
+            return put_data_page_req_queue.try_enqueue(r);
         }
 
         auto
-        schedule(get::req<page_t>* r) const {
-            return 0 < spdk_ring_enqueue(get_data_page_req_queue, reinterpret_cast<void **>(&r), 1, nullptr);
+        schedule(get::req<page_t>* r) {
+            return get_data_page_req_queue.try_enqueue(r);
         }
 
         void
@@ -188,10 +189,9 @@ namespace pump::scheduler::nvme {
             return qp->owner;
         }
 
-        scheduler(spdk_ring* put_r,  spdk_ring* get_r, qpair<page_t>* qpair)
+        explicit
+        scheduler(qpair<page_t>* qpair)
             : qp(qpair)
-            , put_data_page_req_queue(put_r)
-            , get_data_page_req_queue(get_r)
             , local_put_q(128)
             , local_get_q(128) {
         }
@@ -215,25 +215,13 @@ namespace pump::scheduler::nvme {
             handle_local_queue(local_put_q);
             handle_local_queue(local_get_q);
 
-            auto count = spdk_ring_dequeue(
-                put_data_page_req_queue,
-                static_cast<void **>(local_put_q.tail_buffer()),
-                local_put_q.size()
-            );
+            put_data_page_req_queue.drain([this](put::req<page_t>* r) {
+                local_put_q.enqueue(r);
+            });
 
-            if (0 < count) {
-                local_put_q.tail_offset(count);
-            }
-
-            count = spdk_ring_dequeue(
-                get_data_page_req_queue,
-                static_cast<void **>(local_get_q.tail_buffer()),
-                local_get_q.size()
-            );
-
-            if (0 < count) {
-                local_get_q.tail_offset(count);
-            }
+            get_data_page_req_queue.drain([this](get::req<page_t>* r) {
+                local_get_q.enqueue(r);
+            });
 
             handle_local_queue(local_put_q);
             handle_local_queue(local_get_q);

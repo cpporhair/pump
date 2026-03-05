@@ -18,6 +18,7 @@
 
 #include "env/scheduler/nvme/sender.hh"
 #include "nvme_impl.hh"
+#include "pump/sender/pop_context.hh"
 
 using namespace pump;
 using namespace pump::sender;
@@ -38,36 +39,31 @@ create_runtime_schedulers() {
 auto
 nvme_test_proc(const runtime_schedulers *rs) {
     return just()
-        >> then([]() {
-            // 准备测试数据
-            example::nvme::page_list pl(1);
-            // 这里为了演示，我们假设页面内存已经分配并填充了内容
-            // 实际上在真实环境中需要 DMA 分配
-            return pl;
+        >> with_context(example::nvme::page_list(1))([rs]() {
+            return get_context<example::nvme::page_list>()
+                >> flat_map([rs](example::nvme::page_list &pl) {
+                    auto *scheduler = rs->get_schedulers<nvme_scheduler_t>()[0];
+                    return scheduler::nvme::put_page(pl.pages[0], scheduler);
+                })
+                >> then([](auto res) {
+                    if (res) {
+                        std::cout << "NVMe Put Success" << std::endl;
+                    } else {
+                        std::cout << "NVMe Put Failed" << std::endl;
+                    }
+                })
+                >> get_context<example::nvme::page_list>()
+                >> flat_map([rs](example::nvme::page_list &pl) {
+                    auto *p = pl.pages[0];
+                    auto *scheduler = rs->get_schedulers<nvme_scheduler_t>()[0];
+                    return scheduler::nvme::get_page(p, scheduler);
+                })
+                >> then([](auto res) {
+                    if (res == 0) {
+                        std::cout << "NVMe Get Success" << std::endl;
+                    }
+                });
         })
-        >> flat_map([rs](example::nvme::page_list&& pl) {
-            auto* scheduler = rs->get_schedulers<nvme_scheduler_t>()[0];
-            return scheduler::nvme::put_page(pl.pages[0], scheduler);
-        })
-        >> then([](auto res) {
-            if (res.status == 0) {
-                std::cout << "NVMe Put Success" << std::endl;
-            } else {
-                std::cout << "NVMe Put Failed" << std::endl;
-            }
-            return res.page;
-        })
-        >> flat_map([rs](example::nvme::nvme_page* p) {
-            auto* scheduler = rs->get_schedulers<nvme_scheduler_t>()[0];
-            return scheduler::nvme::get_page(p, scheduler);
-        })
-        >> then([](auto res) {
-            if (res.status == 0) {
-                std::cout << "NVMe Get Success" << std::endl;
-            }
-            return just();
-        })
-        >> flat()
         >> any_exception([](std::exception_ptr e) {
             std::cerr << "Exception in nvme_test_proc" << std::endl;
             return just();
@@ -90,7 +86,7 @@ main(int argc, char **argv) {
         >> get_context<runtime_schedulers *>()
         >> then([](runtime_schedulers *rs) {
             // 启动调度器循环
-            env::runtime::start(rs->schedulers_by_core);
+            env::runtime::start(rs);
         })
         >> submit(core::make_root_context(create_runtime_schedulers()));
 

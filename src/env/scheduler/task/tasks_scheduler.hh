@@ -160,8 +160,8 @@ namespace pump::scheduler::task {
         friend struct _timer::op<scheduler>;
         using preemptive_scheduler_t = preemptive_scheduler;
     public:
-        core::mpsc::queue<_tasks::req*, 2048> tasks_request_q;
-        core::mpsc::queue<_timer::req*, 1024> timer_request_q;
+        core::per_core::queue<_tasks::req*, 2048> tasks_request_q;
+        core::per_core::queue<_timer::req*, 1024> timer_request_q;
         std::set<_timer::req*> timer_set;
         uint32_t core;
 
@@ -191,13 +191,10 @@ namespace pump::scheduler::task {
 
         bool
         handle_tasks() {
-            bool worked = false;
-            while (const auto req = tasks_request_q.try_dequeue()) {
-                req.value()->cb();
-                delete req.value();
-                worked = true;
-            }
-            return worked;
+            return tasks_request_q.drain([](_tasks::req* req) {
+                req->cb();
+                delete req;
+            });
         }
 
         auto
@@ -232,11 +229,9 @@ namespace pump::scheduler::task {
 
         bool
         handle_timer() {
-            bool worked = false;
-            while (auto req = timer_request_q.try_dequeue()) {
-                timer_set.emplace(req.value());
-                worked = true;
-            }
+            bool worked = timer_request_q.drain([this](_timer::req* req) {
+                timer_set.emplace(req);
+            });
 
             while (!timer_set.empty()) {
                 if (now_ms() < (*timer_set.begin())->timestamp)

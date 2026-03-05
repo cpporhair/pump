@@ -33,7 +33,7 @@ namespace pump::scheduler::net::epoll {
             common::connect_req* req;
         };
 
-        core::mpsc::queue<common::connect_req*, 2048> conn_request_q;
+        core::per_core::queue<common::connect_req*, 2048> conn_request_q;
         core::mpmc::queue<common::session_id_t, 2048> session_q;
         detail::poller_epoll poller;
         size_t _recv_buffer_size = 4096;

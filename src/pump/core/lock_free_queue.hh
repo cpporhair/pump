@@ -345,5 +345,87 @@ namespace pump::core {
             }
         };
     }
+
+    // Per-core SPSC queue group with active bitmap.
+    // Each source core gets a dedicated SPSC queue; bitmap tracks which cores have pending data.
+    inline constexpr uint32_t MAX_CORES = 128;
+    inline constexpr uint32_t BITMAP_WORDS = (MAX_CORES + 63) / 64;
+
+    inline thread_local uint32_t this_core_id = 0;
+
+    namespace per_core {
+        template<typename T, size_t CAPACITY = 1024>
+        struct queue {
+        private:
+            static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be power of 2");
+
+            std::array<spsc::queue<T, CAPACITY>, MAX_CORES> queues_;
+
+            struct alignas(64) bitmap_word { std::atomic<uint64_t> mask{0}; };
+            std::array<bitmap_word, BITMAP_WORDS> active_mask_{};
+
+        public:
+            queue() = default;
+            ~queue() = default;
+            queue(const queue&) = delete;
+            queue& operator=(const queue&) = delete;
+
+            bool try_enqueue(T&& value) noexcept {
+                if (queues_[this_core_id].try_enqueue(std::move(value))) {
+                    uint32_t word = this_core_id / 64;
+                    uint64_t bit  = 1ULL << (this_core_id % 64);
+                    active_mask_[word].mask.fetch_or(bit, std::memory_order_release);
+                    return true;
+                }
+                return false;
+            }
+
+            bool try_enqueue(const T& value) noexcept {
+                return try_enqueue(T(value));
+            }
+
+            template<typename F>
+            bool drain(F&& handler) {
+                bool worked = false;
+                for (uint32_t w = 0; w < BITMAP_WORDS; ++w) {
+                    uint64_t mask = active_mask_[w].mask.exchange(0, std::memory_order_acquire);
+                    while (mask) {
+                        uint32_t bit = __builtin_ctzll(mask);
+                        mask &= mask - 1;
+                        uint32_t core = w * 64 + bit;
+                        T item;
+                        while (queues_[core].try_dequeue(item)) {
+                            handler(std::move(item));
+                            worked = true;
+                        }
+                    }
+                }
+                return worked;
+            }
+
+            std::optional<T> try_dequeue() noexcept {
+                for (uint32_t w = 0; w < BITMAP_WORDS; ++w) {
+                    uint64_t mask = active_mask_[w].mask.load(std::memory_order_acquire);
+                    while (mask) {
+                        uint32_t bit = __builtin_ctzll(mask);
+                        mask &= mask - 1;
+                        uint32_t core = w * 64 + bit;
+                        T item;
+                        if (queues_[core].try_dequeue(item))
+                            return std::move(item);
+                    }
+                }
+                return std::nullopt;
+            }
+
+            bool empty() const noexcept {
+                for (uint32_t w = 0; w < BITMAP_WORDS; ++w) {
+                    if (active_mask_[w].mask.load(std::memory_order_relaxed) != 0)
+                        return false;
+                }
+                return true;
+            }
+        };
+    }
 }
 #endif // PUMP_CORE_LOCK_FREE_QUEUE_HH
