@@ -17,6 +17,52 @@ just(10)
 
 Pump 的解法很直接：**让异步代码的拓扑结构和业务逻辑的拓扑结构一致。** 你想的是"先做 A，再做 B，并发做 C"，写出来的代码就是 `A >> B >> concurrent >> C`。
 
+## 示例：跨域异步批量写入
+
+一个完整的 KV 写入 pipeline——跨 5 种 scheduler、2 次并发扇出/扇入、leader/follower 合并、编译期类型分支、分层异常安全，全程无锁：
+
+```cpp
+just(std::move(req))
+    >> flat_map([b](auto&& r) { return b->alloc_id(std::move(r)); })
+    >> push_result_to_context()
+    // 并发更新索引分片（hash 路由，每个分片单线程无锁）
+    >> then([](auto&& batch) { return batch.keys(); })
+    >> for_each()
+    >> concurrent()
+    >> flat_map([i](auto&& k) { return i[k.hash() % N]->update(std::move(k)); })
+    >> reduce()
+    // 分配数据页（leader/follower 自动合并）→ 并发写 NVMe
+    >> flat_map([f](auto&& r) { return f->alloc_page(std::move(r)); })
+    >> visit()
+    >> flat_map([](auto&& r) {
+        if constexpr (is_leader<r>)
+            return for_each(r->spans) >> concurrent()
+                >> flat_map([](auto&& s) { return nvme::put(std::move(s)); })
+                >> reduce() >> then([r](auto&&) { r->notify_followers(); });
+        else
+            return just(std::forward<decltype(r)>(r));
+    })
+    // 缓存回索引
+    >> get_context<batch_info>()
+    >> flat_map([i](auto&& info) {
+        return for_each(info.entries()) >> concurrent()
+            >> flat_map([i](auto&& e) { return i[e.shard]->cache(std::move(e)); })
+            >> reduce();
+    })
+    >> pop_context()
+    >> flat_map([b](auto&&) { return b->finish(); })
+    >> any_exception([](auto e) { log(e); return just(); })
+    >> submit(ctx);
+```
+
+30 行代码，体现了 Pump 的核心优势：
+
+- **声明式编排** — 5 次跨域跳转读起来就是一段自上而下的线性流程，没有回调地狱和状态机
+- **零锁并发** — 每个 index scheduler 单线程运行，直接操作 B-tree 无需互斥；跨域通信走 per-core SPSC 队列，只有 relaxed load + release store
+- **编译期类型安全** — `visit()` 把运行时 `variant` 转为 `if constexpr` 分支，类型错误在编译时暴露；Op 平铺到 `std::tuple`，零虚函数开销
+- **结构化异常安全** — `ignore_all_exception()` + `finish()` 构成类 RAII 资源释放保证，异常路径编译期可见
+- **Scheduler = 单线程状态容器** — leader/follower 合并等跨请求协调逻辑写在 `handle()` 中，就是普通顺序代码
+
 ## 核心机制
 
 ### Sender 与 Pipeline
@@ -58,6 +104,19 @@ just()
 ```
 
 `push_context` 压栈，`get_context<T>` 按类型查找并追加到当前值列表，`pop_context` 弹栈。对称使用，生命周期由栈管理。
+
+## 调度层
+
+Pump 采用 Share-Nothing 架构：每个调度器实例只在一个线程上运行，不需要任何内部同步。多核并行通过每个核心持有独立的调度器实例实现，线程内循环调用 `advance()` 驱动所有调度器。
+
+| 调度器 | 用途 |
+|--------|------|
+| **Task Scheduler** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
+| **Net Scheduler** | 网络 IO，支持 io_uring（推荐）和 epoll 两个后端 |
+| **NVMe Scheduler** | 集成 SPDK 的零拷贝磁盘 IO，以页为单位操作 |
+| **RPC** | 基于 Net Scheduler 的轻量 RPC 框架，支持 pipelining 和并发服务端 |
+
+完整示例见 `apps/example/`（echo server、rpc、并发控制等）。
 
 ## 算子速查
 
@@ -119,19 +178,6 @@ just()
 | 算子 | 作用 |
 |------|------|
 | `await_able(context)` | 将 Sender 转为 `co_await` 对象 |
-
-## 调度层
-
-Pump 采用 Share-Nothing 架构：每个调度器实例只在一个线程上运行，不需要任何内部同步。多核并行通过每个核心持有独立的调度器实例实现，线程内循环调用 `advance()` 驱动所有调度器。
-
-| 调度器 | 用途 |
-|--------|------|
-| **Task Scheduler** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
-| **Net Scheduler** | 网络 IO，支持 io_uring（推荐）和 epoll 两个后端 |
-| **NVMe Scheduler** | 集成 SPDK 的零拷贝磁盘 IO，以页为单位操作 |
-| **RPC** | 基于 Net Scheduler 的轻量 RPC 框架，支持 pipelining 和并发服务端 |
-
-完整示例见 `apps/example/`（echo server、rpc、并发控制等）。
 
 ## 项目结构
 
