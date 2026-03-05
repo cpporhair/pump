@@ -96,7 +96,7 @@ namespace apps::rpc::server {
             })
             >> pump::sender::get_context<rs_t *>()
             >> pump::sender::then([](rs_t *rs) {
-                pump::env::runtime::start(rs->schedulers_by_core);
+                pump::env::runtime::start(rs);
             })
             >> pump::sender::submit(
                 pump::core::make_root_context(

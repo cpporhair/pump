@@ -30,7 +30,6 @@ namespace pump::scheduler::task {
         op {
             constexpr static bool scheduler_task_op = true;
             scheduler_t *scheduler;
-            bool preemptive = false;
 
             template<uint32_t pos, typename context_t, typename scope_t>
             auto
@@ -40,19 +39,6 @@ namespace pump::scheduler::task {
                         core::op_pusher<pos + 1, scope_t>::push_value(context, scope);
                     }
                 };
-
-                if (preemptive) {
-                    using Qs = typename scheduler_t::preemption_queues;
-                    if constexpr (std::tuple_size_v<Qs> > 0) {
-                        using Q = std::tuple_element_t<0, Qs>;
-                        if constexpr (requires { context.template get_preemption_queue<Q>(); }) {
-                            if (auto* q = context.template get_preemption_queue<Q>()) {
-                                q->schedule(r);
-                                return;
-                            }
-                        }
-                    }
-                }
                 scheduler->schedule(r);
             }
         };
@@ -61,14 +47,14 @@ namespace pump::scheduler::task {
         struct
         sender {
         public:
-            explicit sender(scheduler_t *schd, bool p = false) noexcept
-                : scheduler(schd)
-                , preemptive(p) {}
+            explicit
+            sender(scheduler_t *schd, bool p = false) noexcept
+                : scheduler(schd) {
+            }
 
-            inline
             auto
             make_op() {
-                return op<scheduler_t>{scheduler, preemptive};
+                return op<scheduler_t>{scheduler};
             }
 
             template<typename context_t>
@@ -78,7 +64,6 @@ namespace pump::scheduler::task {
             }
 
             scheduler_t *scheduler;
-            bool preemptive;
         };
     }
 
@@ -140,6 +125,7 @@ namespace pump::scheduler::task {
     struct
     preemptive_scheduler {
         core::mpmc::queue<_tasks::req*, 2048> tasks_request_q;
+        core::mpmc::queue<_timer::req*, 2048> timer_request_q;
 
         auto
         schedule(_tasks::req* req) {
@@ -147,16 +133,32 @@ namespace pump::scheduler::task {
         }
 
         auto
-        as_task() noexcept {
-            return _tasks::sender<preemptive_scheduler>{this, false};
+        schedule(_timer::req* req) {
+            return timer_request_q.try_enqueue(req);
+        }
+
+        auto
+        as_task() {
+            return _tasks::sender{this};
+        }
+
+        static uint64_t
+        now_ms() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+
+        auto
+        delay(const uint64_t ms) noexcept {
+            return _timer::sender{this, now_ms() + ms};
         }
     };
+
 
     struct
     scheduler {
         friend struct _tasks::op<scheduler>;
         friend struct _timer::op<scheduler>;
-        using preemption_queues = std::tuple<preemptive_scheduler>;
+        using preemptive_scheduler_t = preemptive_scheduler;
     public:
         core::mpsc::queue<_tasks::req*, 2048> tasks_request_q;
         core::mpsc::queue<_timer::req*, 1024> timer_request_q;
@@ -184,12 +186,7 @@ namespace pump::scheduler::task {
 
         auto
         as_task() noexcept {
-            return _tasks::sender<scheduler>{this, false};
-        }
-
-        auto
-        as_preemptive_task() noexcept {
-            return _tasks::sender<scheduler>{this, true};
+            return _tasks::sender<scheduler>{this};
         }
 
         bool
@@ -203,30 +200,32 @@ namespace pump::scheduler::task {
             return worked;
         }
 
+        auto
+        handle_preemptive_req(_tasks::req* req) {
+            req->cb();
+            delete req;
+            return true;
+        }
+
+        auto
+        handle_preemptive_req(_timer::req* req) {
+            timer_set.emplace(req);
+            return true;
+        }
 
         template<typename Runtime>
         [[nodiscard]]
         bool
-        handle_preemptive(Runtime &rt) const {
-            return handle_preemptive_impl<0>(rt);
-        }
-
-        template<std::size_t Index, typename Runtime>
-        [[nodiscard]]
-        bool
-        handle_preemptive_impl(Runtime &rt) const {
-            if constexpr (Index < std::tuple_size_v<preemption_queues>) {
-                using Q = std::tuple_element_t<Index, preemption_queues>;
-                if constexpr (requires { rt.template get_preemption_queue<Q>(); }) {
-                    if (auto *q = rt.template get_preemption_queue<Q>()) {
-                        if (auto req = q->tasks_request_q.try_dequeue()) {
-                            req.value()->cb();
-                            delete req.value();
-                            return true;
-                        }
+        handle_preemptive(Runtime &rt) {
+            if constexpr (requires { rt.template get_preemption_queue<preemptive_scheduler_t>(); }) {
+                if (auto *q = rt.template get_preemption_queue<preemptive_scheduler_t>()) {
+                    if (auto req = q->tasks_request_q.try_dequeue(); req) {
+                        return handle_preemptive_req(req.value());
+                    }
+                    if (auto req = q->timer_request_q.try_dequeue(); req) {
+                        return handle_preemptive_req(req.value());
                     }
                 }
-                return handle_preemptive_impl<Index + 1>(rt);
             }
             return false;
         }

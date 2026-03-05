@@ -204,7 +204,7 @@ run_echo() {
         })
         >> get_context<rs_t *>()
         >> then([](rs_t *rs) {
-            env::runtime::start(rs->schedulers_by_core);
+            env::runtime::start(rs);
         })
         >> submit(core::make_root_context(create_runtime_schedulers<accept_scheduler_t, session_scheduler_t>()));
 }

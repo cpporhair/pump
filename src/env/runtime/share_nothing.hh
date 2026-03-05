@@ -6,103 +6,49 @@
 #include <vector>
 #include <bits/move_only_function.h>
 
+#include "./runner.hh"
+
 namespace pump::env::runtime {
+    template <typename ...scheduler_t>
+    using global_runtime_t = runtime_schedulers_impl<std::tuple<scheduler_t...>>;
+
+    template <typename runtime_t, typename scheduler_t>
+    auto
+    advance_one(runtime_t* runtime, scheduler_t* sche) {
+        if constexpr (requires { sche->advance(*runtime); })
+            return sche->advance(*runtime);
+        else
+            return sche->advance();
+    }
 
     template <typename ...scheduler_t>
     auto
-    run(std::atomic<bool>& running, scheduler_t* ...sche) {
+    run(global_runtime_t<scheduler_t...> *runtime, uint32_t core) {
         const static auto st = std::chrono::milliseconds(1);
-        while (running.load()) [[likely]] {
-            if (!(... | (sche ? sche->advance() : false))) [[unlikely]] {
-                std::this_thread::sleep_for(st);
-            }
-        }
-    }
-
-    template <typename ...scheduler_t>
-    auto
-    start(std::vector<scheduler_t*>& ...by_core) {
-        uint16_t cur_core = sched_getcpu();
-        uint32_t max_core = std::max({by_core.size()...});
-        for (uint16_t i = 0; i < max_core; ++i) {
-            if (i == cur_core)
-                continue;
-            if (auto has_scheduler = (... || (by_core[i] ? true : false))) {
-                std::thread([...s = by_core[i]]() {
-                    std::atomic<bool> running(true);
-                    run(running, s...);
-                });
-            }
-        }
-        if (auto has_scheduler = (... || (by_core[cur_core] ? true : false))) {
-            std::atomic<bool> running(true);
-            run(running, by_core[cur_core]...);
-        }
-    }
-
-    template <typename ...scheduler_t>
-    auto
-    start(std::vector<std::tuple<scheduler_t*...>>& schedulers_by_core) {
-        const uint32_t cur_core = sched_getcpu();
-        const uint32_t max_core = schedulers_by_core.size();
-        for (uint32_t i = 0; i < max_core; ++i) {
-            if (i == cur_core)
-                continue;
+        runtime->is_running_by_core[core].store(true);
+        while (runtime->is_running_by_core[core].load()) [[likely]] {
             std::apply(
-                [](auto *... sche) {
-                    if ((... && (sche == nullptr)))
-                        return;
-                    std::thread([...s = sche]() {
-                        std::atomic<bool> running(true);
-                        run(running, s...);
-                    }).detach();
+                [runtime](auto *... sche) {
+                    if (!(... | (sche ? advance_one(runtime, sche) : false))) [[unlikely]]
+                        std::this_thread::sleep_for(st);
                 },
-                schedulers_by_core[i]
+                runtime->schedulers_by_core[core]
             );
         }
-
-        std::apply(
-            [](auto *... sche) {
-                if ((... && (sche == nullptr)))
-                    return;
-                std::atomic<bool> running(true);
-                run(running, sche...);
-            },
-            schedulers_by_core[cur_core]
-        );
     }
 
-
-    template <typename Runtime>
+    template <typename ...scheduler_t>
     auto
-    start(Runtime* rs) {
+    start(global_runtime_t<scheduler_t...>* rs) {
         const uint32_t cur_core = sched_getcpu();
         const uint32_t max_core = rs->schedulers_by_core.size();
         for (uint32_t i = 0; i < max_core; ++i) {
             if (i == cur_core)
                 continue;
-            std::apply(
-                [rs](auto *... sche) {
-                    if ((... && (sche == nullptr)))
-                        return;
-                    std::thread([rs, ...s = sche]() {
-                        std::atomic<bool> running(true);
-                        run(running, rs, s...);
-                    }).detach();
-                },
-                rs->schedulers_by_core[i]
-            );
+            std::jthread(run<scheduler_t...>, rs, i).detach();
         }
 
-        std::apply(
-            [rs](auto *... sche) {
-                if ((... && (sche == nullptr)))
-                    return;
-                std::atomic<bool> running(true);
-                run(running, rs, sche...);
-            },
-            rs->schedulers_by_core[cur_core]
-        );
+        std::jthread(run<scheduler_t...>, rs, cur_core).detach();
     }
 }
 
