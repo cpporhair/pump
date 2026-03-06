@@ -14,4 +14,6 @@ include(src/env/scheduler/nvme/nvme.cmake)
 
 include(src/env/scheduler/tcp/tcp.cmake)
 
+include(src/env/scheduler/udp/udp.cmake)
+
 add_subdirectory(apps)
