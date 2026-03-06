@@ -198,8 +198,7 @@ src/env/
 apps/
   example/
     hello_world/  # 基础用法：just, then, for_each, context, exception, coroutine
-    echo/         # 网络 Echo Server
-    echo_client/  # Echo 客户端
+    echo/         # 网络 Echo（UDP/KCP/TCP × io_uring/epoll，CLI 选择）
     concurrent/   # 并发控制测试
     share_nothing/# 多核并发测试
     coro/         # 协程桥接
