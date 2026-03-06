@@ -6,7 +6,8 @@
 
 | 原则 | 说明 |
 |------|------|
-| 单向调用 session | 一条 TCP 连接只承载一个方向的 RPC 调用（客户端→服务端）。服务端推送需另建 session |
+| Transport 抽象 | RPC 核心逻辑与传输层解耦，通过 transport trait 支持 TCP/KCP/QUIC 等可靠协议 |
+| 单向调用 session | 一条连接只承载一个方向的 RPC 调用（客户端→服务端）。服务端推送需另建 session |
 | sender 原生组合 | `call`/`serv` 本身就是 sender，直接与 `then`/`flat_map`/`concurrent` 等组合 |
 | 最小抽象 | 无 channel/dispatch loop 等独立运行时。`call` = 发请求+等响应，`serv` = 收请求+分派+发响应 |
 
@@ -14,19 +15,56 @@
 
 ```
 src/env/scheduler/rpc/
-├── rpc.hh                    ← 公共 API（rpc::call, rpc::serv）
+├── rpc.hh                    ← 公共 API（默认TCP + 显式transport两套）
+├── transport/
+│   └── tcp.hh               ← TCP transport trait（默认）
 ├── client/
-│   ├── call.hh              ← 客户端 RPC 调用实现
+│   ├── call.hh              ← 客户端 RPC 调用实现（模板参数化 transport_t）
 │   └── trigger.hh           ← 乱序响应处理（自定义 scheduler）
 ├── server/
-│   └── serv.hh              ← 服务端请求处理循环
+│   └── serv.hh              ← 服务端请求处理循环（模板参数化 transport_t）
 └── common/
-    ├── struct.hh            ← 帧结构、辅助类型、运行时 context
-    ├── rpc_state.hh         ← pending_requests_map（两阶段匹配状态机）
+    ├── struct.hh            ← 帧结构、辅助类型、运行时 context（传输无关）
+    ├── rpc_state.hh         ← pending_requests_map（传输无关，使用 pump::common::net_frame）
     └── service.hh           ← service trait + variant dispatch 工具
+
+src/env/common/
+└── frame.hh                  ← pump::common::net_frame（传输无关的帧类型）
 ```
 
 示例程序：`apps/example/rpc/`（server.hh + client.hh + service.hh + rpc.cc）
+
+## 2.1 Transport Trait
+
+RPC 核心代码（serv.hh、call.hh、trigger.hh、rpc_state.hh）不依赖任何具体传输协议。传输层通过 transport trait 接入：
+
+```cpp
+struct tcp_transport {
+    using address_type = tcp::common::session_id_t;   // 连接标识类型
+    using frame_type   = pump::common::net_frame;      // 帧类型（所有 transport 统一）
+
+    // 接收：返回 sender<frame_type>
+    static auto recv(auto* sche, address_type addr) {
+        return tcp::recv(sche, addr);
+    }
+
+    // 发送：返回 sender<bool>
+    static auto send(auto* sche, address_type addr, void* data, uint32_t len) {
+        return tcp::send(sche, addr, data, len);
+    }
+
+    // 获取原始地址值（用于 trigger 的 session 匹配）
+    static uint64_t address_raw(const address_type& addr) {
+        return addr._value;
+    }
+};
+```
+
+**添加新传输协议**只需写一个 ~20 行的 transport trait。RPC 层的 serv/call/trigger/dispatch 代码完全复用。
+
+适用协议：所有**可靠的、面向连接的**传输协议（TCP、QUIC、KCP、ENet 等）。raw UDP 不适用（无连接、不可靠，RPC 语义不匹配）。
+
+**`pump::common::net_frame`**：传输无关的帧类型（`char* + len`，RAII，move-only），从 `tcp::common::net_frame` 提取到 `env/common/frame.hh`。TCP 层通过 `using net_frame = pump::common::net_frame` 保持兼容。
 
 ## 3. 协议帧格式
 
@@ -66,25 +104,25 @@ enum class rpc_error_code : uint16_t {
 ## 4. 服务端流程
 
 ```
-rpc::serv<service_id1, service_id2, ...>(sche, session_id)
+rpc::serv<service_id1, service_id2, ...>(sche, session_id)          // 默认 TCP
+rpc::serv<transport_t, service_id1, ...>(sche, addr)                // 显式 transport
 
 展开为：
-tcp::join(sche, session_id)                        ← 绑定 session
->> push_context(session_state{sche, sid, false})   ← 压入 session 状态
+push_context(session_state{sche, addr})            ← 压入 session 状态
 >> serv_proc()                                     ← 主处理逻辑
 >> pop_context()
 >> ignore_args()
->> flat_map(tcp::stop(sche, id))                   ← 正常路径关闭 session
->> any_exception(tcp::stop + re-throw)             ← 异常路径也关闭 session
+
+注：TCP 生命周期管理（join/stop）由应用层负责，不在 rpc::serv 内部。
 
 serv_proc 内部：
   for_each(check_rpc_state(sd))                    ← 协程：sd.closed 前持续 yield true
   >> with_context(serv_runtime_context)(            ← 每次迭代一个新的 req/res 帧对
-      recv_req(sd)                                 ← tcp::recv → rpc_frame 存入 context
+      recv_req<transport_t>(sd)                    ← transport_t::recv → rpc_frame 存入 context
       >> flat_map(                                 ← 隔离 dispatch 异常作用域
           dispatch<service_ids...>()               ← 按 service_id 分派到 handle()
           >> any_exception(build_error_response)   ← dispatch 失败 → 构建错误帧
-          >> send_res(sd)                          ← rpc_frame → tcp::send
+          >> send_res<transport_t>(sd)             ← rpc_frame → transport_t::send
       )
   )
   >> handle_exception(sd)                          ← 异常时标记 closed + 传播异常
@@ -95,13 +133,13 @@ serv_proc 内部：
 
 dispatch 失败时（handle 抛异常或 unknown service_id），`any_exception` 在 `flat_map` 内层捕获异常，通过 `build_error_response()` 构建错误帧（flags=0x02），然后正常 `send_res` 发回客户端。session 保持打开。
 
-`recv_req` 失败（session_closed_error）则异常逃出 `flat_map`，由 `handle_exception` 关闭 session。
+`recv_req` 失败（连接断开等）则异常逃出 `flat_map`，由 `handle_exception` 关闭 session。
 
 ### 并发处理模式
 
-`rpc::serv_concurrent<concurrency, ids...>(sche, sid)` 在串行 `serv` 基础上增加：
+`rpc::serv<transport_t, concurrency, ids...>(sche, addr)` 在串行 `serv` 基础上增加：
 - `concurrent(concurrency)` 允许 N 个请求同时 in-flight（编译期 `uint16_t` 模板参数）
-- 不需要额外的 task_scheduler — `tcp::recv` 本身是异步的，`concurrent` 只是允许并发，是否真正并发取决于下游处理逻辑
+- 不需要额外的 task_scheduler — `transport_t::recv` 本身是异步的，`concurrent` 只是允许并发，是否真正并发取决于下游处理逻辑
 - 内部通过 `apply_concurrency<N>()` 模板函数条件性地插入 `concurrent(N)`，`serv` 和 `serv_concurrent` 共用同一个 `serv_proc`
 - 每个迭代独立 recv → dispatch → send
 - 响应可能乱序发送（客户端 trigger 已支持乱序匹配）
@@ -113,21 +151,24 @@ dispatch 失败时（handle 抛异常或 unknown service_id），`any_exception`
 3. `if constexpr (T::is_service)` 匹配具体 service，调用 `T::handle(req, res)` → 返回 sender
 4. `monostate` = 未注册 service_id → 抛异常
 
-### session 生命周期
+### 连接生命周期
 
 `check_rpc_state` 协程通过 `session_state.closed` 控制：
 - 正常 → `co_yield true` → for_each 驱动下一次 recv
 - 异常 → `handle_exception` 调用 `sd.close()` → 协程返回 false → 流结束
 
+注：连接的建立和销毁（TCP 的 join/stop、KCP 的 connect/disconnect 等）由应用层负责，不在 `rpc::serv` 内部。
+
 ## 5. 客户端流程
 
 ```
-rpc::call<service_id>(sche, sid, args...)
+rpc::call<service_id>(sche, sid, args...)                           // 默认 TCP
+rpc::call<transport_t, service_id>(sche, addr, args...)             // 显式 transport
 
 展开为：
-with_context(call_runtime_context{rid, sche, sid, req, res})(
-    send_req<service_id>()                          ← 序列化参数 → 填 header → tcp::send
-    >> wait_res<service_id>()                       ← tcp::recv → 匹配 request_id → 反序列化
+with_context(call_runtime_context{rid, sche, addr, req, res})(
+    send_req<transport_t, service_id>()             ← 序列化参数 → 填 header → transport_t::send
+    >> wait_res<transport_t, service_id>()          ← transport_t::recv → 匹配 request_id → 反序列化
 )
 ```
 
@@ -141,7 +182,7 @@ N 个并发 call（pipelining）：N 个 recv 竞争收帧：
 3. **不匹配**：`recv_res<false>` → `trigger.on_response(wrong_rid, frame)` 存入 map → `trigger.wait_response(my_rid)` 挂起等待
 4. `visit()` 分支处理 variant → `flat()`
 
-关键洞察：trigger 不做 recv，只暂存+匹配。各并发 call 的 `tcp::recv` 互相为对方接力。
+关键洞察：trigger 不做 recv，只暂存+匹配。各并发 call 的 `transport_t::recv` 互相为对方接力。
 
 ### 错误响应检测
 
@@ -149,7 +190,7 @@ N 个并发 call（pipelining）：N 个 recv 竞争收帧：
 
 ### 断连通知（fail_session）
 
-`wait_res` 末尾包裹 `any_exception`：当 `tcp::recv` 或 send 失败时，调用 `trigger.fail_session(session_raw, ex)` 通知同 session 上所有 pending 请求（通过 slot 中记录的 `session_raw` 精确匹配），然后重新抛出原异常。
+`wait_res` 末尾包裹 `any_exception`：当 recv 或 send 失败时，调用 `trigger.fail_session(address_raw, ex)` 通知同连接上所有 pending 请求（通过 slot 中记录的 `address_raw` 精确匹配），然后重新抛出原异常。`address_raw` 通过 `transport_t::address_raw(ctx.address)` 获取。
 
 ## 6. trigger 自定义 scheduler
 
@@ -161,7 +202,7 @@ N 个并发 call（pipelining）：N 个 recv 竞争收帧：
 | sender | `storage_at_sender`，`connect()` 构建 op_tuple |
 | scheduler | `trigger`，持有 `pending_requests_map`，提供 `wait_response(rid, session_raw)`/`on_response(rid, frame)`/`fail_session(session_raw, ex)` |
 | op_pusher 特化 | `requires storage_at_op`，调用 `op.start<pos>()` |
-| compute_sender_type 特化 | 输出类型为 `net_frame` |
+| compute_sender_type 特化 | 输出类型为 `pump::common::net_frame` |
 
 **`static thread_local`**：利用 single-thread scheduler 不变量，无需同步原语。
 
@@ -224,7 +265,7 @@ struct pump::scheduler::rpc::server::service<type::add> {
 
 | 对象 | 所有权 | 生命周期 |
 |------|--------|---------|
-| `rpc_frame`（via `rpc_frame_helper`） | RAII，`delete[] char*` | 帧处理期间。send 前 `frame = nullptr` 转移给 tcp 层 |
+| `rpc_frame`（via `rpc_frame_helper`） | RAII，`delete[] char*` | 帧处理期间。send 前 `frame = nullptr` 转移给传输层 |
 | `call_runtime_context` | 值语义，`with_context` 作用域 | 单次 RPC 调用 |
 | `serv_runtime_context` | 值语义，`with_context` 作用域 | 单次请求处理（recv→dispatch→send） |
 | `session_state` | 值语义，`push_context` 作用域 | session 存续期间 |
@@ -232,30 +273,60 @@ struct pump::scheduler::rpc::server::service<type::add> {
 
 ### 帧所有权转移链
 
-**发送**：`rpc_frame_helper.frame` → `ctx.req.frame = nullptr` 释放所有权 → `tcp::send` 接管 → io_uring 写完后释放
+**发送**：`rpc_frame_helper.frame` → `ctx.req.frame = nullptr` 释放所有权 → `transport_t::send` 接管 → 传输层写完后释放
 
-**接收**：`tcp::recv` → `net_frame` → `frame.release()` 拿出 `char*` → `reinterpret_cast<rpc_frame*>` → `ctx.res.frame` 接管 → `rpc_frame_helper` 析构释放
+**接收**：`transport_t::recv` → `pump::common::net_frame` → `frame.release()` 拿出 `char*` → `reinterpret_cast<rpc_frame*>` → `ctx.res.frame` 接管 → `rpc_frame_helper` 析构释放
 
 ## 9. 公共 API
 
 ```cpp
-// 串行服务端（单请求处理）
-rpc::serv<service_id1, service_id2, ...>(tcp_sche, session_id)
+// --- 默认 TCP transport（向后兼容）---
 
-// 并发服务端（多请求并行处理，concurrency 为编译期 uint16_t）
-rpc::serv_concurrent<concurrency, service_id1, service_id2, ...>(sche, session_id)
+// 串行服务端
+rpc::serv<service_id1, service_id2, ...>(sche, session_id)
+
+// 并发服务端（concurrency 为编译期 uint16_t）
+rpc::serv<concurrency, service_id1, service_id2, ...>(sche, session_id)
 
 // 客户端调用
 rpc::call<service_id>(sche, session_id, args...)
+
+// --- 显式 transport（用于 KCP/QUIC 等可靠协议）---
+
+// 串行服务端
+rpc::serv<transport_t, service_id1, ...>(sche, addr)
+
+// 并发服务端
+rpc::serv<transport_t, concurrency, service_id1, ...>(sche, addr)
+
+// 客户端调用
+rpc::call<transport_t, service_id>(sche, addr, args...)
+```
+
+### Transport Trait 模板
+
+添加新传输协议时，只需实现以下 trait：
+
+```cpp
+struct my_transport {
+    using address_type = my_protocol::connection_id_t;  // 连接标识
+    using frame_type   = pump::common::net_frame;        // 统一帧类型
+
+    static auto recv(auto* sche, address_type addr);     // → sender<frame_type>
+    static auto send(auto* sche, address_type addr,
+                     void* data, uint32_t len);          // → sender<bool>
+    static uint64_t address_raw(const address_type& addr); // 用于 trigger 匹配
+};
 ```
 
 ## 10. 已知限制与待完善
 
 | 项目 | 状态 | 说明 |
 |------|------|------|
-| `fail_session` 精度 | 已实现 | 按 `session_raw` 匹配，仅 fail 同 session 的 pending 请求 |
+| Transport 抽象 | 已实现 | transport trait 模式，TCP 为默认，支持 KCP/QUIC 等可靠协议扩展 |
+| `fail_session` 精度 | 已实现 | 按 `address_raw` 匹配，仅 fail 同连接的 pending 请求 |
 | 错误响应 | 已实现 | flags=0x02 传递 `rpc_error_code`，客户端抛 `rpc_error` |
-| session 关闭 | 已实现 | `serv()` 结束后自动调用 `tcp::stop`（正常/异常路径均覆盖） |
-| 并发处理 | 已实现 | `serv_concurrent<N>` 支持多请求并行，编译期 concurrency 参数，无需额外 scheduler |
-| 帧长度截断 | 已知 | `total_len` 为 uint32_t，但 tcp 层 send 用 uint16_t，超 64KB 帧会截断 |
+| 连接生命周期 | 应用层 | `serv()` 不含 join/stop，由应用层管理（TCP 需 `tcp::join`/`tcp::stop`） |
+| 并发处理 | 已实现 | concurrency 作为模板参数，无需额外 scheduler |
+| 帧长度截断 | 已知 | `total_len` 为 uint32_t，但 TCP 层 send 用 uint16_t，超 64KB 帧会截断 |
 | 命名空间 | 待优化 | 共用类型在 `server::` 命名空间下，客户端代码需 `server::` 前缀 |
