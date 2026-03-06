@@ -5,18 +5,14 @@
 #include <cstdint>
 #include <cstring>
 #include <list>
-#include <netinet/in.h>
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/socket.h>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"
 #include "pump/core/lock_free_queue.hh"
 
 #include "../common/struct.hh"
-#include "./epoll.hh"
+
+#include "env/scheduler/dgram/epoll.hh"
 
 namespace pump::scheduler::udp::epoll {
 
@@ -29,9 +25,7 @@ namespace pump::scheduler::udp::epoll {
         friend struct recv_op_t<scheduler>;
         friend struct send_op_t<scheduler>;
     private:
-        int _fd = -1;
-        detail::poller_epoll _poller;
-        uint32_t _max_datagram_size = 65536;
+        dgram::epoll::transport _transport;
 
         core::per_core::queue<common::recv_req*, 2048> recv_q;
         core::per_core::queue<common::send_req*, 2048> send_q;
@@ -50,9 +44,6 @@ namespace pump::scheduler::udp::epoll {
 
         std::atomic<bool> _shutdown{false};
 
-        // Reusable recv buffer
-        char* _recv_buf = nullptr;
-
     private:
         void
         schedule(common::recv_req* req) {
@@ -68,17 +59,6 @@ namespace pump::scheduler::udp::epoll {
                 req->cb(false);
                 delete req;
             }
-        }
-
-        void
-        deliver_datagram(common::recv_req* req, char* data, uint32_t len, const sockaddr_in& src) {
-            auto* copy = new char[len];
-            memcpy(copy, data, len);
-            req->cb(std::make_pair(
-                common::datagram{copy, len},
-                common::endpoint{src}
-            ));
-            delete req;
         }
 
         void
@@ -99,9 +79,9 @@ namespace pump::scheduler::udp::epoll {
         }
 
         bool
-        try_sendmsg(common::send_req* req) {
+        try_send(common::send_req* req) {
             req->prepare();
-            auto res = ::sendmsg(_fd, &req->_msg, MSG_DONTWAIT);
+            auto res = _transport.try_sendmsg(&req->_msg);
             if (res >= 0) {
                 req->cb(true);
                 delete req;
@@ -110,7 +90,6 @@ namespace pump::scheduler::udp::epoll {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return false;
             }
-            // Other error
             req->cb(false);
             delete req;
             return true;
@@ -119,7 +98,7 @@ namespace pump::scheduler::udp::epoll {
         void
         drain_send_q() {
             send_q.drain([this](common::send_req* req) {
-                if (!try_sendmsg(req)) {
+                if (!try_send(req)) {
                     pending_sends.push_back(req);
                 }
             });
@@ -129,54 +108,31 @@ namespace pump::scheduler::udp::epoll {
         flush_pending_sends() {
             auto it = pending_sends.begin();
             while (it != pending_sends.end()) {
-                if (try_sendmsg(*it)) {
+                if (try_send(*it)) {
                     it = pending_sends.erase(it);
                 } else {
-                    break;  // Still blocked
-                }
-            }
-        }
-
-        // Read datagrams until EAGAIN
-        void
-        handle_read_event() {
-            while (true) {
-                sockaddr_in src_addr{};
-                iovec iov{_recv_buf, _max_datagram_size};
-                msghdr msg{};
-                msg.msg_name = &src_addr;
-                msg.msg_namelen = sizeof(src_addr);
-                msg.msg_iov = &iov;
-                msg.msg_iovlen = 1;
-
-                auto res = ::recvmsg(_fd, &msg, MSG_DONTWAIT);
-                if (res <= 0) {
-                    // EAGAIN or error — stop reading
-                    return;
-                }
-
-                auto len = static_cast<uint32_t>(res);
-                if (auto opt = pending_recv.try_dequeue()) {
-                    deliver_datagram(opt.value(), _recv_buf, len, src_addr);
-                } else {
-                    auto* copy = new char[len];
-                    memcpy(copy, _recv_buf, len);
-                    ready_q.try_enqueue(new ready_entry{
-                        common::datagram{copy, len},
-                        common::endpoint{src_addr}
-                    });
+                    break;
                 }
             }
         }
 
         void
-        handle_events() {
-            const int cnt = _poller.wait_event(0);
-            for (int i = 0; i < cnt; ++i) {
-                if (_poller.events[i].events & EPOLLIN)
-                    handle_read_event();
-                if (_poller.events[i].events & EPOLLOUT)
-                    flush_pending_sends();
+        on_recv(const char* buf, uint32_t len, const sockaddr_in& src) {
+            if (auto opt = pending_recv.try_dequeue()) {
+                auto* copy = new char[len];
+                memcpy(copy, buf, len);
+                opt.value()->cb(std::make_pair(
+                    common::datagram{copy, len},
+                    common::endpoint{src}
+                ));
+                delete opt.value();
+            } else {
+                auto* copy = new char[len];
+                memcpy(copy, buf, len);
+                ready_q.try_enqueue(new ready_entry{
+                    common::datagram{copy, len},
+                    common::endpoint{src}
+                });
             }
         }
 
@@ -200,9 +156,8 @@ namespace pump::scheduler::udp::epoll {
                 delete req;
             }
             pending_sends.clear();
-            while (auto opt = ready_q.try_dequeue()) {
+            while (auto opt = ready_q.try_dequeue())
                 delete opt.value();
-            }
         }
 
     public:
@@ -216,41 +171,14 @@ namespace pump::scheduler::udp::epoll {
         int
         init(const char* address, uint16_t port,
              uint32_t max_datagram_size = 65536) {
-            _fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-            if (_fd < 0)
-                return -1;
-
-            int opt = 1;
-            setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
-
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port);
-            inet_pton(AF_INET, address, &addr.sin_addr);
-
-            if (bind(_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-                ::close(_fd);
-                _fd = -1;
-                return -1;
-            }
-
-            _max_datagram_size = max_datagram_size;
-            _recv_buf = new char[max_datagram_size];
-
-            epoll_event ev{};
-            ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-            ev.data.fd = _fd;
-            _poller.add_event(_fd, &ev);
-
-            return 0;
+            dgram::transport_config cfg{};
+            cfg.max_dgram_size = max_datagram_size;
+            return _transport.init(address, port, cfg);
         }
 
         ~scheduler() {
-            delete[] _recv_buf;
             while (auto opt = ready_q.try_dequeue())
                 delete opt.value();
-            if (_fd >= 0)
-                ::close(_fd);
         }
 
         void
@@ -266,7 +194,13 @@ namespace pump::scheduler::udp::epoll {
             }
             drain_recv_q();
             drain_send_q();
-            handle_events();
+            bool writable = _transport.advance(
+                [this](const char* buf, uint32_t len, const sockaddr_in& src) {
+                    on_recv(buf, len, src);
+                }
+            );
+            if (writable)
+                flush_pending_sends();
             return true;
         }
 

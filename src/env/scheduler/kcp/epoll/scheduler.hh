@@ -6,11 +6,6 @@
 #include <cstring>
 #include <unordered_map>
 #include <list>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"
@@ -20,12 +15,9 @@
 #include "../common/ikcp.hh"
 #include "../kcp.hh"
 
-namespace pump::scheduler::kcp::epoll {
+#include "env/scheduler/dgram/epoll.hh"
 
-    namespace detail {
-        static constexpr int MAX_EVENTS = 16;
-        static constexpr uint32_t MAX_UDP_SIZE = 65536;
-    }
+namespace pump::scheduler::kcp::epoll {
 
     // Per-connection state
     struct kcp_connection {
@@ -51,9 +43,7 @@ namespace pump::scheduler::kcp::epoll {
         friend struct connect_op_t<scheduler>;
 
     private:
-        int _fd = -1;
-        int _epoll_fd = -1;
-        epoll_event _events[detail::MAX_EVENTS]{};
+        dgram::epoll::transport _transport;
 
         core::per_core::queue<common::recv_req*, 2048>    recv_q;
         core::per_core::queue<common::send_req*, 2048>    send_q;
@@ -75,7 +65,6 @@ namespace pump::scheduler::kcp::epoll {
         std::list<pending_connect> _pending_connects;
 
         uint32_t _next_conv = 1;
-        char* _recv_buf = nullptr;
 
     private:
         void
@@ -99,17 +88,11 @@ namespace pump::scheduler::kcp::epoll {
         }
 
         void
-        udp_sendto(const char* data, uint32_t len, const sockaddr_in& addr) {
-            ::sendto(_fd, data, len, MSG_DONTWAIT,
-                     reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
-        }
-
-        void
         send_handshake(uint8_t type, uint32_t conv, const sockaddr_in& addr) {
             common::handshake_pkt pkt{};
             pkt.type = type;
             pkt.conv = conv;
-            udp_sendto(reinterpret_cast<const char*>(&pkt), common::HANDSHAKE_PKT_SIZE, addr);
+            _transport.sendto(reinterpret_cast<const char*>(&pkt), common::HANDSHAKE_PKT_SIZE, addr);
         }
 
         kcp_connection&
@@ -121,7 +104,7 @@ namespace pump::scheduler::kcp::epoll {
             conn.kcp = common::ikcp(conv, [this, conv](const char* buf, uint32_t len) {
                 auto it = _connections.find(conv);
                 if (it != _connections.end()) {
-                    udp_sendto(buf, len, it->second.peer_addr);
+                    _transport.sendto(buf, len, it->second.peer_addr);
                 }
             });
 
@@ -196,41 +179,6 @@ namespace pump::scheduler::kcp::epoll {
         }
 
         void
-        handle_read_event(uint32_t now_ms) {
-            while (true) {
-                sockaddr_in src_addr{};
-                socklen_t addrlen = sizeof(src_addr);
-                auto res = ::recvfrom(_fd, _recv_buf, detail::MAX_UDP_SIZE, MSG_DONTWAIT,
-                                      reinterpret_cast<sockaddr*>(&src_addr), &addrlen);
-                if (res <= 0) return;
-
-                auto len = static_cast<uint32_t>(res);
-
-                if (len == common::HANDSHAKE_PKT_SIZE) {
-                    auto* pkt = reinterpret_cast<const common::handshake_pkt*>(_recv_buf);
-                    if (pkt->type == common::HANDSHAKE_SYN) {
-                        handle_syn(pkt->conv, src_addr);
-                        continue;
-                    } else if (pkt->type == common::HANDSHAKE_ACK) {
-                        handle_ack(pkt->conv, src_addr);
-                        continue;
-                    }
-                }
-
-                if (len < common::IKCP_OVERHEAD) continue;
-                uint32_t conv = common::decode32u(_recv_buf);
-
-                auto it = _connections.find(conv);
-                if (it == _connections.end()) continue;
-
-                auto& conn = it->second;
-                conn.kcp.input(_recv_buf, static_cast<int>(len));
-
-                deliver_received(conn, now_ms);
-            }
-        }
-
-        void
         handle_syn(uint32_t client_conv, const sockaddr_in& peer) {
             if (_connections.count(client_conv)) {
                 send_handshake(common::HANDSHAKE_ACK, client_conv, peer);
@@ -266,7 +214,31 @@ namespace pump::scheduler::kcp::epoll {
         }
 
         void
-        deliver_received(kcp_connection& conn, uint32_t /*now_ms*/) {
+        on_raw_packet(const char* buf, uint32_t len, const sockaddr_in& src) {
+            if (len == common::HANDSHAKE_PKT_SIZE) {
+                auto* pkt = reinterpret_cast<const common::handshake_pkt*>(buf);
+                if (pkt->type == common::HANDSHAKE_SYN) {
+                    handle_syn(pkt->conv, src);
+                    return;
+                } else if (pkt->type == common::HANDSHAKE_ACK) {
+                    handle_ack(pkt->conv, src);
+                    return;
+                }
+            }
+
+            if (len < common::IKCP_OVERHEAD) return;
+            uint32_t conv = common::decode32u(buf);
+
+            auto it = _connections.find(conv);
+            if (it == _connections.end()) return;
+
+            auto& conn = it->second;
+            conn.kcp.input(buf, static_cast<int>(len));
+            deliver_received(conn);
+        }
+
+        void
+        deliver_received(kcp_connection& conn) {
             while (true) {
                 int peeklen = conn.kcp.peeksize();
                 if (peeklen <= 0) break;
@@ -323,46 +295,10 @@ namespace pump::scheduler::kcp::epoll {
 
         int
         init(const char* address, uint16_t port) {
-            _fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-            if (_fd < 0) return -1;
-
-            int opt = 1;
-            setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
-
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(port);
-            inet_pton(AF_INET, address, &addr.sin_addr);
-
-            if (bind(_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-                ::close(_fd);
-                _fd = -1;
-                return -1;
-            }
-
-            _recv_buf = new char[detail::MAX_UDP_SIZE];
-
-            _epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-            if (_epoll_fd < 0) {
-                delete[] _recv_buf;
-                ::close(_fd);
-                _fd = -1;
-                return -1;
-            }
-
-            epoll_event ev{};
-            ev.events = EPOLLIN | EPOLLET;
-            ev.data.fd = _fd;
-            epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _fd, &ev);
-
-            return 0;
+            return _transport.init(address, port);
         }
 
         ~scheduler() {
-            delete[] _recv_buf;
-            if (_epoll_fd >= 0) ::close(_epoll_fd);
-            if (_fd >= 0) ::close(_fd);
-
             for (auto* req : _pending_accepts) delete req;
             for (auto& pc : _pending_connects) delete pc.req;
             for (auto& [conv, conn] : _connections) {
@@ -381,12 +317,11 @@ namespace pump::scheduler::kcp::epoll {
             drain_recv_q();
             drain_send_q();
 
-            int cnt = epoll_wait(_epoll_fd, _events, detail::MAX_EVENTS, 0);
-            for (int i = 0; i < cnt; ++i) {
-                if (_events[i].events & EPOLLIN) {
-                    handle_read_event(now_ms);
+            _transport.advance(
+                [this](const char* buf, uint32_t len, const sockaddr_in& src) {
+                    on_raw_packet(buf, len, src);
                 }
-            }
+            );
 
             retry_connects(now_ms);
             update_all_kcp(now_ms);
