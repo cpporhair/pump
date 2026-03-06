@@ -11,51 +11,10 @@
 #include <bits/types/struct_iovec.h>
 
 #include "pump/core/meta.hh"
+#include "env/common/frame.hh"
 
 namespace pump::scheduler::tcp::common {
-    struct
-    net_frame {
-        char* _data;
-        uint32_t _len;
-
-        net_frame() : _data(nullptr), _len(0) {}
-        net_frame(char* data, const uint32_t len) : _data(data), _len(len) {}
-
-        net_frame(net_frame&& rhs) noexcept : _data(rhs._data), _len(rhs._len) {
-            rhs._data = nullptr;
-            rhs._len = 0;
-        }
-
-        net_frame& operator=(net_frame&& rhs) noexcept {
-            if (this != &rhs) {
-                _data = rhs._data;
-                _len = rhs._len;
-                rhs._data = nullptr;
-                rhs._len = 0;
-            }
-            return *this;
-        }
-
-        net_frame(const net_frame&) = delete;
-        net_frame& operator=(const net_frame&) = delete;
-
-        ~net_frame() {
-            delete[] _data;
-        }
-
-        [[nodiscard]] char* release() noexcept {
-            auto* p = _data;
-            _data = nullptr;
-            _len = 0;
-            return p;
-        }
-
-        [[nodiscard]] const char* data() const { return _data; }
-        [[nodiscard]] uint32_t size() const { return _len; }
-
-        template <typename T>
-        [[nodiscard]] const T* as() const { return reinterpret_cast<const T*>(_data); }
-    };
+    using net_frame = pump::common::net_frame;
 
     // SPSC (Single-Producer Single-Consumer) ring buffer.
     // Producer: network IO write end (updates _tail)

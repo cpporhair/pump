@@ -5,7 +5,6 @@
 #include "pump/sender/just.hh"
 #include "pump/sender/flat.hh"
 #include "pump/sender/then.hh"
-#include "env/scheduler/tcp/tcp.hh"
 #include "env/scheduler/rpc/common/rpc_state.hh"
 #include "pump/coro/coro.hh"
 #include "pump/sender/for_each.hh"
@@ -22,11 +21,11 @@
 namespace pump::scheduler::rpc::server {
     using namespace pump::sender;
 
-    template <typename session_scheduler_t>
+    template <typename transport_t, typename session_scheduler_t>
     struct
     session_state {
         session_scheduler_t* scheduler;
-        tcp::common::session_id_t session_id;
+        typename transport_t::address_type address;
         bool closed = false;
 
         [[nodiscard]] bool
@@ -73,17 +72,19 @@ namespace pump::scheduler::rpc::server {
         co_return false;
     }
 
+    template <typename transport_t>
     inline auto
     recv_req(const auto& st) {
         return flat_map([&st](...) {
-            return tcp::recv(st.scheduler, st.session_id)
+            return transport_t::recv(st.scheduler, st.address)
                 >> get_context<serv_runtime_context>()
-                >> then([](serv_runtime_context& memo, tcp::common::net_frame &&frame) {
+                >> then([](serv_runtime_context& memo, pump::common::net_frame &&frame) {
                     memo.req.frame = reinterpret_cast<rpc_frame *>(frame.release());
                 });
         });
     }
 
+    template <typename transport_t>
     inline auto
     send_res(const auto& st) {
         return get_context<serv_runtime_context>()
@@ -92,7 +93,7 @@ namespace pump::scheduler::rpc::server {
                 auto len = memo.res.get_len();
                 auto* f = memo.res.frame;
                 memo.res.frame = nullptr;
-                return tcp::send(st.scheduler, st.session_id, f, len);
+                return transport_t::send(st.scheduler, st.address, f, len);
             });
     }
 
@@ -136,17 +137,18 @@ namespace pump::scheduler::rpc::server {
             return ::pump::core::bind_back<detail::forward_cpo>(detail::forward_cpo{});
     }
 
-    template<uint16_t concurrency = 0, typename session_scheduler_t, uint16_enum_concept auto ...service_ids>
+    template<typename transport_t, uint16_t concurrency = 0, typename session_scheduler_t, uint16_enum_concept auto ...service_ids>
     requires(sizeof...(service_ids) > 0)
     auto
     serv_proc() {
-        return get_context<session_state<session_scheduler_t> >()
-            >> then([](session_state<session_scheduler_t> &sd) {
+        using state_t = session_state<transport_t, session_scheduler_t>;
+        return get_context<state_t>()
+            >> then([](state_t &sd) {
                 return just()
                     >> for_each(coro::make_view_able(check_rpc_state(sd)))
                     >> apply_concurrency<concurrency>()
                     >> with_context(serv_runtime_context())([&sd]() {
-                        return recv_req(sd)
+                        return recv_req<transport_t>(sd)
                             >> flat_map([&sd](...) {
                                 return just()
                                     >> dispatch<service_ids...>()
@@ -157,7 +159,7 @@ namespace pump::scheduler::rpc::server {
                                                 build_error_response(memo, e);
                                             });
                                     })
-                                    >> send_res(sd);
+                                    >> send_res<transport_t>(sd);
                             });
                     })
                     >> handle_exception(sd)
@@ -166,22 +168,13 @@ namespace pump::scheduler::rpc::server {
             >> flat();
     }
 
-    template<uint16_t concurrency = 0, typename session_scheduler_t, uint16_enum_concept auto ...service_ids>
+    template<typename transport_t, uint16_t concurrency = 0, typename session_scheduler_t, uint16_enum_concept auto ...service_ids>
     auto
-    serv(session_scheduler_t* sche, tcp::common::session_id_t id) {
-        return tcp::join(sche, id)
-            >> push_context(session_state<session_scheduler_t>{sche, id})
-            >> serv_proc<concurrency, session_scheduler_t, service_ids...>()
+    serv(session_scheduler_t* sche, typename transport_t::address_type addr) {
+        return push_context(session_state<transport_t, session_scheduler_t>{sche, addr})
+            >> serv_proc<transport_t, concurrency, session_scheduler_t, service_ids...>()
             >> pop_context()
-            >> ignore_args()
-            >> flat_map([sche, id]() {
-                return tcp::stop(sche, id);
-            })
-            >> pump::sender::any_exception([sche, id](std::exception_ptr e) {
-                return tcp::stop(sche, id)
-                    >> ignore_all_exception()
-                    >> then_exception(e);
-            });
+            >> ignore_args();
     }
 }
 

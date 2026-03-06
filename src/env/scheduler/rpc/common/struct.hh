@@ -3,10 +3,9 @@
 #define PUMP_ENV_SCHEDULER_RPC_COMMON_STRUCT_HH
 
 #include <cstdint>
+#include <cstring>
 
-#include "env/scheduler/tcp/tcp.hh"
-#include "env/scheduler/tcp/common/detail.hh"
-#include "env/scheduler/tcp/common/struct.hh"
+#include "env/common/frame.hh"
 #include "pump/core/meta.hh"
 
 #include "./rpc_state.hh"
@@ -125,20 +124,20 @@ namespace pump::scheduler::rpc {
         }
     };
 
-    template <typename session_scheduler_t>
+    template <typename transport_t, typename session_scheduler_t>
     struct
     call_runtime_context {
         uint64_t request_id{};
         session_scheduler_t* scheduler = nullptr;
-        tcp::common::session_id_t sid;
+        typename transport_t::address_type address;
         rpc_frame_helper req{nullptr};
         rpc_frame_helper res{nullptr};
 
         call_runtime_context(
             session_scheduler_t *sche,
-            tcp::common::session_id_t ssid,
+            typename transport_t::address_type addr,
             uint64_t rid
-        ) : request_id(rid), scheduler(sche), sid(ssid){
+        ) : request_id(rid), scheduler(sche), address(addr){
         }
 
         call_runtime_context(const call_runtime_context&) = delete;
@@ -148,7 +147,7 @@ namespace pump::scheduler::rpc {
             , res(__fwd__(rhs.res)) {
             std::swap(request_id, rhs.request_id);
             std::swap(scheduler, rhs.scheduler);
-            std::swap(sid, rhs.sid);
+            std::swap(address, rhs.address);
         }
     };
 }

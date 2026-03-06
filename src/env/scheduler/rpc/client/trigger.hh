@@ -24,7 +24,7 @@ namespace pump::scheduler::rpc::client::detail {
                 request_id,
                 session_raw,
                 [context = context, scope = scope](completion_result &&result) mutable {
-                    if (auto* frame = std::get_if<tcp::common::net_frame>(&result)) {
+                    if (auto* frame = std::get_if<pump::common::net_frame>(&result)) {
                         core::op_pusher<pos + 1, scope_t>::push_value(context, scope, __mov__(*frame));
                     } else {
                         core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::get<std::exception_ptr>(result));
@@ -83,7 +83,7 @@ namespace pump::scheduler::rpc::client::detail {
         }
 
         auto
-        on_response(uint64_t request_id, tcp::common::net_frame&& frame) {
+        on_response(uint64_t request_id, pump::common::net_frame&& frame) {
             if (auto res = map.on_frame(request_id, __fwd__(frame)))
                 res.value().cb(completion_result(__mov__(res.value().frame)));
         }
@@ -113,7 +113,7 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<pump::scheduler::tcp::common::net_frame>{};
+            return std::type_identity<pump::common::net_frame>{};
         }
     };
 }

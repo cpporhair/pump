@@ -88,7 +88,16 @@ namespace apps::rpc::server {
                     })
                     >> pump::sender::then([rs](pump::scheduler::tcp::common::session_id_t s) {
                         auto *session_sched = rs->template get_schedulers<session_scheduler_t>()[0];
-                        return pump::scheduler::rpc::serv<service::type::sub, service::type::add>(session_sched, s)
+                        return pump::scheduler::tcp::join(session_sched, s)
+                            >> pump::scheduler::rpc::serv<service::type::sub, service::type::add>(session_sched, s)
+                            >> pump::sender::flat_map([session_sched, s]() {
+                                return pump::scheduler::tcp::stop(session_sched, s);
+                            })
+                            >> pump::sender::any_exception([session_sched, s](std::exception_ptr e) {
+                                return pump::scheduler::tcp::stop(session_sched, s)
+                                    >> pump::sender::ignore_all_exception()
+                                    >> pump::sender::then_exception(e);
+                            })
                             >> pump::sender::submit(pump::core::make_root_context());
                     })
                     >> pump::sender::count()
