@@ -5,7 +5,7 @@
 #include "pump/sender/just.hh"
 #include "pump/sender/flat.hh"
 #include "pump/sender/then.hh"
-#include "env/scheduler/net/net.hh"
+#include "env/scheduler/tcp/tcp.hh"
 #include "env/scheduler/rpc/common/rpc_state.hh"
 #include "pump/coro/coro.hh"
 #include "pump/sender/for_each.hh"
@@ -26,7 +26,7 @@ namespace pump::scheduler::rpc::server {
     struct
     session_state {
         session_scheduler_t* scheduler;
-        net::common::session_id_t session_id;
+        tcp::common::session_id_t session_id;
         bool closed = false;
 
         [[nodiscard]] bool
@@ -76,9 +76,9 @@ namespace pump::scheduler::rpc::server {
     inline auto
     recv_req(const auto& st) {
         return flat_map([&st](...) {
-            return net::recv(st.scheduler, st.session_id)
+            return tcp::recv(st.scheduler, st.session_id)
                 >> get_context<serv_runtime_context>()
-                >> then([](serv_runtime_context& memo, net::common::net_frame &&frame) {
+                >> then([](serv_runtime_context& memo, tcp::common::net_frame &&frame) {
                     memo.req.frame = reinterpret_cast<rpc_frame *>(frame.release());
                 });
         });
@@ -92,7 +92,7 @@ namespace pump::scheduler::rpc::server {
                 auto len = memo.res.get_len();
                 auto* f = memo.res.frame;
                 memo.res.frame = nullptr;
-                return net::send(st.scheduler, st.session_id, f, len);
+                return tcp::send(st.scheduler, st.session_id, f, len);
             });
     }
 
@@ -168,17 +168,17 @@ namespace pump::scheduler::rpc::server {
 
     template<uint16_t concurrency = 0, typename session_scheduler_t, uint16_enum_concept auto ...service_ids>
     auto
-    serv(session_scheduler_t* sche, net::common::session_id_t id) {
-        return net::join(sche, id)
+    serv(session_scheduler_t* sche, tcp::common::session_id_t id) {
+        return tcp::join(sche, id)
             >> push_context(session_state<session_scheduler_t>{sche, id})
             >> serv_proc<concurrency, session_scheduler_t, service_ids...>()
             >> pop_context()
             >> ignore_args()
             >> flat_map([sche, id]() {
-                return net::stop(sche, id);
+                return tcp::stop(sche, id);
             })
             >> pump::sender::any_exception([sche, id](std::exception_ptr e) {
-                return net::stop(sche, id)
+                return tcp::stop(sche, id)
                     >> ignore_all_exception()
                     >> then_exception(e);
             });

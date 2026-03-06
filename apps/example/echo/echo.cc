@@ -18,9 +18,9 @@
 #include "pump/sender/pop_context.hh"
 #include "env/runtime/share_nothing.hh"
 #include "env/runtime/runner.hh"
-#include "env/scheduler/net/net.hh"
-#include "env/scheduler/net/io_uring/scheduler.hh"
-#include "env/scheduler/net/epoll/scheduler.hh"
+#include "env/scheduler/tcp/tcp.hh"
+#include "env/scheduler/tcp/io_uring/scheduler.hh"
+#include "env/scheduler/tcp/epoll/scheduler.hh"
 
 #include "pump/core/lock_free_queue.hh"
 
@@ -33,7 +33,7 @@ using task_scheduler_t = scheduler::task::scheduler;
 template <typename session_scheduler_t>
 struct
 session_data {
-    scheduler::net::common::session_id_t id;
+    scheduler::tcp::common::session_id_t id;
     session_scheduler_t* scheduler;
     std::atomic<bool> closed;
 
@@ -43,7 +43,7 @@ session_data {
           , closed(rhs.closed.load()) {
     }
 
-    session_data(scheduler::net::common::session_id_t id, session_scheduler_t* scheduler)
+    session_data(scheduler::tcp::common::session_id_t id, session_scheduler_t* scheduler)
         : id(id)
         , scheduler(scheduler)
         , closed(false) {
@@ -68,11 +68,11 @@ using runtime_schedulers = env::runtime::runtime_schedulers<
 
 template <typename accept_scheduler_t, typename session_scheduler_t>
 auto
-session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *rs, const scheduler::net::common::session_id_t sid) {
+session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *rs, const scheduler::tcp::common::session_id_t sid) {
     auto session_count = rs->template get_schedulers<session_scheduler_t>().size();
     auto core_idx = sid.raw() % session_count;
     auto* session_sched = rs->template get_schedulers<session_scheduler_t>()[core_idx];
-    return scheduler::net::join(session_sched, sid)
+    return scheduler::tcp::join(session_sched, sid)
         >> with_context(session_data<session_scheduler_t>(sid, session_sched))([]() {
             return get_context<session_data<session_scheduler_t>>()
                 >> then([](const session_data<session_scheduler_t> &sd) {
@@ -81,12 +81,12 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                 >> as_stream()
                 >> get_context<session_data<session_scheduler_t>>()
                 >> flat_map([](const session_data<session_scheduler_t> &sd, ...) {
-                    return scheduler::net::recv(sd.scheduler, sd.id);
+                    return scheduler::tcp::recv(sd.scheduler, sd.id);
                 })
                 >> get_context<session_data<session_scheduler_t>>()
-                >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::net::common::net_frame &&frame) {
+                >> flat_map([](const session_data<session_scheduler_t> &sd, scheduler::tcp::common::net_frame &&frame) {
                     auto len = frame.size();
-                    return scheduler::net::send(sd.scheduler, sd.id, frame.release(), len);
+                    return scheduler::tcp::send(sd.scheduler, sd.id, frame.release(), len);
                     // send_req 持有 net_frame，析构自动释放 data
                 })
                 >> any_exception([](std::exception_ptr e) {
@@ -99,7 +99,7 @@ session_proc(const runtime_schedulers<accept_scheduler_t, session_scheduler_t> *
                 >> count();
         })
         >> flat_map([session_sched, sid](...) {
-            return scheduler::net::stop(session_sched, sid);
+            return scheduler::tcp::stop(session_sched, sid);
         });
 }
 
@@ -193,9 +193,9 @@ run_echo() {
             return just()
                 >> forever()
                 >> flat_map([rs](...) {
-                    return scheduler::net::wait_connection(rs->template get_schedulers<accept_scheduler_t>()[0]);
+                    return scheduler::tcp::wait_connection(rs->template get_schedulers<accept_scheduler_t>()[0]);
                 })
-                >> then([rs](scheduler::net::common::session_id_t s) {
+                >> then([rs](scheduler::tcp::common::session_id_t s) {
                     session_proc<accept_scheduler_t, session_scheduler_t>(rs, s)
                         >> submit(core::make_root_context());
                 })
@@ -220,22 +220,22 @@ main(int argc, char **argv) {
 
     if (use_epoll) {
         std::println("Using epoll backend");
-        using accept_sched_t = scheduler::net::epoll::accept_scheduler<pump::scheduler::net::senders::conn::op>;
-        using session_sched_t = scheduler::net::epoll::session_scheduler<
-            scheduler::net::senders::join::op,
-            scheduler::net::senders::recv::op,
-            scheduler::net::senders::send::op,
-            scheduler::net::senders::stop::op
+        using accept_sched_t = scheduler::tcp::epoll::accept_scheduler<pump::scheduler::tcp::senders::conn::op>;
+        using session_sched_t = scheduler::tcp::epoll::session_scheduler<
+            scheduler::tcp::senders::join::op,
+            scheduler::tcp::senders::recv::op,
+            scheduler::tcp::senders::send::op,
+            scheduler::tcp::senders::stop::op
         >;
         run_echo<accept_sched_t, session_sched_t>();
     } else {
         std::println("Using io_uring backend");
-        using accept_sched_t = scheduler::net::io_uring::accept_scheduler<pump::scheduler::net::senders::conn::op>;
-        using session_sched_t = scheduler::net::io_uring::session_scheduler<
-            scheduler::net::senders::join::op,
-            scheduler::net::senders::recv::op,
-            scheduler::net::senders::send::op,
-            scheduler::net::senders::stop::op
+        using accept_sched_t = scheduler::tcp::io_uring::accept_scheduler<pump::scheduler::tcp::senders::conn::op>;
+        using session_sched_t = scheduler::tcp::io_uring::session_scheduler<
+            scheduler::tcp::senders::join::op,
+            scheduler::tcp::senders::recv::op,
+            scheduler::tcp::senders::send::op,
+            scheduler::tcp::senders::stop::op
         >;
         run_echo<accept_sched_t, session_sched_t>();
     }

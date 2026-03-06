@@ -6,13 +6,13 @@
 
 #include "env/runtime/runner.hh"
 #include "env/runtime/share_nothing.hh"
-#include "env/scheduler/net/io_uring/scheduler.hh"
+#include "env/scheduler/tcp/io_uring/scheduler.hh"
 #include "env/scheduler/task/sender.hh"
 #include "pump/sender/repeat.hh"
 #include "pump/sender/submit.hh"
 
 #include "./service.hh"
-#include "env/scheduler/net/net.hh"
+#include "env/scheduler/tcp/tcp.hh"
 #include "env/scheduler/rpc/rpc.hh"
 #include "pump/sender/concurrent.hh"
 #include "pump/sender/flat.hh"
@@ -22,7 +22,7 @@
 
 namespace apps::rpc::client {
     using task_scheduler_t = pump::scheduler::task::scheduler;
-    using session_id_t = pump::scheduler::net::common::session_id_t;
+    using session_id_t = pump::scheduler::tcp::common::session_id_t;
 
     template <typename connect_scheduler_t, typename session_scheduler_t>
     using runtime_schedulers = pump::env::runtime::runtime_schedulers<
@@ -47,7 +47,7 @@ namespace apps::rpc::client {
         uint32_t num_cores = std::thread::hardware_concurrency();
 
         auto *connect_sched = new connect_scheduler_t();
-        auto cfg = pump::scheduler::net::common::scheduler_config{};
+        auto cfg = pump::scheduler::tcp::common::scheduler_config{};
         if (connect_sched->init(cfg) < 0) {
             std::println(stderr, "Failed to init connect_scheduler");
             std::exit(1);
@@ -82,16 +82,16 @@ namespace apps::rpc::client {
     connect_to_server(runtime_schedulers<conn_scheduler_t, sess_scheduler_t>* rs) {
         return pump::sender::flat_map([rs](...) {
             auto *conn_sche = rs->template get_schedulers<conn_scheduler_t>()[0];
-            return pump::scheduler::net::connect(conn_sche, "127.0.0.1", 8080);
+            return pump::scheduler::tcp::connect(conn_sche, "127.0.0.1", 8080);
         });
     }
 
     template<typename conn_scheduler_t, typename sess_scheduler_t>
     inline auto
     bind_session(runtime_schedulers<conn_scheduler_t, sess_scheduler_t>* rs) {
-        return pump::sender::flat_map([rs](pump::scheduler::net::common::session_id_t s) {
+        return pump::sender::flat_map([rs](pump::scheduler::tcp::common::session_id_t s) {
             auto *sess_sche = rs->template get_schedulers<sess_scheduler_t>()[0];
-            return pump::scheduler::net::join(sess_sche, s)
+            return pump::scheduler::tcp::join(sess_sche, s)
                 >> pump::sender::get_context<connection_pool<sess_scheduler_t> >()
                 >> pump::sender::then([s,sess_sche](auto &pool) {
                     pool.sessions.emplace_back(std::make_pair(s, sess_sche));

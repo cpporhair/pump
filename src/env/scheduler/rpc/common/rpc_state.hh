@@ -3,11 +3,11 @@
 #define PUMP_ENV_SCHEDULER_RPC_COMMON_RPC_STATE_HH
 
 #include <bits/move_only_function.h>
-#include "env/scheduler/net/common/struct.hh"
+#include "env/scheduler/tcp/common/struct.hh"
 
 
 namespace pump::scheduler::rpc {
-    using completion_result = std::variant<net::common::net_frame, std::exception_ptr>;
+    using completion_result = std::variant<tcp::common::net_frame, std::exception_ptr>;
     using completion_callback = std::move_only_function<void(completion_result&&)>;
 
     struct
@@ -15,7 +15,7 @@ namespace pump::scheduler::rpc {
         enum class slot_state : uint08_t { empty, wait_frame, wait_callback };
         struct slot {
             slot_state state = slot_state::empty;
-            net::common::net_frame frame;
+            tcp::common::net_frame frame;
             completion_callback cb;
             uint64_t session_raw = 0;
         };
@@ -48,7 +48,7 @@ namespace pump::scheduler::rpc {
         }
 
         std::optional<slot>
-        on_frame(uint64_t rid, net::common::net_frame&& frame) {
+        on_frame(uint64_t rid, tcp::common::net_frame&& frame) {
             auto idx = rid % slots.size();
             switch (slots[idx].state) {
                 case slot_state::empty: {

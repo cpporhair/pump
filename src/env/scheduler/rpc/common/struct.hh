@@ -4,9 +4,9 @@
 
 #include <cstdint>
 
-#include "env/scheduler/net/net.hh"
-#include "env/scheduler/net/common/detail.hh"
-#include "env/scheduler/net/common/struct.hh"
+#include "env/scheduler/tcp/tcp.hh"
+#include "env/scheduler/tcp/common/detail.hh"
+#include "env/scheduler/tcp/common/struct.hh"
 #include "pump/core/meta.hh"
 
 #include "./rpc_state.hh"
@@ -130,13 +130,13 @@ namespace pump::scheduler::rpc {
     call_runtime_context {
         uint64_t request_id{};
         session_scheduler_t* scheduler = nullptr;
-        net::common::session_id_t sid;
+        tcp::common::session_id_t sid;
         rpc_frame_helper req{nullptr};
         rpc_frame_helper res{nullptr};
 
         call_runtime_context(
             session_scheduler_t *sche,
-            net::common::session_id_t ssid,
+            tcp::common::session_id_t ssid,
             uint64_t rid
         ) : request_id(rid), scheduler(sche), sid(ssid){
         }

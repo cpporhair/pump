@@ -1,6 +1,6 @@
 
-#ifndef ENV_SCHEDULER_NET_SENDER_STOP_HH
-#define ENV_SCHEDULER_NET_SENDER_STOP_HH
+#ifndef ENV_SCHEDULER_TCP_SENDER_STOP_HH
+#define ENV_SCHEDULER_TCP_SENDER_STOP_HH
 
 #include <cstdint>
 #include <bits/move_only_function.h>
@@ -11,7 +11,7 @@
 #include "../common/struct.hh"
 #include "../common/error.hh"
 
-namespace pump::scheduler::net::senders::stop {
+namespace pump::scheduler::tcp::senders::stop {
     template <typename scheduler_t>
     struct
     op {
@@ -94,7 +94,7 @@ namespace pump::core {
 
     template <typename context_t, typename scheduler_t>
     struct
-    compute_sender_type<context_t, scheduler::net::senders::stop::sender<scheduler_t>> {
+    compute_sender_type<context_t, scheduler::tcp::senders::stop::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
             return 0;
@@ -103,4 +103,4 @@ namespace pump::core {
 
 }
 
-#endif //ENV_SCHEDULER_NET_SENDER_STOP_HH
+#endif //ENV_SCHEDULER_TCP_SENDER_STOP_HH

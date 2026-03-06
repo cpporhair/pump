@@ -9,7 +9,7 @@
 #include "../../kv/runtime/scheduler_objects.hh"
 #include "env/runtime/runner.hh"
 #include "env/runtime/share_nothing.hh"
-#include "env/scheduler/net/io_uring/scheduler.hh"
+#include "env/scheduler/tcp/io_uring/scheduler.hh"
 #include "env/scheduler/task/sender.hh"
 #include "pump/sender/repeat.hh"
 #include "pump/sender/submit.hh"
@@ -83,10 +83,10 @@ namespace apps::rpc::server {
                 return pump::sender::just()
                     >> pump::sender::forever()
                     >> pump::sender::flat_map([rs](...) {
-                        return pump::scheduler::net::wait_connection(
+                        return pump::scheduler::tcp::wait_connection(
                             rs->template get_schedulers<accept_scheduler_t>()[0]);
                     })
-                    >> pump::sender::then([rs](pump::scheduler::net::common::session_id_t s) {
+                    >> pump::sender::then([rs](pump::scheduler::tcp::common::session_id_t s) {
                         auto *session_sched = rs->template get_schedulers<session_scheduler_t>()[0];
                         return pump::scheduler::rpc::serv<service::type::sub, service::type::add>(session_sched, s)
                             >> pump::sender::submit(pump::core::make_root_context());

@@ -19,7 +19,7 @@
 #include "../common/detail.hh"
 #include "../common/error.hh"
 
-namespace pump::scheduler::net::io_uring {
+namespace pump::scheduler::tcp::io_uring {
 
     // 6.1: unified session type - recv-only (io_uring manages sends via ring, no per-session send cache)
     using session_t = common::detail::internal_session<common::detail::recv_cache>;

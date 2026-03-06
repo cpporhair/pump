@@ -1,6 +1,6 @@
 
-#ifndef ENV_SCHEDULER_NET_COMMON_STRUCT_HH
-#define ENV_SCHEDULER_NET_COMMON_STRUCT_HH
+#ifndef ENV_SCHEDULER_TCP_COMMON_STRUCT_HH
+#define ENV_SCHEDULER_TCP_COMMON_STRUCT_HH
 
 #include <cassert>
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 #include "pump/core/meta.hh"
 
-namespace pump::scheduler::net::common {
+namespace pump::scheduler::tcp::common {
     struct
     net_frame {
         char* _data;
@@ -273,4 +273,4 @@ namespace pump::scheduler::net::common {
 
 }
 
-#endif //ENV_SCHEDULER_NET_COMMON_STRUCT_HH
+#endif //ENV_SCHEDULER_TCP_COMMON_STRUCT_HH

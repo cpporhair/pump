@@ -1,6 +1,6 @@
 
-#ifndef ENV_SCHEDULER_NET_COMMON_DETAIL_HH
-#define ENV_SCHEDULER_NET_COMMON_DETAIL_HH
+#ifndef ENV_SCHEDULER_TCP_COMMON_DETAIL_HH
+#define ENV_SCHEDULER_TCP_COMMON_DETAIL_HH
 #include <atomic>
 #include <cstring>
 #include <unistd.h>
@@ -9,7 +9,7 @@
 #include "pump/core/lock_free_queue.hh"
 #include "./struct.hh"
 
-namespace pump::scheduler::net::common::detail {
+namespace pump::scheduler::tcp::common::detail {
     struct
     _read_pkt_len {
         uint32_t
@@ -212,4 +212,4 @@ namespace pump::scheduler::net::common::detail {
     };
 }
 
-#endif //ENV_SCHEDULER_NET_COMMON_DETAIL_HH
+#endif //ENV_SCHEDULER_TCP_COMMON_DETAIL_HH

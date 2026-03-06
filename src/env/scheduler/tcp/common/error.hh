@@ -1,11 +1,11 @@
 
-#ifndef ENV_SCHEDULER_NET_COMMON_ERROR_HH
-#define ENV_SCHEDULER_NET_COMMON_ERROR_HH
+#ifndef ENV_SCHEDULER_TCP_COMMON_ERROR_HH
+#define ENV_SCHEDULER_TCP_COMMON_ERROR_HH
 
 #include <stdexcept>
 #include <string>
 
-namespace pump::scheduler::net::common {
+namespace pump::scheduler::tcp::common {
 
     struct net_error : std::runtime_error {
         using std::runtime_error::runtime_error;
@@ -38,4 +38,4 @@ namespace pump::scheduler::net::common {
 
 }
 
-#endif //ENV_SCHEDULER_NET_COMMON_ERROR_HH
+#endif //ENV_SCHEDULER_TCP_COMMON_ERROR_HH

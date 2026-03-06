@@ -1,48 +1,44 @@
-#ifndef ENV_SCHEDULER_NET_SENDERS_SEND_HH
-#define ENV_SCHEDULER_NET_SENDERS_SEND_HH
+#ifndef ENV_SCHEDULER_TCP_SENDERS_RECV_HH
+#define ENV_SCHEDULER_TCP_SENDERS_RECV_HH
 #include <cstdint>
 #include <bits/move_only_function.h>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"
-#include "../common/struct.hh"
+#include "env/scheduler/tcp/common/struct.hh"
 
-namespace pump::scheduler::net::senders::send {
+namespace pump::scheduler::tcp::senders::recv {
+
     template <typename scheduler_t>
     struct
     op {
-        constexpr static bool net_sender_send_op = true;
+        constexpr static bool net_sender_recv_op = true;
         scheduler_t* scheduler;
         common::session_id_t session_id;
-        common::net_frame frame;
 
-        op(scheduler_t* s, common::session_id_t sid, common::net_frame&& f)
+        op(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
-            , session_id(sid)
-            , frame(__fwd__(f)){
+            , session_id(sid) {
         }
 
-        op(op &&rhs) noexcept
+        op(op&& rhs) noexcept
             : scheduler(rhs.scheduler)
-            , session_id(rhs.session_id)
-            , frame(__fwd__(rhs.frame)) {
+            , session_id(rhs.session_id) {
         }
-
-
 
         template<uint32_t pos, typename context_t, typename scope_t>
         auto
         start(context_t &context, scope_t &scope) {
             return scheduler->schedule(
-                new common::send_req{
+                new common::recv_req{
                     session_id,
-                    __mov__(frame),
-                    [context = context, scope = scope](bool succeed) mutable {
-                        core::op_pusher<pos + 1, scope_t>::push_value(
-                            context,
-                            scope,
-                            succeed
-                        );
+                    [context = context, scope = scope](std::variant<common::net_frame, std::exception_ptr>&& res) mutable {
+                        if (res.index() == 0) [[likely]] {
+                            core::op_pusher<pos + 1, scope_t>::push_value(context, scope, std::move(std::get<0>(res)));
+                        }
+                        else {
+                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::get<1>(res));
+                        }
                     }
                 }
             );
@@ -54,24 +50,21 @@ namespace pump::scheduler::net::senders::send {
     sender {
         scheduler_t* scheduler;
         common::session_id_t session_id;
-        common::net_frame frame;
 
-        sender(scheduler_t* s, common::session_id_t sid, common::net_frame&& f)
+        sender(scheduler_t* s, common::session_id_t sid)
             : scheduler(s)
-            , session_id(sid)
-            , frame(__fwd__(f)) {
+            , session_id(sid) {
         }
 
         sender(sender &&rhs) noexcept
             : scheduler(rhs.scheduler)
-            , session_id(rhs.session_id)
-            , frame(__fwd__(rhs.frame)){
+            , session_id(rhs.session_id) {
         }
 
         inline
         auto
         make_op(){
-            return op<scheduler_t>(scheduler, session_id, __mov__(frame));
+            return op<scheduler_t>(scheduler, session_id);
         }
 
         template<typename context_t>
@@ -83,10 +76,9 @@ namespace pump::scheduler::net::senders::send {
 }
 
 namespace pump::core {
-
     template<uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-    && (get_current_op_type_t<pos, scope_t>::net_sender_send_op)
+    && (get_current_op_type_t<pos, scope_t>::net_sender_recv_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
         template<typename context_t>
@@ -98,7 +90,7 @@ namespace pump::core {
 
     template <typename context_t, typename scheduler_t>
     struct
-    compute_sender_type<context_t, scheduler::net::senders::send::sender<scheduler_t>> {
+    compute_sender_type<context_t, scheduler::tcp::senders::recv::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
             return 1;
@@ -106,10 +98,9 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<bool>{};
+            return std::type_identity<scheduler::tcp::common::net_frame>{};
         }
     };
-
 }
 
-#endif //ENV_SCHEDULER_NET_SENDERS_SEND_HH
+#endif //ENV_SCHEDULER_TCP_SENDERS_RECV_HH

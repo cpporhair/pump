@@ -2,14 +2,14 @@
 // Created by null on 2025/7/21.
 //
 
-#ifndef ENV_SCHEDULER_NET_EPOLL_HH
-#define ENV_SCHEDULER_NET_EPOLL_HH
+#ifndef ENV_SCHEDULER_TCP_EPOLL_HH
+#define ENV_SCHEDULER_TCP_EPOLL_HH
 #include <cstring>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <array>
 
-namespace pump::scheduler::net::epoll::detail {
+namespace pump::scheduler::tcp::epoll::detail {
 
     static constexpr int MAX_EVENTS = 16;
 
@@ -67,4 +67,4 @@ namespace pump::scheduler::net::epoll::detail {
     };
 }
 
-#endif //ENV_SCHEDULER_NET_EPOLL_HH
+#endif //ENV_SCHEDULER_TCP_EPOLL_HH

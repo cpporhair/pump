@@ -2,8 +2,8 @@
 // Created by null on 2025/7/21.
 //
 
-#ifndef ENV_SCHEDULER_NET_NET_HH
-#define ENV_SCHEDULER_NET_NET_HH
+#ifndef ENV_SCHEDULER_TCP_NET_HH
+#define ENV_SCHEDULER_TCP_NET_HH
 
 #include "pump/sender/flat.hh"
 #include "./senders/conn.hh"
@@ -13,7 +13,7 @@
 #include "./senders/join.hh"
 #include "./senders/stop.hh"
 
-namespace pump::scheduler::net {
+namespace pump::scheduler::tcp {
     template <typename scheduler_t>
     inline auto
     wait_connection(scheduler_t* sche) {
@@ -55,4 +55,4 @@ namespace pump::scheduler::net {
     }
 }
 
-#endif //ENV_SCHEDULER_NET_NET_HH
+#endif //ENV_SCHEDULER_TCP_NET_HH

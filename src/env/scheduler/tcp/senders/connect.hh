@@ -1,5 +1,5 @@
-#ifndef ENV_SCHEDULER_NET_SENDERS_CONNECT_HH
-#define ENV_SCHEDULER_NET_SENDERS_CONNECT_HH
+#ifndef ENV_SCHEDULER_TCP_SENDERS_CONNECT_HH
+#define ENV_SCHEDULER_TCP_SENDERS_CONNECT_HH
 #include <cstdint>
 #include <bits/move_only_function.h>
 
@@ -8,7 +8,7 @@
 
 #include "../common/struct.hh"
 
-namespace pump::scheduler::net::senders::connect {
+namespace pump::scheduler::tcp::senders::connect {
 
     template <typename scheduler_t>
     struct
@@ -84,7 +84,7 @@ namespace pump::core {
 
     template <typename context_t, typename scheduler_t>
     struct
-    compute_sender_type<context_t, scheduler::net::senders::connect::sender<scheduler_t>> {
+    compute_sender_type<context_t, scheduler::tcp::senders::connect::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
             return 1;
@@ -92,9 +92,9 @@ namespace pump::core {
 
         consteval static auto
         get_value_type_identity() {
-            return std::type_identity<scheduler::net::common::session_id_t>{};
+            return std::type_identity<scheduler::tcp::common::session_id_t>{};
         }
     };
 }
 
-#endif //ENV_SCHEDULER_NET_SENDERS_CONNECT_HH
+#endif //ENV_SCHEDULER_TCP_SENDERS_CONNECT_HH

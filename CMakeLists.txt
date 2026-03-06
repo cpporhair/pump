@@ -12,6 +12,6 @@ find_package(PkgConfig REQUIRED)
 
 include(src/env/scheduler/nvme/nvme.cmake)
 
-include(src/env/scheduler/net/net.cmake)
+include(src/env/scheduler/tcp/tcp.cmake)
 
 add_subdirectory(apps)

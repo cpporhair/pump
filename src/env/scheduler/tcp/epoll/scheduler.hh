@@ -1,6 +1,6 @@
 
-#ifndef ENV_SCHEDULER_NET_EPOLL_SCHEDULER_HH
-#define ENV_SCHEDULER_NET_EPOLL_SCHEDULER_HH
+#ifndef ENV_SCHEDULER_TCP_EPOLL_SCHEDULER_HH
+#define ENV_SCHEDULER_TCP_EPOLL_SCHEDULER_HH
 
 #include <list>
 #include <bits/move_only_function.h>
@@ -18,7 +18,7 @@
 #include "../common/error.hh"
 #include "./epoll.hh"
 
-namespace pump::scheduler::net::epoll {
+namespace pump::scheduler::tcp::epoll {
 
     struct
     epoll_send_cache {
@@ -453,4 +453,4 @@ namespace pump::scheduler::net::epoll {
     };
 }
 
-#endif //ENV_SCHEDULER_NET_EPOLL_SCHEDULER_HH
+#endif //ENV_SCHEDULER_TCP_EPOLL_SCHEDULER_HH

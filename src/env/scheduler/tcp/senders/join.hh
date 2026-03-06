@@ -1,18 +1,22 @@
-#ifndef ENV_SCHEDULER_NET_SENDERS_RECV_HH
-#define ENV_SCHEDULER_NET_SENDERS_RECV_HH
+//
+// Created by null on 2025/7/26.
+//
+
+#ifndef ENV_SCHEDULER_TCP_SENDERS_JOIN_HH
+#define ENV_SCHEDULER_TCP_SENDERS_JOIN_HH
 #include <cstdint>
 #include <bits/move_only_function.h>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"
-#include "env/scheduler/net/common/struct.hh"
 
-namespace pump::scheduler::net::senders::recv {
-
+#include "../common/struct.hh"
+#include "../common/error.hh"
+namespace pump::scheduler::tcp::senders::join {
     template <typename scheduler_t>
     struct
     op {
-        constexpr static bool net_sender_recv_op = true;
+        constexpr static bool net_sender_join_op = true;
         scheduler_t* scheduler;
         common::session_id_t session_id;
 
@@ -30,14 +34,14 @@ namespace pump::scheduler::net::senders::recv {
         auto
         start(context_t &context, scope_t &scope) {
             return scheduler->schedule(
-                new common::recv_req{
+                new common::join_req{
                     session_id,
-                    [context = context, scope = scope](std::variant<common::net_frame, std::exception_ptr>&& res) mutable {
-                        if (res.index() == 0) [[likely]] {
-                            core::op_pusher<pos + 1, scope_t>::push_value(context, scope, std::move(std::get<0>(res)));
+                    [context = context, scope = scope](bool res) mutable {
+                        if (res) [[likely]] {
+                            core::op_pusher<pos + 1, scope_t>::push_value(context, scope);
                         }
                         else {
-                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::get<1>(res));
+                            core::op_pusher<pos + 1, scope_t>::push_exception(context, scope, std::make_exception_ptr(common::join_failed_error()));
                         }
                     }
                 }
@@ -78,7 +82,7 @@ namespace pump::scheduler::net::senders::recv {
 namespace pump::core {
     template<uint32_t pos, typename scope_t>
     requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
-    && (get_current_op_type_t<pos, scope_t>::net_sender_recv_op)
+    && (get_current_op_type_t<pos, scope_t>::net_sender_join_op)
     struct
     op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
         template<typename context_t>
@@ -90,17 +94,12 @@ namespace pump::core {
 
     template <typename context_t, typename scheduler_t>
     struct
-    compute_sender_type<context_t, scheduler::net::senders::recv::sender<scheduler_t>> {
+    compute_sender_type<context_t, scheduler::tcp::senders::join::sender<scheduler_t>> {
         consteval static uint32_t
         count_value() {
-            return 1;
-        }
-
-        consteval static auto
-        get_value_type_identity() {
-            return std::type_identity<scheduler::net::common::net_frame>{};
+            return 0;
         }
     };
 }
 
-#endif //ENV_SCHEDULER_NET_SENDERS_RECV_HH
+#endif //ENV_SCHEDULER_TCP_SENDERS_JOIN_HH

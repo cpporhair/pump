@@ -1,13 +1,13 @@
-#ifndef ENV_SCHEDULER_NET_EPOLL_CONNECT_SCHEDULER_HH
-#define ENV_SCHEDULER_NET_EPOLL_CONNECT_SCHEDULER_HH
+#ifndef ENV_SCHEDULER_TCP_IOURING_CONNECT_SCHEDULER_HH
+#define ENV_SCHEDULER_TCP_IOURING_CONNECT_SCHEDULER_HH
 
+#include <cstdint>
 #include <list>
 #include <bits/move_only_function.h>
+#include <liburing.h>
 #include <netinet/in.h>
 #include <fcntl.h>
-#include <sys/uio.h>
 #include <arpa/inet.h>
-#include <cerrno>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"
@@ -16,11 +16,10 @@
 #include "../common/struct.hh"
 #include "../common/detail.hh"
 #include "../common/error.hh"
-#include "./epoll.hh"
 #include "./scheduler.hh"
 #include "../senders/connect.hh"
 
-namespace pump::scheduler::net::epoll {
+namespace pump::scheduler::tcp::io_uring {
 
     template <template<typename> class conn_op_t>
     struct
@@ -30,12 +29,13 @@ namespace pump::scheduler::net::epoll {
     private:
         struct pending_connect_info {
             int fd;
+            sockaddr_in addr;
             common::connect_req* req;
         };
 
         core::per_core::queue<common::connect_req*, 2048> conn_request_q;
         core::mpmc::queue<common::session_id_t, 2048> session_q;
-        detail::poller_epoll poller;
+        struct ::io_uring ring{};
         size_t _recv_buffer_size = 4096;
         std::atomic<bool> _shutdown{false};
         std::list<pending_connect_info> pending_connects;
@@ -60,65 +60,54 @@ namespace pump::scheduler::net::epoll {
                 return;
             }
 
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(req->port);
-            inet_pton(AF_INET, req->address.c_str(), &addr.sin_addr);
+            pending_connects.push_back({fd, {}, req});
+            auto& pc = pending_connects.back();
+            pc.addr.sin_family = AF_INET;
+            pc.addr.sin_port = htons(req->port);
+            inet_pton(AF_INET, req->address.c_str(), &pc.addr.sin_addr);
 
-            int ret = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-            if (ret == 0) {
-                create_internal_session(fd, req);
-                return;
-            }
-
-            if (errno == EINPROGRESS) {
-                auto* ev = new epoll_event;
-                ev->events = EPOLLOUT;
-                ev->data.fd = fd;
-                poller.add_event(fd, ev);
-                pending_connects.push_back({fd, req});
-            } else {
+            ::io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
+            if (!sqe) {
+                pending_connects.pop_back();
                 req->cb(common::session_id_t{});
                 ::close(fd);
                 delete req;
+                return;
             }
+
+            ::io_uring_prep_connect(sqe, fd,
+                reinterpret_cast<sockaddr*>(&pc.addr), sizeof(pc.addr));
+            ::io_uring_sqe_set_data(sqe, &pc);
+            ::io_uring_submit(&ring);
         }
 
         void
-        handle_connect_completion(epoll_event* e) {
-            int fd = e->data.fd;
-            auto it = pending_connects.begin();
-            for (; it != pending_connects.end(); ++it) {
-                if (it->fd == fd)
-                    break;
+        handle_io_uring() {
+            ::io_uring_cqe* cqe;
+            while (::io_uring_peek_cqe(&ring, &cqe) == 0) {
+                auto* pc = reinterpret_cast<pending_connect_info*>(cqe->user_data);
+                int res = cqe->res;
+                ::io_uring_cqe_seen(&ring, cqe);
+
+                if (res == 0) {
+                    create_internal_session(pc->fd, pc->req);
+                } else {
+                    pc->req->cb(common::session_id_t{});
+                    ::close(pc->fd);
+                    delete pc->req;
+                }
+
+                pending_connects.remove_if([pc](const pending_connect_info& info) {
+                    return &info == pc;
+                });
             }
-            if (it == pending_connects.end())
-                return;
-
-            auto* req = it->req;
-            int so_error = 0;
-            socklen_t len = sizeof(so_error);
-            getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len);
-
-            epoll_event ev{};
-            poller.del_event(fd, &ev);
-
-            if (so_error == 0) {
-                create_internal_session(fd, req);
-            } else {
-                req->cb(common::session_id_t{});
-                ::close(fd);
-                delete req;
-            }
-
-            pending_connects.erase(it);
         }
 
         void
         create_internal_session(int fd, common::connect_req* req) {
             const int flags = fcntl(fd, F_GETFL, 0);
             fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-            auto* s = new session_t(fd, new common::detail::recv_cache(_recv_buffer_size), new epoll_send_cache());
+            auto* s = new session_t(fd, new common::detail::recv_cache(_recv_buffer_size));
             auto sid = common::session_id_t::encode(s);
             req->cb(sid);
             delete req;
@@ -139,18 +128,18 @@ namespace pump::scheduler::net::epoll {
         }
 
     public:
-        connect_scheduler()
-            : poller() {
-        }
+        connect_scheduler() = default;
 
         int
         init(const common::scheduler_config& cfg) {
             _recv_buffer_size = cfg.recv_buffer_size;
-            return 0;
+            return init(cfg.queue_depth);
         }
 
         int
-        init() {
+        init(unsigned queue_depth = 256) {
+            if (::io_uring_queue_init(queue_depth, &ring, 0) < 0)
+                return -1;
             return 0;
         }
 
@@ -158,6 +147,7 @@ namespace pump::scheduler::net::epoll {
             for (auto& pc : pending_connects) {
                 ::close(pc.fd);
             }
+            ::io_uring_queue_exit(&ring);
         }
 
         void
@@ -171,10 +161,7 @@ namespace pump::scheduler::net::epoll {
                 drain_on_shutdown();
                 return false;
             }
-            const int cnt = poller.wait_event(0);
-            for (int i = 0; i < cnt; ++i) {
-                handle_connect_completion(&poller.events[i]);
-            }
+            handle_io_uring();
             return true;
         }
 
@@ -186,4 +173,4 @@ namespace pump::scheduler::net::epoll {
     };
 }
 
-#endif //ENV_SCHEDULER_NET_EPOLL_CONNECT_SCHEDULER_HH
+#endif //ENV_SCHEDULER_TCP_IOURING_CONNECT_SCHEDULER_HH

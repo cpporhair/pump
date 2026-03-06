@@ -69,22 +69,22 @@ enum class rpc_error_code : uint16_t {
 rpc::serv<service_id1, service_id2, ...>(sche, session_id)
 
 展开为：
-net::join(sche, session_id)                        ← 绑定 session
+tcp::join(sche, session_id)                        ← 绑定 session
 >> push_context(session_state{sche, sid, false})   ← 压入 session 状态
 >> serv_proc()                                     ← 主处理逻辑
 >> pop_context()
 >> ignore_args()
->> flat_map(net::stop(sche, id))                   ← 正常路径关闭 session
->> any_exception(net::stop + re-throw)             ← 异常路径也关闭 session
+>> flat_map(tcp::stop(sche, id))                   ← 正常路径关闭 session
+>> any_exception(tcp::stop + re-throw)             ← 异常路径也关闭 session
 
 serv_proc 内部：
   for_each(check_rpc_state(sd))                    ← 协程：sd.closed 前持续 yield true
   >> with_context(serv_runtime_context)(            ← 每次迭代一个新的 req/res 帧对
-      recv_req(sd)                                 ← net::recv → rpc_frame 存入 context
+      recv_req(sd)                                 ← tcp::recv → rpc_frame 存入 context
       >> flat_map(                                 ← 隔离 dispatch 异常作用域
           dispatch<service_ids...>()               ← 按 service_id 分派到 handle()
           >> any_exception(build_error_response)   ← dispatch 失败 → 构建错误帧
-          >> send_res(sd)                          ← rpc_frame → net::send
+          >> send_res(sd)                          ← rpc_frame → tcp::send
       )
   )
   >> handle_exception(sd)                          ← 异常时标记 closed + 传播异常
@@ -101,7 +101,7 @@ dispatch 失败时（handle 抛异常或 unknown service_id），`any_exception`
 
 `rpc::serv_concurrent<concurrency, ids...>(sche, sid)` 在串行 `serv` 基础上增加：
 - `concurrent(concurrency)` 允许 N 个请求同时 in-flight（编译期 `uint16_t` 模板参数）
-- 不需要额外的 task_scheduler — `net::recv` 本身是异步的，`concurrent` 只是允许并发，是否真正并发取决于下游处理逻辑
+- 不需要额外的 task_scheduler — `tcp::recv` 本身是异步的，`concurrent` 只是允许并发，是否真正并发取决于下游处理逻辑
 - 内部通过 `apply_concurrency<N>()` 模板函数条件性地插入 `concurrent(N)`，`serv` 和 `serv_concurrent` 共用同一个 `serv_proc`
 - 每个迭代独立 recv → dispatch → send
 - 响应可能乱序发送（客户端 trigger 已支持乱序匹配）
@@ -126,8 +126,8 @@ rpc::call<service_id>(sche, sid, args...)
 
 展开为：
 with_context(call_runtime_context{rid, sche, sid, req, res})(
-    send_req<service_id>()                          ← 序列化参数 → 填 header → net::send
-    >> wait_res<service_id>()                       ← net::recv → 匹配 request_id → 反序列化
+    send_req<service_id>()                          ← 序列化参数 → 填 header → tcp::send
+    >> wait_res<service_id>()                       ← tcp::recv → 匹配 request_id → 反序列化
 )
 ```
 
@@ -141,7 +141,7 @@ N 个并发 call（pipelining）：N 个 recv 竞争收帧：
 3. **不匹配**：`recv_res<false>` → `trigger.on_response(wrong_rid, frame)` 存入 map → `trigger.wait_response(my_rid)` 挂起等待
 4. `visit()` 分支处理 variant → `flat()`
 
-关键洞察：trigger 不做 recv，只暂存+匹配。各并发 call 的 `net::recv` 互相为对方接力。
+关键洞察：trigger 不做 recv，只暂存+匹配。各并发 call 的 `tcp::recv` 互相为对方接力。
 
 ### 错误响应检测
 
@@ -149,7 +149,7 @@ N 个并发 call（pipelining）：N 个 recv 竞争收帧：
 
 ### 断连通知（fail_session）
 
-`wait_res` 末尾包裹 `any_exception`：当 `net::recv` 或 send 失败时，调用 `trigger.fail_session(session_raw, ex)` 通知同 session 上所有 pending 请求（通过 slot 中记录的 `session_raw` 精确匹配），然后重新抛出原异常。
+`wait_res` 末尾包裹 `any_exception`：当 `tcp::recv` 或 send 失败时，调用 `trigger.fail_session(session_raw, ex)` 通知同 session 上所有 pending 请求（通过 slot 中记录的 `session_raw` 精确匹配），然后重新抛出原异常。
 
 ## 6. trigger 自定义 scheduler
 
@@ -224,7 +224,7 @@ struct pump::scheduler::rpc::server::service<type::add> {
 
 | 对象 | 所有权 | 生命周期 |
 |------|--------|---------|
-| `rpc_frame`（via `rpc_frame_helper`） | RAII，`delete[] char*` | 帧处理期间。send 前 `frame = nullptr` 转移给 net 层 |
+| `rpc_frame`（via `rpc_frame_helper`） | RAII，`delete[] char*` | 帧处理期间。send 前 `frame = nullptr` 转移给 tcp 层 |
 | `call_runtime_context` | 值语义，`with_context` 作用域 | 单次 RPC 调用 |
 | `serv_runtime_context` | 值语义，`with_context` 作用域 | 单次请求处理（recv→dispatch→send） |
 | `session_state` | 值语义，`push_context` 作用域 | session 存续期间 |
@@ -232,15 +232,15 @@ struct pump::scheduler::rpc::server::service<type::add> {
 
 ### 帧所有权转移链
 
-**发送**：`rpc_frame_helper.frame` → `ctx.req.frame = nullptr` 释放所有权 → `net::send` 接管 → io_uring 写完后释放
+**发送**：`rpc_frame_helper.frame` → `ctx.req.frame = nullptr` 释放所有权 → `tcp::send` 接管 → io_uring 写完后释放
 
-**接收**：`net::recv` → `net_frame` → `frame.release()` 拿出 `char*` → `reinterpret_cast<rpc_frame*>` → `ctx.res.frame` 接管 → `rpc_frame_helper` 析构释放
+**接收**：`tcp::recv` → `net_frame` → `frame.release()` 拿出 `char*` → `reinterpret_cast<rpc_frame*>` → `ctx.res.frame` 接管 → `rpc_frame_helper` 析构释放
 
 ## 9. 公共 API
 
 ```cpp
 // 串行服务端（单请求处理）
-rpc::serv<service_id1, service_id2, ...>(net_sche, session_id)
+rpc::serv<service_id1, service_id2, ...>(tcp_sche, session_id)
 
 // 并发服务端（多请求并行处理，concurrency 为编译期 uint16_t）
 rpc::serv_concurrent<concurrency, service_id1, service_id2, ...>(sche, session_id)
@@ -255,7 +255,7 @@ rpc::call<service_id>(sche, session_id, args...)
 |------|------|------|
 | `fail_session` 精度 | 已实现 | 按 `session_raw` 匹配，仅 fail 同 session 的 pending 请求 |
 | 错误响应 | 已实现 | flags=0x02 传递 `rpc_error_code`，客户端抛 `rpc_error` |
-| session 关闭 | 已实现 | `serv()` 结束后自动调用 `net::stop`（正常/异常路径均覆盖） |
+| session 关闭 | 已实现 | `serv()` 结束后自动调用 `tcp::stop`（正常/异常路径均覆盖） |
 | 并发处理 | 已实现 | `serv_concurrent<N>` 支持多请求并行，编译期 concurrency 参数，无需额外 scheduler |
-| 帧长度截断 | 已知 | `total_len` 为 uint32_t，但 net 层 send 用 uint16_t，超 64KB 帧会截断 |
+| 帧长度截断 | 已知 | `total_len` 为 uint32_t，但 tcp 层 send 用 uint16_t，超 64KB 帧会截断 |
 | 命名空间 | 待优化 | 共用类型在 `server::` 命名空间下，客户端代码需 `server::` 前缀 |
