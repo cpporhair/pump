@@ -15,6 +15,8 @@ target_link_libraries(test.sequential PRIVATE pthread numa)
 target_link_libraries(test.when_any PRIVATE pthread numa)
 target_link_libraries(example.rpc PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY} pthread)
+add_executable(example.dpdk ./example/dpdk/main.cc)
+target_link_libraries(example.dpdk PRIVATE ${DPDK_LIBRARIES} pthread)
 target_link_libraries(example.share_nothing PRIVATE numa)
 target_link_libraries(example.pump PRIVATE numa)
 target_link_libraries(example.nvme PRIVATE 
