@@ -1,6 +1,6 @@
 # Pump
 
-Pump 是一个 C++26 异步流水线框架。用 `>>` 运算符把异步操作串成线性管道，编译期确定内存布局，运行期零分配。
+用 `>>` 把异步操作串成线性管道的 C++26 框架。编译期展平为 `std::tuple`，运行期零分配。
 
 ```cpp
 just(10)
@@ -9,159 +9,199 @@ just(10)
     >> submit(make_root_context());
 ```
 
-## 为什么需要 Pump
+## 为什么
 
-传统异步编程的核心困境：**逻辑是线性的，但代码是碎片化的。**
+异步编程的核心困境：**逻辑是线性的，代码是碎片化的。**
 
-回调把连续流程撕裂到多个函数里。Future 在高频场景下有堆分配和原子计数开销。裸协程需要手工封装调度和并发控制。
+回调把连续流程撕裂到多个函数。Future 有堆分配和原子计数开销。协程需要手工封装调度和并发控制。
 
-Pump 的解法很直接：**让异步代码的拓扑结构和业务逻辑的拓扑结构一致。** 你想的是"先做 A，再做 B，并发做 C"，写出来的代码就是 `A >> B >> concurrent >> C`。
+Pump 的解法：**让代码拓扑和业务拓扑一致。** "先做 A，再做 B，并发做 C" 写出来就是 `A >> B >> concurrent >> C`。
+
+## 实战：KV 存储写路径
+
+一次 batch put 跨越 5 个 scheduler，涉及 Leader/Follower 合并、多级并发、variant 分支和分层异常处理——如果用回调或协程写，这是上千行散落在十几个函数里的状态机。用 Pump 写出来仍然是一条线性 pipeline：
+
+```cpp
+auto apply() {
+    return get_context<batch*>()
+        >> then([](batch* b) {
+            return just()
+                >> request_put_serial_number(b)           // → batch scheduler：分配版本号
+                >> update_index(b)                        // → index scheduler × N：并发更新索引
+                >> merge_batch_and_allocate_page()        // → fs scheduler：Leader/Follower 合并分配页面
+                >> then([b](auto&& res) {                 //   返回 variant<leader*, follower, failed>
+                    if constexpr (is_same_v<leader_res*, __typ__(res)>) {
+                        return just()                     // Leader：写入 + 通知 Follower
+                            >> write_data(res->span_list) //   → nvme scheduler × M：并发 DMA 写
+                            >> write_meta(res)            //   → fs + nvme：元数据（嵌套 Leader/Follower）
+                            >> free_page_when_error(res->span_list)
+                            >> notify_follower(res);
+                    }
+                    else if constexpr (is_same_v<follower_res, __typ__(res)>) {
+                        return just(__fwd__(res));         // Follower：等 Leader 通知后继续
+                    }
+                    else {
+                        return just(make_exception_ptr(new allocate_page_failed()));
+                    }
+                })
+                >> flat()
+                >> ignore_all_exception()                 // 屏蔽异常，确保缓存阶段执行
+                >> cache_data_if_succeed(b);              // → index scheduler × N：并发缓存
+        })
+        >> flat();
+}
+
+// 每个子阶段也是 pipeline
+auto update_index(batch* b) {
+    return for_each(b->cache)                             // 每个 KV 对
+        >> concurrent()                                   // 并发路由到 index scheduler
+        >> then([](key_value& kv) { return index::update(kv.file); })
+        >> flat() >> reduce()
+        >> then([](bool ok) { if (!ok) throw update_index_failed(); });
+}
+
+auto write_data(write_span_list& list) {
+    return for_each(list.spans)                           // 每个 span
+        >> concurrent()                                   // 并发提交到 nvme scheduler
+        >> nvme::then_put_span()
+        >> all([](write_span& s) { return s.all_wrote(); });
+}
+```
+
+跨域数据流：
+
+```
+batch scheduler           分配版本号
+       ↓
+index scheduler × N       并发更新索引（for_each + concurrent）
+       ↓
+fs scheduler               Leader/Follower 合并分配页面 → variant<leader*, follower, failed>
+       ↓
+    ┌──┴──────────────────┐
+    │ leader              │ follower
+    ↓                     ↓
+nvme scheduler × M       （等待 leader 通知）
+    │ 并发 DMA 写数据
+    ↓
+fs scheduler               写元数据（嵌套 Leader/Follower）
+    ↓
+nvme scheduler × P         并发 DMA 写元数据
+    │
+    ├── notify_follower ──→ follower 继续
+    ↓                     ↓
+index scheduler × N        并发缓存数据
+```
+
+30 行代码，5 次跨域跳转，体现了 Pump 的核心优势：
+
+- **声明式编排** — 读起来就是自上而下的线性流程，没有回调地狱和状态机
+- **零锁并发** — 每个 scheduler 单线程运行，跨域通信走 per-core SPSC 队列，无 CAS 竞争
+- **编译期类型安全** — `if constexpr` 分支在编译时展开，Op 平铺到 `std::tuple`，零虚函数开销
+- **结构化异常安全** — `ignore_all_exception()` + cache 构成类 RAII 保证，异常路径编译期可见
+- **Scheduler = 单线程状态容器** — Leader/Follower 合并写在 `handle()` 中，就是普通顺序代码
+
+完整代码见 `apps/kv/`。
 
 ## 核心机制
 
 ### Sender 与 Pipeline
 
-Sender 是一个延迟操作的描述。它不执行任何动作，直到被 `submit` 启动。
+Sender 描述一个延迟操作，直到 `submit` 才执行。`>>` 串联多个 Sender 成 Pipeline，`connect()` 时所有 Op 展平到一个 `std::tuple` 中——扁平数组，不是递归嵌套。tuple 大小编译期确定。
 
-`>>` 把多个 Sender 串联成 Pipeline。Pipeline 被连接（connect）时，所有 Sender 的 Op 被展平到一个 `std::tuple` 中——不是递归嵌套，是扁平数组。这个 tuple 的大小在编译期就确定了。
+### OpPusher：位置驱动执行
 
-### OpPusher：位置驱动的执行引擎
+Pump 和 stdexec 的根本区别。stdexec 用递归 Receiver 模型，每层操作嵌套调用 `set_value`。Pump 用编译期位置索引：`push_value<pos>` 直接跳到 `pos+1`，在扁平 tuple 上线性推进。
 
-这是 Pump 和 stdexec 最根本的区别。
-
-stdexec 用递归 Receiver 模型：每个操作完成后调用下一个 Receiver 的 `set_value`，形成深层嵌套的调用栈。Pump 的 OpPusher 用编译期位置索引：`push_value<pos>` 直接跳到 `pos+1` 的操作，整个执行过程在一个扁平 tuple 上线性推进。
-
-这带来三个好处：
 - 没有递归深度问题，长流水线不会栈溢出
 - 缓存局部性好，所有 Op 在连续内存中
-- 支持跳转和回滚——`repeat`、异常恢复等控制流只需调整位置索引
+- 支持跳转和回滚——`repeat`、异常恢复只需调整位置索引
 
-OpPusher 传播四种信号：
-- `push_value` — 正常值向下传递
-- `push_exception` — 异常向下传播，直到被 `any_exception` 捕获
-- `push_skip` — 跳过当前元素（用于 `maybe` 等条件算子）
-- `push_done` — 流结束
+四种信号：`push_value`（值传递）、`push_exception`（异常传播）、`push_skip`（跳过元素）、`push_done`（流结束）。
 
 ### Context：栈式上下文
 
-在复杂流水线中，多个步骤需要访问同一份状态。传统做法是在每个 lambda 的参数列表中传递，Pump 用类型化的上下文栈解决这个问题：
+跨多个步骤传递状态，不需要逐层 lambda 捕获：
 
 ```cpp
 just()
     >> push_context(std::make_shared<MyState>())
     >> get_context<std::shared_ptr<MyState>>()
-    >> then([](std::shared_ptr<MyState>& state) {
-        state->update();
-    })
+    >> then([](std::shared_ptr<MyState>& state) { state->update(); })
     >> pop_context()
     >> submit(context);
 ```
 
-`push_context` 压栈，`get_context<T>` 按类型查找并追加到当前值列表，`pop_context` 弹栈。对称使用，生命周期由栈管理。
+## 调度层
+
+Share-Nothing 架构：每个调度器实例单线程运行，无内部同步。多核通过每核独立实例实现，线程内循环 `advance()` 驱动。
+
+| 调度器 | 用途 |
+|--------|------|
+| **Task** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
+| **TCP** | TCP 网络 IO（io_uring / epoll） |
+| **UDP** | UDP 数据报（io_uring / epoll / DPDK） |
+| **KCP** | 可靠 UDP（io_uring / DPDK） |
+| **NVMe** | SPDK 零拷贝磁盘 IO |
+| **RPC** | 轻量 RPC，transport trait 支持 TCP/KCP/自定义协议 |
 
 ## 算子速查
 
-### 起点与终点
+### 变换与流控
 | 算子 | 作用 |
 |------|------|
-| `just(v...)` | 创建携带初始值的 Sender |
-| `submit(context)` | 启动 Pipeline 执行 |
-
-### 变换
-| 算子 | 作用 |
-|------|------|
-| `then(f)` | 同步变换：`f(上游值) -> 下游值` |
-| `transform(f)` | 同 `then` |
-| `flat_map(f)` | `f` 返回一个新 Sender，展平后继续执行 |
-| `flat()` | 上游值本身是 Sender 时，展平执行 |
+| `just(v...)` | 起始值 |
+| `submit(ctx)` | 启动执行 |
+| `then(f)` / `transform(f)` | 同步变换 |
+| `flat_map(f)` | f 返回 Sender，展平执行 |
+| `flat()` | 展平上游 Sender |
+| `on(sender)` | 切换执行域 |
 
 ### 流式处理
 | 算子 | 作用 |
 |------|------|
-| `for_each(range)` | 将 range 的每个元素作为独立的流元素发射 |
-| `for_each_by_args()` | 将上游容器拆成流 |
-| `as_stream()` | `for_each` 的别名（`generate.hh`） |
-| `repeat(n)` | 产生 n 个流元素（值为 0..n-1） |
-| `forever()` | 无限流 |
-| `reduce()` | 收集流的所有元素到容器 |
-| `count()` | 统计流元素个数 |
-| `all()` | 等待所有流元素完成，返回 bool（全部成功则 true） |
+| `for_each(range)` / `as_stream()` | 将 range 流式化 |
+| `repeat(n)` / `forever()` | 重复 n 次 / 无限流 |
+| `concurrent(max)` | 声明并发（需配合调度器） |
+| `sequential()` | 收束为串行 |
+| `reduce()` / `all()` / `count()` | 聚合流元素 |
 
-### 并发控制
+### 分支与条件
 | 算子 | 作用 |
 |------|------|
-| `concurrent(max)` | 声明最大并发数。**必须配合调度器使用才有真正并发。** |
-| `sequential()` | 将并发流收束为串行流 |
-| `on(sender)` | 将当前值转移到另一个 Sender 上执行（通常是调度器 Sender） |
+| `visit()` | 运行时类型 → 编译期分支（bool/variant/T*） |
+| `maybe()` / `maybe_not()` | optional 解包 / 反向 |
+| `when_skipped(f)` | 处理跳过信号 |
+| `when_all(...)` / `when_any(...)` | 并行等待 / 竞争 |
 
-### 条件与分支
+### 异常与协程
 | 算子 | 作用 |
 |------|------|
-| `maybe()` | `optional<T>` 有值时解包继续，无值时跳过 |
-| `maybe_not()` | 与 `maybe` 相反 |
-| `when_skipped(f)` | 处理跳过信号，`f` 返回新 Sender 作为替代路径 |
-| `visit(...)` | 将运行时类型（`bool`/`variant`/`T*`）提升为编译期分支，配合 `if constexpr` 使用 |
-
-### 聚合
-| 算子 | 作用 |
-|------|------|
-| `when_all(s1, s2, ...)` | 并行执行多个 Sender，收集所有结果 |
-| `when_any(s1, s2, ...)` | 并行执行，第一个完成的胜出 |
-
-### 异常处理
-| 算子 | 作用 |
-|------|------|
-| `any_exception(f)` | 捕获所有异常，`f(exception_ptr)` 返回恢复 Sender |
+| `any_exception(f)` | 捕获所有异常，f 返回恢复 Sender |
 | `catch_exception<T>(f)` | 按类型捕获 |
-| `ignore_all_exception()` | 吞掉所有异常，继续执行 |
-
-### 协程桥接
-| 算子 | 作用 |
-|------|------|
-| `await_able(context)` | 将 Sender 转为 `co_await` 对象 |
-
-## 调度层
-
-Pump 采用 Share-Nothing 架构：每个调度器实例只在一个线程上运行，不需要任何内部同步。多核并行通过每个核心持有独立的调度器实例实现，线程内循环调用 `advance()` 驱动所有调度器。
-
-| 调度器 | 用途 |
-|--------|------|
-| **Task Scheduler** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
-| **Net Scheduler** | 网络 IO，支持 io_uring（推荐）、epoll 和 DPDK 三个后端 |
-| **NVMe Scheduler** | 集成 SPDK 的零拷贝磁盘 IO，以页为单位操作 |
-| **RPC** | 基于 Net Scheduler 的轻量 RPC 框架，支持 pipelining 和并发服务端 |
-
-完整示例见 `apps/example/`（echo server、rpc、并发控制等）。
+| `ignore_all_exception()` | 吞异常继续执行 |
+| `await_able(ctx)` | Sender → `co_await` |
 
 ## 项目结构
 
 ```
 src/pump/
-  core/           # 核心抽象：op_pusher, context, scope, op_tuple_builder
-  sender/         # 算子实现：just, then, for_each, concurrent, visit 等
-  coro/           # 协程支持：return_yields, await_able
+  core/           # op_pusher, context, scope, op_tuple_builder
+  sender/         # just, then, for_each, concurrent, visit ...
+  coro/           # return_yields, await_able
 
 src/env/
   scheduler/
-    task/         # 任务调度器 + 定时器
+    task/         # 任务调度 + 定时器
     dgram/        # 数据报传输层（io_uring / epoll / DPDK）
-    udp/          # UDP 调度器（io_uring / epoll / DPDK 三后端）
-    kcp/          # KCP 调度器（io_uring / DPDK 两后端）
-    tcp/          # TCP 调度器（io_uring / epoll）
-    nvme/         # NVMe 调度器（SPDK）
-    rpc/          # RPC 框架（client/server，transport trait 支持 TCP/KCP）
+    udp/          # UDP（io_uring / epoll / DPDK）
+    kcp/          # KCP（io_uring / DPDK）
+    tcp/          # TCP（io_uring / epoll）
+    nvme/         # NVMe（SPDK）
+    rpc/          # RPC（transport trait: TCP / KCP）
   runtime/        # Share-Nothing 多核运行时
 
 apps/
-  example/
-    hello_world/  # 基础用法：just, then, for_each, context, exception, coroutine
-    echo/         # 网络 Echo（UDP/KCP/TCP × io_uring/epoll，CLI 选择）
-    dpdk/         # DPDK Echo（UDP/KCP over DPDK TAP，含 Python 测试脚本）
-    concurrent/   # 并发控制测试
-    share_nothing/# 多核并发测试
-    coro/         # 协程桥接
-    nvme/         # NVMe 调度器示例
-    rpc/          # RPC 示例
-  test/           # 测试（sequential, when_any）
-  kv/             # 基于 Pump 的高性能 KV 存储
+  example/        # hello_world, echo, rpc, concurrent, coro, nvme, dpdk
+  test/           # sequential, when_any
+  kv/             # 高性能 KV 存储（展示完整 scheduler 协作）
 ```
