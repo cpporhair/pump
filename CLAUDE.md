@@ -108,23 +108,19 @@ check() >> visit() >> then([](auto flag){
         return handle_false();
 }) >> flat();
 
-// RPC 服务端（默认 TCP transport）
-rpc::serv<service::type::sub, service::type::add>(tcp_scheduler, session_id)
+// RPC 服务端（session-only，scheduler 类型自动推导）
+rpc::serv<service::type::sub, service::type::add>(session)
     >> submit(ctx);
 
-// RPC 客户端（默认 TCP transport）
-rpc::call<service::type::add>(tcp_scheduler, session_id, 10, 20)
+// RPC 客户端（session-only，call 是 bind_back，需 just() >> 前缀）
+just() >> rpc::call<service::type::add>(session, 10, 20)
     >> then([](auto res) { use(res.v); })
     >> submit(ctx);
 
-// RPC 显式指定 transport（用于 KCP/QUIC 等可靠协议）
-rpc::serv<kcp_transport, service::type::add>(kcp_scheduler, conv_id) >> submit(ctx);
-rpc::call<kcp_transport, service::type::add>(kcp_scheduler, conv_id, 10, 20);
-
 // RPC 并发调用（同一 session 上 pipelining）
 for_each(requests) >> concurrent(N)
-    >> flat_map([sche, sid](auto&& args) {
-        return rpc::call<service::type::add>(sche, sid, args.a, args.b);
+    >> flat_map([session](auto&& args) {
+        return just() >> rpc::call<service::type::add>(session, args.a, args.b);
     }) >> reduce();
 
 // UDP 收发（帧同步/实时流等场景，非 RPC）
@@ -177,12 +173,14 @@ udp::send(sche, ep, data, len) >> then([](bool ok) { ... });
 | `pop_context()` | 出栈 | `pump/sender/pop_context.hh` |
 | `with_context(v)(bb)` | 作用域context | `pump/sender/pop_context.hh` |
 | `await_able()` / `await_able(ctx)` | 协程桥接 | `pump/sender/await_sender.hh` |
-| `rpc::serv<ids...>(sche, sid)` | RPC服务端（默认TCP transport） | `env/scheduler/rpc/rpc.hh` |
-| `rpc::serv<transport, ids...>(sche, addr)` | RPC服务端（显式transport） | `env/scheduler/rpc/rpc.hh` |
-| `rpc::call<id>(sche, sid, args...)` | RPC客户端（默认TCP transport） | `env/scheduler/rpc/rpc.hh` |
-| `rpc::call<transport, id>(sche, addr, args...)` | RPC客户端（显式transport） | `env/scheduler/rpc/rpc.hh` |
-| `udp::recv(sche)` | UDP接收→(datagram, endpoint) | `env/scheduler/udp/udp.hh` |
-| `udp::send(sche, ep, data, len)` | UDP发送→bool | `env/scheduler/udp/udp.hh` |
+| `rpc::serv<ids...>(session)` | RPC服务端（session-only） | `env/scheduler/net/rpc/rpc.hh` |
+| `rpc::call<id>(session, args...)` | RPC客户端（bind_back，需`just() >>`） | `env/scheduler/net/rpc/rpc.hh` |
+| `tcp::recv(session)` | TCP接收→net_frame | `env/scheduler/net/tcp/tcp.hh` |
+| `tcp::send(session, data, len)` | TCP发送→bool | `env/scheduler/net/tcp/tcp.hh` |
+| `kcp::recv(session)` | KCP接收→net_frame | `env/scheduler/net/kcp/kcp.hh` |
+| `kcp::send(session, data, len)` | KCP发送→bool | `env/scheduler/net/kcp/kcp.hh` |
+| `udp::recv(sche)` | UDP接收→(datagram, endpoint) | `env/scheduler/net/udp/udp.hh` |
+| `udp::send(sche, ep, data, len)` | UDP发送→bool | `env/scheduler/net/udp/udp.hh` |
 
 ### Core / Coro 头文件
 | API | 路径 |
@@ -277,20 +275,23 @@ struct compute_sender_type<ctx_t, my_app::_my_op::sender<sched_t>> {
 |------|------|
 | Task Scheduler（含preemptive_scheduler） | `env/scheduler/task/tasks_scheduler.hh` |
 | NVMe Scheduler | `env/scheduler/nvme/scheduler.hh` |
-| TCP Scheduler | `env/scheduler/tcp/*` |
-| UDP Scheduler（io_uring / epoll / dpdk） | `env/scheduler/udp/io_uring/scheduler.hh`, `env/scheduler/udp/epoll/scheduler.hh`, `env/scheduler/udp/dpdk/scheduler.hh` |
-| KCP Scheduler（io_uring / dpdk） | `env/scheduler/kcp/scheduler.hh`, `env/scheduler/kcp/dpdk/scheduler.hh` |
-| dgram Transport（io_uring / epoll / dpdk） | `env/scheduler/dgram/io_uring.hh`, `env/scheduler/dgram/epoll.hh`, `env/scheduler/dgram/dpdk.hh` |
-| RPC Scheduler | `env/scheduler/rpc/*` |
-| RPC Transport Trait（TCP默认） | `env/scheduler/rpc/transport/tcp.hh` |
-| 共享帧类型 | `env/common/frame.hh`（`pump::common::net_frame`） |
+| TCP Scheduler | `env/scheduler/net/tcp/*` |
+| TCP Layers（tcp_bind, tcp_ring_buffer） | `env/scheduler/net/tcp/common/layers.hh` |
+| UDP Scheduler（io_uring / epoll / dpdk） | `env/scheduler/net/udp/io_uring/scheduler.hh`, `env/scheduler/net/udp/epoll/scheduler.hh`, `env/scheduler/net/udp/dpdk/scheduler.hh` |
+| KCP Scheduler（io_uring / epoll / dpdk） | `env/scheduler/net/kcp/io_uring/scheduler.hh`, `env/scheduler/net/kcp/epoll/scheduler.hh`, `env/scheduler/net/kcp/dpdk/scheduler.hh` |
+| dgram Transport（io_uring / epoll / dpdk） | `env/scheduler/net/dgram/io_uring.hh`, `env/scheduler/net/dgram/epoll.hh`, `env/scheduler/net/dgram/dpdk.hh` |
+| RPC | `env/scheduler/net/rpc/*` |
+| Session 组合 | `env/scheduler/net/common/session.hh`（`pump::scheduler::net::session_t`） |
+| 共享帧类型 | `env/scheduler/net/common/frame.hh`（`pump::scheduler::net::net_frame`） |
+| 共享 send/recv sender | `env/scheduler/net/common/send_sender.hh`, `env/scheduler/net/common/recv_sender.hh` |
+| Frame Receiver Layer | `env/scheduler/net/common/frame_receiver.hh` |
 | Runtime（runtime_schedulers, any_scheduler） | `env/runtime/runner.hh` |
 | Share-Nothing Runner | `env/runtime/share_nothing.hh` |
 | op_pusher基类 | `pump/core/op_pusher.hh` |
 | compute_sender_type | `pump/core/compute_sender_type.hh` |
 | op_list_builder | `pump/core/op_tuple_builder.hh` |
 
-参考实现：`src/env/scheduler/task/tasks_scheduler.hh`, `apps/kv/batch/scheduler.hh`, `src/env/scheduler/rpc/client/trigger.hh`（轻量自定义scheduler示例）
+参考实现：`src/env/scheduler/task/tasks_scheduler.hh`, `apps/kv/batch/scheduler.hh`, `src/env/scheduler/net/rpc/client/trigger.hh`（轻量自定义scheduler示例）
 
 ---
 

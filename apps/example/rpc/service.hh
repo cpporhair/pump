@@ -11,7 +11,7 @@
 #include <thread>
 
 #include "env/runtime/runner.hh"
-#include "env/scheduler/rpc/common/struct.hh"
+#include "env/scheduler/net/rpc/common/struct.hh"
 #include "env/scheduler/task/tasks_scheduler.hh"
 
 namespace apps::rpc::service {

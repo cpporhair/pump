@@ -1,9 +1,26 @@
 
 #pragma once
 
-#include "env/scheduler/kcp/kcp.hh"
-#include "env/scheduler/kcp/io_uring/scheduler.hh"
-#include "env/scheduler/kcp/epoll/scheduler.hh"
+#include "env/scheduler/net/kcp/kcp.hh"
+#include "env/scheduler/net/kcp/io_uring/scheduler.hh"
+#include "env/scheduler/net/kcp/epoll/scheduler.hh"
+#include "env/scheduler/net/common/session.hh"
+
+struct kcp_echo_factory {
+    template<typename sched_t>
+    using session_type = pump::scheduler::net::session_t<
+        kcp::common::kcp_bind<sched_t>,
+        pump::scheduler::net::frame_receiver
+    >;
+
+    template<typename sched_t>
+    static auto* create(kcp::common::conv_id_t conv, sched_t* sche) {
+        return new session_type<sched_t>(
+            kcp::common::kcp_bind<sched_t>(conv, sche),
+            pump::scheduler::net::frame_receiver()
+        );
+    }
+};
 
 template <typename sched_t>
 static void run_kcp_echo_impl() {
@@ -18,20 +35,23 @@ static void run_kcp_echo_impl() {
         return;
     }
 
+    using session_t = typename sched_t::address_type;
+
     // Server: accept → per-connection echo loop
     just()
         >> forever()
         >> flat_map([server](auto&&...) { return kcp::accept(server); })
-        >> then([server](kcp::common::conv_id_t conv) {
-            printf("server: new connection conv=%u\n", conv.value);
+        >> then([](session_t session) {
+            printf("server: new connection conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
             just()
                 >> forever()
-                >> flat_map([server, conv](auto&&...) { return kcp::recv(server, conv); })
-                >> flat_map([server, conv](pump::common::net_frame&& frame) {
+                >> flat_map([session](auto&&...) { return kcp::recv(session); })
+                >> flat_map([session](pump::scheduler::net::net_frame&& frame) {
                     printf("server: echo %u bytes\n", frame.size());
                     auto len = frame.size();
                     auto* data = frame.release();
-                    return kcp::send(server, conv, data, len);
+                    return kcp::send(session, data, len);
                 })
                 >> then([](bool ok) { if (!ok) printf("server: send failed\n"); })
                 >> reduce()
@@ -45,18 +65,19 @@ static void run_kcp_echo_impl() {
         >> flat_map([client, port](auto&&...) {
             return kcp::connect(client, "127.0.0.1", port);
         })
-        >> flat_map([client](kcp::common::conv_id_t conv) {
-            printf("client: connected conv=%u\n", conv.value);
+        >> flat_map([](session_t session) {
+            printf("client: connected conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
             return just()
                 >> loop(5)
-                >> flat_map([client, conv](size_t i) {
+                >> flat_map([session](size_t i) {
                     auto* buf = new char[sizeof(int)];
                     *reinterpret_cast<int*>(buf) = static_cast<int>(i);
-                    return kcp::send(client, conv, buf, sizeof(int))
-                        >> flat_map([client, conv](auto&&...) {
-                            return kcp::recv(client, conv);
+                    return kcp::send(session, buf, sizeof(int))
+                        >> flat_map([session](auto&&...) {
+                            return kcp::recv(session);
                         })
-                        >> then([i](pump::common::net_frame&& frame) {
+                        >> then([i](pump::scheduler::net::net_frame&& frame) {
                             int v = *reinterpret_cast<const int*>(frame.data());
                             printf("client: sent %zu, got back %d\n", i, v);
                         });
@@ -80,10 +101,10 @@ static void run_kcp_echo_impl() {
 
 static void run_kcp_echo(bool epoll) {
     using uring_t = kcp::io_uring::scheduler<
-        kcp::senders::recv::op, kcp::senders::send::op,
+        kcp_echo_factory,
         kcp::senders::accept::op, kcp::senders::connect::op>;
     using epoll_t = kcp::epoll::scheduler<
-        kcp::senders::recv::op, kcp::senders::send::op,
+        kcp_echo_factory,
         kcp::senders::accept::op, kcp::senders::connect::op>;
 
     printf("KCP echo (%s)\n", epoll ? "epoll" : "io_uring");

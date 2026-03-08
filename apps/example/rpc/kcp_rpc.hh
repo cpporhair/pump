@@ -10,21 +10,41 @@
 #include "pump/sender/submit.hh"
 #include "pump/sender/any_exception.hh"
 
-#include "env/scheduler/kcp/kcp.hh"
-#include "env/scheduler/kcp/io_uring/scheduler.hh"
-#include "env/scheduler/kcp/epoll/scheduler.hh"
-#include "env/scheduler/kcp/transport.hh"
-#include "env/scheduler/rpc/rpc.hh"
+#include "env/scheduler/net/kcp/kcp.hh"
+#include "env/scheduler/net/common/session.hh"
+#include "env/scheduler/net/kcp/io_uring/scheduler.hh"
+#include "env/scheduler/net/kcp/epoll/scheduler.hh"
+#include "env/scheduler/net/rpc/rpc.hh"
+#include "env/scheduler/net/rpc/common/rpc_layer.hh"
 
 #include "./service.hh"
+
+// KCP session factory with rpc_session_layer for RPC use
+struct kcp_rpc_factory {
+    template<typename sched_t>
+    using session_type = pump::scheduler::net::session_t<
+        pump::scheduler::kcp::common::kcp_bind<sched_t>,
+        pump::scheduler::rpc::rpc_session_layer,
+        pump::scheduler::net::frame_receiver
+    >;
+
+    template<typename sched_t>
+    static auto* create(pump::scheduler::kcp::common::conv_id_t conv, sched_t* sche) {
+        return new session_type<sched_t>(
+            pump::scheduler::kcp::common::kcp_bind<sched_t>(conv, sche),
+            pump::scheduler::rpc::rpc_session_layer(),
+            pump::scheduler::net::frame_receiver()
+        );
+    }
+};
 
 template <typename kcp_sched_t>
 static void run_kcp_rpc_impl() {
     using namespace pump::sender;
     namespace kcp = pump::scheduler::kcp;
     namespace rpc = pump::scheduler::rpc;
-    using kcp_transport = rpc::transport::kcp;
     using service_type = apps::rpc::service::type;
+    using session_t = typename kcp_sched_t::address_type;
 
     constexpr uint16_t port = 19300;
 
@@ -41,14 +61,17 @@ static void run_kcp_rpc_impl() {
     just()
         >> forever()
         >> flat_map([server](auto&&...) { return kcp::accept(server); })
-        >> then([server](kcp::common::conv_id_t conv) {
-            printf("server: accepted conv=%u\n", conv.value);
-            just() >> rpc::serv<kcp_transport, service_type::sub, service_type::add>(server, conv)
-                >> then([conv]() {
-                    printf("server: session conv=%u ended\n", conv.value);
+        >> then([](session_t session) {
+            printf("server: accepted conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
+            just() >> rpc::serv<service_type::sub, service_type::add>(session)
+                >> then([session]() {
+                    printf("server: session conv=%u ended\n",
+                        session->invoke(kcp::common::get_conv).value);
                 })
-                >> any_exception([conv](std::exception_ptr) {
-                    printf("server: session conv=%u error\n", conv.value);
+                >> any_exception([session](std::exception_ptr) {
+                    printf("server: session conv=%u error\n",
+                        session->invoke(kcp::common::get_conv).value);
                     return just();
                 })
                 >> submit(pump::core::make_root_context());
@@ -61,14 +84,15 @@ static void run_kcp_rpc_impl() {
         >> flat_map([client, port](auto&&...) {
             return kcp::connect(client, "127.0.0.1", port);
         })
-        >> flat_map([client](kcp::common::conv_id_t conv) {
-            printf("client: connected conv=%u\n", conv.value);
+        >> flat_map([](session_t session) {
+            printf("client: connected conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
             return just()
                 >> loop(5)
-                >> flat_map([client, conv](size_t i) {
+                >> flat_map([session](size_t i) {
                     return just()
-                        >> rpc::call<kcp_transport, service_type::add>(
-                            client, conv, static_cast<int>(i), 10)
+                        >> rpc::call<service_type::add>(
+                            session, static_cast<int>(i), 10)
                         >> then([i](auto&& res) {
                             printf("client: %zu + 10 = %d\n", i, res.v);
                         });
@@ -91,13 +115,11 @@ static void run_kcp_rpc_impl() {
 
 static void run_kcp_rpc(bool epoll) {
     using uring_t = pump::scheduler::kcp::io_uring::scheduler<
-        pump::scheduler::kcp::senders::recv::op,
-        pump::scheduler::kcp::senders::send::op,
+        kcp_rpc_factory,
         pump::scheduler::kcp::senders::accept::op,
         pump::scheduler::kcp::senders::connect::op>;
     using epoll_t = pump::scheduler::kcp::epoll::scheduler<
-        pump::scheduler::kcp::senders::recv::op,
-        pump::scheduler::kcp::senders::send::op,
+        kcp_rpc_factory,
         pump::scheduler::kcp::senders::accept::op,
         pump::scheduler::kcp::senders::connect::op>;
 

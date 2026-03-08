@@ -155,8 +155,9 @@ while (running) {
 | 核心 | `src/pump/core/*` | context, scope, op_pusher, compute_sender_type |
 | Sender | `src/pump/sender/*` | 所有算子实现 |
 | 协程 | `src/pump/coro/*` | task\<T\>, generator\<T\> |
-| Scheduler | `src/env/scheduler/*` | task / nvme / tcp / udp / rpc |
-| 共享类型 | `src/env/common/*` | net_frame 等传输无关类型 |
+| 非网络 Scheduler | `src/env/scheduler/task/`, `src/env/scheduler/nvme/` | task / nvme |
+| 网络 Scheduler | `src/env/scheduler/net/*` | tcp / udp / kcp / dgram / rpc |
+| 网络公共 | `src/env/scheduler/net/common/*` | session, frame, send/recv sender, frame_receiver |
 | 运行时 | `src/env/runtime/*` | share_nothing 多核运行 |
 | KV 应用 | `apps/kv/*` | 完整应用示例 |
 | 示例 | `apps/example/*` | hello / echo / concurrent / rpc 等 |

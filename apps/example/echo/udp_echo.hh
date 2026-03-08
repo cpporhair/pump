@@ -9,9 +9,9 @@
 #include "pump/sender/repeat.hh"
 #include "pump/sender/submit.hh"
 
-#include "env/scheduler/udp/udp.hh"
-#include "env/scheduler/udp/io_uring/scheduler.hh"
-#include "env/scheduler/udp/epoll/scheduler.hh"
+#include "env/scheduler/net/udp/udp.hh"
+#include "env/scheduler/net/udp/io_uring/scheduler.hh"
+#include "env/scheduler/net/udp/epoll/scheduler.hh"
 
 using namespace pump::sender;
 using namespace pump::scheduler;

@@ -230,6 +230,11 @@ namespace pump::core {
             ~queue() = default;
             queue(const queue&) = delete;
             queue& operator=(const queue&) = delete;
+            queue(queue&& rhs) noexcept : head_(rhs.head_), tail_(rhs.tail_) {
+                for (size_t i = 0; i < CAPACITY; ++i) buffer_[i] = std::move(rhs.buffer_[i]);
+                rhs.head_ = 0; rhs.tail_ = 0;
+            }
+            queue& operator=(queue&&) = delete;
 
             bool try_enqueue(T&& value) noexcept {
                 size_t next = (tail_ + 1) & MASK;

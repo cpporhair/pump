@@ -14,18 +14,36 @@
 #include "pump/sender/repeat.hh"
 #include "pump/sender/submit.hh"
 
-#include "env/scheduler/dgram/dpdk.hh"
-#include "env/scheduler/udp/udp.hh"
-#include "env/scheduler/udp/dpdk/scheduler.hh"
-#include "env/scheduler/kcp/kcp.hh"
-#include "env/scheduler/kcp/dpdk/scheduler.hh"
+#include "env/scheduler/net/dgram/dpdk.hh"
+#include "env/scheduler/net/udp/udp.hh"
+#include "env/scheduler/net/udp/dpdk/scheduler.hh"
+#include "env/scheduler/net/kcp/kcp.hh"
+#include "env/scheduler/net/kcp/dpdk/scheduler.hh"
+#include "env/scheduler/net/common/session.hh"
 
 using namespace pump::sender;
 using namespace pump::scheduler;
 
 using udp_sched_t = udp::dpdk::scheduler<udp::senders::recv::op, udp::senders::send::op>;
+
+struct kcp_echo_factory {
+    template<typename sched_t>
+    using session_type = pump::scheduler::net::session_t<
+        kcp::common::kcp_bind<sched_t>,
+        pump::scheduler::net::frame_receiver
+    >;
+
+    template<typename sched_t>
+    static auto* create(kcp::common::conv_id_t conv, sched_t* sche) {
+        return new session_type<sched_t>(
+            kcp::common::kcp_bind<sched_t>(conv, sche),
+            pump::scheduler::net::frame_receiver()
+        );
+    }
+};
+
 using kcp_sched_t = kcp::dpdk::scheduler<
-    kcp::senders::recv::op, kcp::senders::send::op,
+    kcp_echo_factory,
     kcp::senders::accept::op, kcp::senders::connect::op>;
 
 static volatile bool g_running = true;
@@ -114,16 +132,17 @@ static void run_kcp_server(dgram::dpdk::dpdk_config cfg, uint16_t port) {
     just()
         >> forever()
         >> flat_map([sche](auto&&...) { return kcp::accept(sche); })
-        >> then([sche](kcp::common::conv_id_t conv) {
-            printf("server: new connection conv=%u\n", conv.value);
+        >> then([](kcp_sched_t::address_type session) {
+            printf("server: new connection conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
             just()
                 >> forever()
-                >> flat_map([sche, conv](auto&&...) { return kcp::recv(sche, conv); })
-                >> flat_map([sche, conv](pump::common::net_frame&& frame) {
+                >> flat_map([session](auto&&...) { return kcp::recv(session); })
+                >> flat_map([session](pump::scheduler::net::net_frame&& frame) {
                     printf("server: echo %u bytes\n", frame.size());
                     auto len = frame.size();
                     auto* data = frame.release();
-                    return kcp::send(sche, conv, data, len);
+                    return kcp::send(session, data, len);
                 })
                 >> then([](bool ok) { if (!ok) printf("server: send failed\n"); })
                 >> reduce()
@@ -156,18 +175,19 @@ static void run_kcp_client(dgram::dpdk::dpdk_config cfg,
         >> flat_map([sche, server_ip, server_port](auto&&...) {
             return kcp::connect(sche, server_ip, server_port);
         })
-        >> flat_map([sche, count](kcp::common::conv_id_t conv) {
-            printf("client: connected conv=%u\n", conv.value);
+        >> flat_map([count](kcp_sched_t::address_type session) {
+            printf("client: connected conv=%u\n",
+                session->invoke(kcp::common::get_conv).value);
             return just()
                 >> loop(count)
-                >> flat_map([sche, conv](size_t i) {
+                >> flat_map([session](size_t i) {
                     auto* buf = new char[sizeof(int)];
                     *reinterpret_cast<int*>(buf) = static_cast<int>(i);
-                    return kcp::send(sche, conv, buf, sizeof(int))
-                        >> flat_map([sche, conv](auto&&...) {
-                            return kcp::recv(sche, conv);
+                    return kcp::send(session, buf, sizeof(int))
+                        >> flat_map([session](auto&&...) {
+                            return kcp::recv(session);
                         })
-                        >> then([i](pump::common::net_frame&& frame) {
+                        >> then([i](pump::scheduler::net::net_frame&& frame) {
                             int v = *reinterpret_cast<const int*>(frame.data());
                             printf("client: sent %zu, got back %d\n", i, v);
                         });

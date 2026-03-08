@@ -140,9 +140,9 @@ Share-Nothing 架构：每个调度器实例单线程运行，无内部同步。
 | **Task** | 通用任务调度与定时器，`on(sched->as_task())` 切换执行域 |
 | **TCP** | TCP 网络 IO（io_uring / epoll） |
 | **UDP** | UDP 数据报（io_uring / epoll / DPDK） |
-| **KCP** | 可靠 UDP（io_uring / DPDK） |
+| **KCP** | 可靠 UDP（io_uring / epoll / DPDK） |
 | **NVMe** | SPDK 零拷贝磁盘 IO |
-| **RPC** | 轻量 RPC，transport trait 支持 TCP/KCP/自定义协议 |
+| **RPC** | 轻量 RPC，session-only API，支持 TCP/KCP 等可靠协议 |
 
 ## 算子速查
 
@@ -192,12 +192,14 @@ src/pump/
 src/env/
   scheduler/
     task/         # 任务调度 + 定时器
-    dgram/        # 数据报传输层（io_uring / epoll / DPDK）
-    udp/          # UDP（io_uring / epoll / DPDK）
-    kcp/          # KCP（io_uring / DPDK）
-    tcp/          # TCP（io_uring / epoll）
     nvme/         # NVMe（SPDK）
-    rpc/          # RPC（transport trait: TCP / KCP）
+    net/          # 网络相关
+      common/     # session 组合、net_frame、通用 send/recv sender
+      tcp/        # TCP（io_uring / epoll）
+      udp/        # UDP（io_uring / epoll / DPDK）
+      kcp/        # KCP（io_uring / epoll / DPDK）
+      dgram/      # 数据报传输层（io_uring / epoll / DPDK）
+      rpc/        # RPC（session-only，支持 TCP / KCP）
   runtime/        # Share-Nothing 多核运行时
 
 apps/

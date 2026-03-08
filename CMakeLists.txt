@@ -12,9 +12,9 @@ find_package(PkgConfig REQUIRED)
 
 include(src/env/scheduler/nvme/nvme.cmake)
 
-include(src/env/scheduler/tcp/tcp.cmake)
+include(src/env/scheduler/net/tcp/tcp.cmake)
 
-include(src/env/scheduler/udp/udp.cmake)
+include(src/env/scheduler/net/udp/udp.cmake)
 
 # DPDK support
 pkg_check_modules(DPDK REQUIRED libdpdk)

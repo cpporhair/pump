@@ -1,9 +1,6 @@
 
 #pragma once
 
-#include <cstring>
-#include <chrono>
-
 #include "pump/sender/just.hh"
 #include "pump/sender/then.hh"
 #include "pump/sender/flat.hh"
@@ -14,36 +11,45 @@
 #include "pump/sender/any_exception.hh"
 
 #include "env/scheduler/net/tcp/tcp.hh"
+#include "env/scheduler/net/common/session.hh"
 #include "env/scheduler/net/tcp/io_uring/scheduler.hh"
 #include "env/scheduler/net/tcp/io_uring/connect_scheduler.hh"
 #include "env/scheduler/net/tcp/epoll/scheduler.hh"
 #include "env/scheduler/net/tcp/epoll/connect_scheduler.hh"
-#include "env/scheduler/net/common/session.hh"
+#include "env/scheduler/net/rpc/rpc.hh"
+#include "env/scheduler/net/rpc/common/rpc_layer.hh"
 
-using namespace pump::sender;
-namespace tcp = pump::scheduler::tcp;
+#include "./service.hh"
 
-struct echo_factory {
+struct tcp_rpc_factory {
     template<typename sched_t>
     using session_type = pump::scheduler::net::session_t<
-        tcp::common::tcp_bind<sched_t>,
-        tcp::common::tcp_ring_buffer<>,
+        pump::scheduler::tcp::common::tcp_bind<sched_t>,
+        pump::scheduler::tcp::common::tcp_ring_buffer<>,
+        pump::scheduler::rpc::rpc_session_layer,
         pump::scheduler::net::frame_receiver
     >;
 
     template<typename sched_t>
     static auto* create(int fd, sched_t* sche) {
         return new session_type<sched_t>(
-            tcp::common::tcp_bind<sched_t>(fd, sche),
-            tcp::common::tcp_ring_buffer<>(),
+            pump::scheduler::tcp::common::tcp_bind<sched_t>(fd, sche),
+            pump::scheduler::tcp::common::tcp_ring_buffer<>(),
+            pump::scheduler::rpc::rpc_session_layer(),
             pump::scheduler::net::frame_receiver()
         );
     }
 };
 
 template <typename accept_sched_t, typename connect_sched_t, typename session_sched_t>
-static void run_tcp_echo_impl() {
-    constexpr uint16_t port = 19100;
+static void run_tcp_rpc_impl() {
+    using namespace pump::sender;
+    namespace tcp = pump::scheduler::tcp;
+    namespace rpc = pump::scheduler::rpc;
+    using service_type = apps::rpc::service::type;
+    using session_t = typename session_sched_t::address_type;
+
+    constexpr uint16_t port = 8080;
 
     auto* accept_sched = new accept_sched_t();
     auto* connect_sched = new connect_sched_t();
@@ -66,14 +72,14 @@ static void run_tcp_echo_impl() {
         fprintf(stderr, "TCP connect init failed\n"); return;
     }
 
-    // Init session scheduler (epoll doesn't need init)
+    // Init session scheduler
     if constexpr (requires { session_sched->init(256u); }) {
         if (session_sched->init(256) < 0) {
             fprintf(stderr, "TCP session init failed\n"); return;
         }
     }
 
-    // Server: accept → create session → join → per-session echo loop
+    // Server: accept → join → serve RPC (add + sub) → stop
     just()
         >> forever()
         >> flat_map([accept_sched](...) {
@@ -81,88 +87,78 @@ static void run_tcp_echo_impl() {
         })
         >> then([session_sched](int fd) {
             printf("server: new connection fd=%d\n", fd);
-            auto* session = echo_factory::create(fd, session_sched);
+            auto* session = tcp_rpc_factory::create(fd, session_sched);
             tcp::join(session_sched, session)
-                >> flat_map([session_sched, session](...) {
-                    return just()
-                        >> forever()
-                        >> flat_map([session](...) {
-                            return tcp::recv(session);
-                        })
-                        >> flat_map([session](tcp::common::net_frame&& frame) {
-                            printf("server: echo %u bytes\n", frame.size());
-                            auto len = frame.size();
-                            return tcp::send(session, frame.release(), len);
-                        })
-                        >> reduce();
-                })
+                >> rpc::serv<service_type::sub, service_type::add>(session)
+                >> then([](auto&&...) { printf("server: session ended\n"); })
                 >> any_exception([](std::exception_ptr) {
-                    printf("server: session closed\n");
+                    printf("server: session error\n");
                     return just();
+                })
+                >> flat_map([session_sched, session]() {
+                    return tcp::stop(session_sched, session);
                 })
                 >> submit(pump::core::make_root_context());
         })
         >> reduce()
         >> submit(pump::core::make_root_context());
 
-    // Client: connect → create session → join → send → recv → stop
-    bool client_done = false;
+    // Client: connect → make RPC calls → stop
     just()
         >> flat_map([connect_sched, port](...) {
             return tcp::connect(connect_sched, "127.0.0.1", port);
         })
         >> flat_map([session_sched](int fd) {
             printf("client: connected fd=%d\n", fd);
-            auto* session = echo_factory::create(fd, session_sched);
+            auto* session = tcp_rpc_factory::create(fd, session_sched);
             return tcp::join(session_sched, session)
                 >> flat_map([session](...) {
-                    const char* msg = "hello from echo client";
-                    auto len = static_cast<uint32_t>(std::strlen(msg));
-                    auto* buf = new char[len];
-                    std::memcpy(buf, msg, len);
-                    return tcp::send(session, buf, len);
-                })
-                >> flat_map([session](...) {
-                    return tcp::recv(session);
-                })
-                >> then([](tcp::common::net_frame&& frame) {
-                    printf("client: got echo %u bytes\n", frame.size());
+                    return just()
+                        >> loop(5)
+                        >> flat_map([session](size_t i) {
+                            return just()
+                                >> rpc::call<service_type::add>(
+                                    session, static_cast<int>(i), 10)
+                                >> then([i](auto&& res) {
+                                    printf("client: %zu + 10 = %d\n", i, res.v);
+                                });
+                        })
+                        >> reduce();
                 })
                 >> flat_map([session_sched, session](...) {
                     return tcp::stop(session_sched, session);
                 });
         })
-        >> then([&client_done](auto&&...) { client_done = true; printf("client: all done\n"); })
-        >> any_exception([&client_done](std::exception_ptr e) {
-            client_done = true;
-            try { std::rethrow_exception(e); }
-            catch (const std::exception& ex) { fprintf(stderr, "client error: %s\n", ex.what()); }
-            return just();
-        })
+        >> then([](auto&&...) { printf("client: all done\n"); })
         >> submit(pump::core::make_root_context());
 
     auto start = std::chrono::steady_clock::now();
-    while (!client_done && std::chrono::steady_clock::now() - start < std::chrono::seconds(3)) {
+    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
         accept_sched->advance();
         connect_sched->advance();
         session_sched->advance();
     }
 
     printf("done\n");
+    delete accept_sched;
+    delete connect_sched;
+    delete session_sched;
 }
 
-static void run_tcp_echo(bool epoll) {
-    printf("TCP echo (%s)\n", epoll ? "epoll" : "io_uring");
+static void run_tcp_rpc(bool epoll) {
+    namespace tcp = pump::scheduler::tcp;
 
     if (epoll) {
         using accept_t = tcp::epoll::accept_scheduler<tcp::senders::conn::op>;
         using connect_t = tcp::epoll::connect_scheduler<tcp::senders::conn::op>;
-        using session_t = tcp::epoll::session_scheduler<echo_factory>;
-        run_tcp_echo_impl<accept_t, connect_t, session_t>();
+        using session_t = tcp::epoll::session_scheduler<tcp_rpc_factory>;
+        printf("TCP RPC (epoll)\n");
+        run_tcp_rpc_impl<accept_t, connect_t, session_t>();
     } else {
         using accept_t = tcp::io_uring::accept_scheduler<tcp::senders::conn::op>;
         using connect_t = tcp::io_uring::connect_scheduler<tcp::senders::conn::op>;
-        using session_t = tcp::io_uring::session_scheduler<echo_factory>;
-        run_tcp_echo_impl<accept_t, connect_t, session_t>();
+        using session_t = tcp::io_uring::session_scheduler<tcp_rpc_factory>;
+        printf("TCP RPC (io_uring)\n");
+        run_tcp_rpc_impl<accept_t, connect_t, session_t>();
     }
 }
