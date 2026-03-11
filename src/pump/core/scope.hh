@@ -2,10 +2,55 @@
 #define PUMP_CORE_SCOPE_HH
 
 #include <cstdint>
+#include <new>
 
 #include "./meta.hh"
 
 namespace pump::core {
+
+    // ================================================================
+    // scope_slab: thread_local free list pooling by size class
+    // ================================================================
+    constexpr size_t scope_size_class(size_t n) {
+        if (n <= 64) return 64;
+        if (n <= 128) return 128;
+        if (n <= 256) return 256;
+        if (n <= 512) return 512;
+        if (n <= 1024) return 1024;
+        if (n <= 2048) return 2048;
+        if (n <= 4096) return 4096;
+        return 0;
+    }
+
+    template<size_t SizeClass>
+    struct scope_slab {
+        struct node { node* next; };
+        static inline thread_local node* head = nullptr;
+        static inline thread_local uint64_t total_allocs = 0;
+        static inline thread_local uint64_t pool_hits = 0;
+
+        static void* alloc() {
+            total_allocs++;
+            if (head) {
+                pool_hits++;
+                auto* p = head;
+                head = p->next;
+                return p;
+            }
+            return ::operator new(SizeClass);
+        }
+
+        static void dealloc(void* p) {
+            auto* n = static_cast<node*>(p);
+            n->next = head;
+            head = n;
+        }
+
+        static void reset_stats() {
+            total_allocs = 0;
+            pool_hits = 0;
+        }
+    };
 
     // ================================================================
     // scope_ptr: trivially copyable raw pointer wrapper (no refcount)
@@ -75,6 +120,22 @@ namespace pump::core {
         root_scope(op_tuple_t&& opt)
             : op_tuple(__fwd__(opt)) {
         }
+
+        static void* operator new(size_t) {
+            constexpr auto sc = scope_size_class(sizeof(root_scope));
+            if constexpr (sc > 0)
+                return scope_slab<sc>::alloc();
+            else
+                return ::operator new(sizeof(root_scope));
+        }
+
+        static void operator delete(void* p) {
+            constexpr auto sc = scope_size_class(sizeof(root_scope));
+            if constexpr (sc > 0)
+                scope_slab<sc>::dealloc(p);
+            else
+                ::operator delete(p);
+        }
     };
 
     template <runtime_scope_type type, typename op_tuple_t, typename base_t>
@@ -111,6 +172,21 @@ namespace pump::core {
         ~runtime_scope() {
         }
 
+        static void* operator new(size_t) {
+            constexpr auto sc = scope_size_class(sizeof(runtime_scope));
+            if constexpr (sc > 0)
+                return scope_slab<sc>::alloc();
+            else
+                return ::operator new(sizeof(runtime_scope));
+        }
+
+        static void operator delete(void* p) {
+            constexpr auto sc = scope_size_class(sizeof(runtime_scope));
+            if constexpr (sc > 0)
+                scope_slab<sc>::dealloc(p);
+            else
+                ::operator delete(p);
+        }
     };
 
     template <runtime_scope_type scope_type,typename base_t, typename op_tuple_t>
