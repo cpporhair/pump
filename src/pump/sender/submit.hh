@@ -23,10 +23,8 @@ namespace pump::sender {
             constexpr
             decltype(auto)
             operator ()(sender_t &&sender, context_t context, receiver_t&& receiver) const{
-                using op_tuple_t = __typ__(sender.template connect<context_t>().push_back(__fwd__(receiver)).take());
-                auto new_scope = core::scope_ptr(new core::root_scope<op_tuple_t>(
-                    sender.template connect<context_t>().push_back(__fwd__(receiver)).take()
-                ));
+                auto op_data = sender.template connect<context_t>().push_back(__fwd__(receiver)).take();
+                auto new_scope = core::scope_ptr(new core::root_scope<decltype(op_data)>(__mov__(op_data)));
                 core::op_pusher<0, __typ__(new_scope)>::push_value(context, new_scope);
             }
 
