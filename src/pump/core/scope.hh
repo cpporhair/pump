@@ -10,45 +10,69 @@ namespace pump::core {
 
     // ================================================================
     // scope_slab: thread_local free list pooling by size class
+    //
+    // 可配置项（在 include scope.hh 之前 #define）：
+    //   PUMP_SCOPE_SLAB_ALIGN     — size class 对齐粒度（默认 64 字节）
+    //   PUMP_SCOPE_SLAB_MAX_SIZE  — 池化的最大 scope 大小（默认 4096，超过走系统 allocator）
+    //   PUMP_SCOPE_SLAB_MAX_FREE  — 每个 size class 最大缓存数（默认 0 = 不限）
     // ================================================================
+#ifndef PUMP_SCOPE_SLAB_ALIGN
+#define PUMP_SCOPE_SLAB_ALIGN 64
+#endif
+
+#ifndef PUMP_SCOPE_SLAB_MAX_SIZE
+#define PUMP_SCOPE_SLAB_MAX_SIZE 4096
+#endif
+
+#ifndef PUMP_SCOPE_SLAB_MAX_FREE
+#define PUMP_SCOPE_SLAB_MAX_FREE 0
+#endif
+
     constexpr size_t scope_size_class(size_t n) {
-        if (n <= 64) return 64;
-        if (n <= 128) return 128;
-        if (n <= 256) return 256;
-        if (n <= 512) return 512;
-        if (n <= 1024) return 1024;
-        if (n <= 2048) return 2048;
-        if (n <= 4096) return 4096;
-        return 0;
+        if (n > PUMP_SCOPE_SLAB_MAX_SIZE) return 0;
+        constexpr size_t align = PUMP_SCOPE_SLAB_ALIGN;
+        return ((n + align - 1) / align) * align;
     }
+
+    struct scope_slab_stats {
+        static inline thread_local uint64_t total_allocs = 0;
+        static inline thread_local uint64_t pool_hits = 0;
+
+        static void reset() {
+            total_allocs = 0;
+            pool_hits = 0;
+        }
+    };
 
     template<size_t SizeClass>
     struct scope_slab {
         struct node { node* next; };
         static inline thread_local node* head = nullptr;
-        static inline thread_local uint64_t total_allocs = 0;
-        static inline thread_local uint64_t pool_hits = 0;
+        static inline thread_local uint32_t free_count = 0;
 
         static void* alloc() {
-            total_allocs++;
+            scope_slab_stats::total_allocs++;
             if (head) {
-                pool_hits++;
+                scope_slab_stats::pool_hits++;
                 auto* p = head;
                 head = p->next;
+                free_count--;
                 return p;
             }
             return ::operator new(SizeClass);
         }
 
         static void dealloc(void* p) {
+            if constexpr (PUMP_SCOPE_SLAB_MAX_FREE > 0) {
+                if (free_count >= PUMP_SCOPE_SLAB_MAX_FREE) {
+                    ::operator delete(p);
+                    return;
+                }
+            }
             auto* n = static_cast<node*>(p);
             n->next = head;
             head = n;
-        }
-
-        static void reset_stats() {
-            total_allocs = 0;
-            pool_hits = 0;
+            free_count++;
         }
     };
 

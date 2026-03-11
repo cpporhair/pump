@@ -223,14 +223,7 @@ void test_pool_hit_rate() {
         pump::core::this_core_id = NUM_CORES + 1;
         auto* sche = new pump::scheduler::task::scheduler(NUM_CORES + 1);
 
-        // Reset stats for all size classes we might use
-        scope_slab<64>::reset_stats();
-        scope_slab<128>::reset_stats();
-        scope_slab<256>::reset_stats();
-        scope_slab<512>::reset_stats();
-        scope_slab<1024>::reset_stats();
-        scope_slab<2048>::reset_stats();
-        scope_slab<4096>::reset_stats();
+        scope_slab_stats::reset();
 
         std::atomic<bool> pipeline_done{false};
         auto ctx = make_root_context();
@@ -250,16 +243,8 @@ void test_pool_hit_rate() {
                std::chrono::steady_clock::now() < deadline)
             sche->advance();
 
-        // Collect stats from all size classes
-        total = scope_slab<64>::total_allocs + scope_slab<128>::total_allocs +
-                scope_slab<256>::total_allocs + scope_slab<512>::total_allocs +
-                scope_slab<1024>::total_allocs + scope_slab<2048>::total_allocs +
-                scope_slab<4096>::total_allocs;
-
-        hits = scope_slab<64>::pool_hits + scope_slab<128>::pool_hits +
-               scope_slab<256>::pool_hits + scope_slab<512>::pool_hits +
-               scope_slab<1024>::pool_hits + scope_slab<2048>::pool_hits +
-               scope_slab<4096>::pool_hits;
+        total = scope_slab_stats::total_allocs;
+        hits = scope_slab_stats::pool_hits;
 
         delete sche;
         done.store(true, std::memory_order_release);
