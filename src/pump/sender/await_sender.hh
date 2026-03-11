@@ -39,7 +39,7 @@ namespace pump::sender {
             bool in_await_suspend = false;
             std::coroutine_handle<> continuation{};
             std::shared_ptr<void> context_holder;
-            std::shared_ptr<void> scope_holder;
+            std::unique_ptr<core::scope_holder_base> scope_holder;
 
             template <typename... value_args_t>
             void
@@ -114,7 +114,7 @@ namespace pump::sender {
             bool in_await_suspend = false;
             std::coroutine_handle<> continuation{};
             std::shared_ptr<void> context_holder;
-            std::shared_ptr<void> scope_holder;
+            std::unique_ptr<core::scope_holder_base> scope_holder;
 
             template <typename... value_args_t>
             void
@@ -224,9 +224,11 @@ namespace pump::sender {
                 auto ops = sender.template connect<context_t>()
                     .push_back(receiver_t{&state})
                     .take();
-                auto scope = std::make_shared<core::root_scope<__typ__(ops)>>( __mov__(ops) );
+                using scope_element_t = core::root_scope<__typ__(ops)>;
+                auto* raw = new scope_element_t(__mov__(ops));
                 state.context_holder = context;
-                state.scope_holder = scope;
+                state.scope_holder = std::make_unique<core::scope_holder_impl<scope_element_t>>(raw);
+                auto scope = core::scope_ptr<scope_element_t>(raw);
                 core::op_pusher<0, __typ__(scope)>::push_value(context, scope);
             }
         };
@@ -277,9 +279,11 @@ namespace pump::sender {
                 auto ops = sender.template connect<context_t>()
                     .push_back(receiver_t{&state})
                     .take();
-                auto scope = std::make_shared<core::root_scope<__typ__(ops)>>( __mov__(ops) );
+                using scope_element_t = core::root_scope<__typ__(ops)>;
+                auto* raw = new scope_element_t(__mov__(ops));
                 state.context_holder = context;
-                state.scope_holder = scope;
+                state.scope_holder = std::make_unique<core::scope_holder_impl<scope_element_t>>(raw);
+                auto scope = core::scope_ptr<scope_element_t>(raw);
                 core::op_pusher<0, __typ__(scope)>::push_value(context, scope);
             }
         };

@@ -23,6 +23,7 @@ namespace pump::core {
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
             static_assert(context_t::element_type::root_flag,"context is not root when op done");
+            delete scope.get();
         }
 
         template <typename context_t>
@@ -30,6 +31,7 @@ namespace pump::core {
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
             static_assert(context_t::element_type::root_flag,"context is not root when op done");
+            delete scope.get();
         }
 
         template <typename context_t>
@@ -37,13 +39,15 @@ namespace pump::core {
         void
         push_skip(context_t& context, scope_t& scope) {
             static_assert(context_t::element_type::root_flag,"context is not root when op done");
+            delete scope.get();
         }
 
         template <typename context_t>
-        inline
+        static inline
         void
         push_done(context_t& context, scope_t& scope) {
             static_assert(context_t::element_type::root_flag,"context is not root when op done");
+            delete scope.get();
         }
     };
 }

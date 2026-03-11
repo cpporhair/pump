@@ -11,7 +11,7 @@ namespace pump::core {
         } else if constexpr (is_tuple<obj_t>::value) {
             return std::apply(
                 []<typename... T0>(T0& ...args) {
-                    return std::tuple<T0&&...>(concurrent_copy<T0>(args)...);
+                    return std::tuple<T0...>(concurrent_copy<T0>(args)...);
                 },
                 const_cast<obj_t&>(o)
             );

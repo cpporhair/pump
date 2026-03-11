@@ -272,12 +272,15 @@ namespace pump::core {
                 return scope;
             } else {
                 auto& op = std::get<pos>(scope->get_op_tuple());
+                // Use stream scope as base (not the transient caller scope like element child scope).
+                // The caller scope may be deleted while the buffer scope is still alive (async path).
+                auto& stream_scope = find_stream_starter(scope);
                 return make_runtime_scope<runtime_scope_type::other>(
-                    scope,
+                    stream_scope,
                     std::tuple_cat(
                         std::tie(op),
                         tuple_to_tie(op.stream_op_tuple),
-                        std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
+                        std::tie(std::get<__typ__(op)::pos + 1>(stream_scope->get_op_tuple()))
                     )
                 );
             }
@@ -315,6 +318,7 @@ namespace pump::core {
                     if (op.drain_requested) continue;
                     // Async path: downstream did not call poll_next synchronously.
                     // Return and wait for async poll_next callback.
+                    // DON'T delete new_scope — async pipeline still using it.
                     return;
                 }
 
@@ -328,6 +332,7 @@ namespace pump::core {
                         push_from_storage<1>(context, new_scope, __mov__(*late_item));
                         op.is_draining = false;
                         if (op.drain_requested) continue;
+                        // Async path: don't delete new_scope
                         return;
                     }
                     // Queue confirmed empty. Push done exactly once via terminal state.
@@ -338,8 +343,9 @@ namespace pump::core {
                         std::memory_order_acq_rel, std::memory_order_relaxed)) {
                         op.is_draining = true;
                         op_pusher<1, __typ__(new_scope)>::push_done(context, new_scope);
-                        op.is_draining = false;
-                        // After push_done, drain_requested from poll_next is meaningless
+                        // After push_done, stream scope may be deleted by pop_to_loop_starter.
+                        // op is a reference into stream scope — don't access it anymore.
+                        delete new_scope.get();
                     }
                     return;
                 }
@@ -356,6 +362,8 @@ namespace pump::core {
                             continue;
                         }
                     }
+                    // No more work, delete buffer scope
+                    delete new_scope.get();
                     return;
                 }
                 // CAS failed - state changed (DONE arrived), re-loop

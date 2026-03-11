@@ -70,9 +70,6 @@ namespace apps::kv::fs {
                     new req{
                         batch,
                         [context = context, scope = scope](std::variant<leader_res *, follower_res, failed_res>&& v) mutable {
-                            if(scope.use_count() == 0) {
-                                std::cout << "AAAAAAAAAAAAAA" << std::endl;
-                            }
                             std::visit(
                                 [&context, &scope](auto&& v){
                                     pump::core::op_pusher<pos + 1, scope_t>::push_value(

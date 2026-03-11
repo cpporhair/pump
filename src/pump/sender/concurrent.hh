@@ -81,20 +81,17 @@ namespace pump::sender {
             constexpr static bool concurrent_counter_op = true;
             constexpr static uint32_t parent_pusher_pos = pos;
             concurrent_counter& impl;
-            bool need_delete_scope;
 
             explicit
             concurrent_counter_wrapper(concurrent_counter& c)
-                : impl(c)
-                , need_delete_scope(false){
+                : impl(c){
 
             }
 
             concurrent_counter_wrapper(const concurrent_counter_wrapper& rhs) = delete;
 
             concurrent_counter_wrapper(concurrent_counter_wrapper&& rhs) noexcept
-                :impl(__fwd__(rhs.impl))
-                , need_delete_scope(__fwd__(rhs.need_delete_scope)){
+                :impl(__fwd__(rhs.impl)){
             }
 
 
@@ -384,9 +381,9 @@ namespace pump::core {
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
             }
             else {
-                op.need_delete_scope = true;
                 op_pusher<pos + 1, scope_t>::counter_push_value(context, scope, __fwd__(v)...);
             }
+            delete scope.get();
         }
 
         template<typename context_t>
@@ -399,9 +396,9 @@ namespace pump::core {
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
             }
             else {
-                op.need_delete_scope = true;
                 op_pusher<pos + 1, scope_t>::counter_push_exception(context, scope, e);
             }
+            delete scope.get();
         }
 
 
@@ -416,9 +413,9 @@ namespace pump::core {
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
             }
             else {
-                op.need_delete_scope = true;
                 op_pusher<pos + 1, scope_t>::counter_push_skip(context, scope);
             }
+            delete scope.get();
         }
 
 
@@ -504,6 +501,7 @@ namespace pump::core {
                 )
             );
             op_pusher<0, __typ__(new_scope)>::set_source_done(context, new_scope, op.count_of_values);
+            delete new_scope.get();
         }
 
         template <typename context_t>

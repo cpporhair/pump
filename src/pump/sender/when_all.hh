@@ -344,28 +344,36 @@ namespace pump::core {
         static inline
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
-            std::get<pos>(scope->get_op_tuple()).set_value(__fwd__(v)...);
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_value<get_current_op_type_t<pos, scope_t>::pos>(__fwd__(v)...);
         }
 
         template<typename context_t>
         static inline
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
-            std::get<pos>(scope->get_op_tuple()).set_error(e);
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_error<get_current_op_type_t<pos, scope_t>::pos>(e);
         }
 
         template<typename context_t>
         static inline
         void
         push_skip(context_t& context, scope_t& scope) {
-            std::get<pos>(scope->get_op_tuple()).skip();
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_skip<get_current_op_type_t<pos, scope_t>::pos>();
         }
 
         template<typename context_t>
         static inline
         void
         push_done(context_t& context, scope_t& scope) {
-            std::get<pos>(scope->get_op_tuple()).done();
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_done<get_current_op_type_t<pos, scope_t>::pos>();
         }
     };
 

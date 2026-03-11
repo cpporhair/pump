@@ -70,12 +70,15 @@ namespace pump::sender {
         struct
         alignas(64)
         race_wrapper {
-            // === packed state: bit 63 = finished flag, bits [0,62] = ref_count ===
-            // Merging finished + ref_count into a single atomic<uint64_t> eliminates
-            // any observation window between the two operations. For losers, a single
-            // fetch_sub is enough (finished bit is already set, ref_count decrements).
-            static constexpr uint64_t FINISHED_BIT = uint64_t(1) << 63;
-            static constexpr uint64_t REF_MASK    = ~FINISHED_BIT;
+            // === packed state bits ===
+            // bit 63: FINISHED   — race won (first fetch_or wins)
+            // bit 62: READY      — result stored, safe to push
+            // bit 61: SUBMITTED  — all branches started by submit_senders
+            // bits [0,60]: ref_count
+            static constexpr uint64_t FINISHED_BIT  = uint64_t(1) << 63;
+            static constexpr uint64_t READY_BIT     = uint64_t(1) << 62;
+            static constexpr uint64_t SUBMITTED_BIT = uint64_t(1) << 61;
+            static constexpr uint64_t REF_MASK      = ~(FINISHED_BIT | READY_BIT | SUBMITTED_BIT);
 
             std::atomic<uint64_t> state;
 
@@ -86,8 +89,9 @@ namespace pump::sender {
             // === set at construction, read-only afterwards ===
             parent_pusher_status_t parent_pusher_status;
 
+            // branch_count + 1: extra ref for the submit phase
             race_wrapper(uint32_t branch_count, parent_pusher_status_t&& p)
-                : state(uint64_t(branch_count))
+                : state(uint64_t(branch_count) + 1)
                 , winner_index(0)
                 , parent_pusher_status(__fwd__(p)) {
             }
@@ -98,10 +102,50 @@ namespace pump::sender {
 
             inline
             void
+            push_to_parent() {
+                core::op_pusher<
+                    parent_pusher_status_t::parent_pusher_pos,
+                    __typ__(parent_pusher_status.scope)
+                >::
+                push_value(
+                    parent_pusher_status.context,
+                    parent_pusher_status.scope,
+                    uint32_t(winner_index),
+                    __mov__(result)
+                );
+            }
+
+            inline
+            void
             release_ref() {
                 if ((state.fetch_sub(1, std::memory_order_acq_rel) & REF_MASK) == 1) [[unlikely]] {
                     delete this;
                 }
+            }
+
+            // Winner calls this after storing result. Sets READY_BIT.
+            // If SUBMITTED_BIT is already set, pushes result to parent.
+            // Exactly one of signal_ready / complete_submit will push (RMW ordering).
+            inline
+            void
+            signal_ready() {
+                uint64_t old = state.fetch_or(READY_BIT, std::memory_order_acq_rel);
+                if (old & SUBMITTED_BIT) {
+                    push_to_parent();
+                }
+            }
+
+            // Called by starter after all branches are submitted.
+            // Sets SUBMITTED_BIT. If READY_BIT is already set, pushes result.
+            // Then releases the extra submit ref.
+            inline
+            void
+            complete_submit() {
+                uint64_t old = state.fetch_or(SUBMITTED_BIT, std::memory_order_acq_rel);
+                if (old & READY_BIT) {
+                    push_to_parent();
+                }
+                release_ref();
             }
 
             template <uint32_t index, typename ...value_t>
@@ -115,16 +159,7 @@ namespace pump::sender {
                         result.template emplace<2>(nullptr);
                     else
                         result.template emplace<2>(__fwd__(v)...);
-                    core::op_pusher<
-                        parent_pusher_status_t::parent_pusher_pos,
-                        __typ__(parent_pusher_status.scope)
-                    >::
-                    push_value(
-                        parent_pusher_status.context,
-                        parent_pusher_status.scope,
-                        uint32_t(winner_index),
-                        __mov__(result)
-                    );
+                    signal_ready();
                 }
                 release_ref();
             }
@@ -137,16 +172,7 @@ namespace pump::sender {
                 if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<1>(e);
-                    core::op_pusher<
-                        parent_pusher_status_t::parent_pusher_pos,
-                        __typ__(parent_pusher_status.scope)
-                    >::
-                    push_value(
-                        parent_pusher_status.context,
-                        parent_pusher_status.scope,
-                        uint32_t(winner_index),
-                        __mov__(result)
-                    );
+                    signal_ready();
                 }
                 release_ref();
             }
@@ -159,16 +185,7 @@ namespace pump::sender {
                 if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<0>(std::monostate{});
-                    core::op_pusher<
-                        parent_pusher_status_t::parent_pusher_pos,
-                        __typ__(parent_pusher_status.scope)
-                    >::
-                    push_value(
-                        parent_pusher_status.context,
-                        parent_pusher_status.scope,
-                        uint32_t(winner_index),
-                        __mov__(result)
-                    );
+                    signal_ready();
                 }
                 release_ref();
             }
@@ -181,16 +198,7 @@ namespace pump::sender {
                 if (!(old & FINISHED_BIT)) {
                     winner_index = index;
                     result.template emplace<0>(std::monostate{});
-                    core::op_pusher<
-                        parent_pusher_status_t::parent_pusher_pos,
-                        __typ__(parent_pusher_status.scope)
-                    >::
-                    push_value(
-                        parent_pusher_status.context,
-                        parent_pusher_status.scope,
-                        uint32_t(winner_index),
-                        __mov__(result)
-                    );
+                    signal_ready();
                 }
                 release_ref();
             }
@@ -295,6 +303,7 @@ namespace pump::sender {
                     branch_count, __fwd__(s)
                 );
                 submit_senders<0>(context, scope, wrapper);
+                wrapper->complete_submit();
             }
         };
 
@@ -402,28 +411,36 @@ namespace pump::core {
         static inline
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
-            std::get<pos>(scope->get_op_tuple()).set_value(__fwd__(v)...);
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_value<get_current_op_type_t<pos, scope_t>::pos>(__fwd__(v)...);
         }
 
         template <typename context_t>
         static inline
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
-            std::get<pos>(scope->get_op_tuple()).set_error(e);
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_error<get_current_op_type_t<pos, scope_t>::pos>(e);
         }
 
         template <typename context_t>
         static inline
         void
         push_skip(context_t& context, scope_t& scope) {
-            std::get<pos>(scope->get_op_tuple()).set_skip();
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_skip<get_current_op_type_t<pos, scope_t>::pos>();
         }
 
         template <typename context_t>
         static inline
         void
         push_done(context_t& context, scope_t& scope) {
-            std::get<pos>(scope->get_op_tuple()).set_done();
+            auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
+            delete scope.get();
+            wrapper->template set_done<get_current_op_type_t<pos, scope_t>::pos>();
         }
     };
 

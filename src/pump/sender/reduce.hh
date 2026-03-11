@@ -295,8 +295,9 @@ namespace pump::core {
         auto
         push_done(context_t& context, scope_t& scope) {
             auto &op = std::get<pos>(scope->get_op_tuple());
+            auto result = op.take();
             auto loop_scope = pop_to_loop_starter(scope);
-            op_pusher<__typ__(op)::pos, __typ__(loop_scope)>::push_value(context, loop_scope, op.take());
+            op_pusher<__typ__(op)::pos, __typ__(loop_scope)>::push_value(context, loop_scope, __mov__(result));
         }
 
         template <typename context_t>

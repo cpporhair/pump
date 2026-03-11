@@ -411,9 +411,10 @@ namespace pump::core {
                 if (!op.is_end()) {
                     op_pusher<pos + 1, scope_t>::push_value(context, scope, op.poll_one());
                 } else {
-                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
                     // 迭代结束，强制释放令牌并退出
+                    // 必须在 push_done 之前释放，因为 push_done 会触发 pop_to_loop_starter 删除 scope
                     op.force_release_token();
+                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
                     return;
                 }
             } while (op.consume_and_continue());
@@ -434,9 +435,10 @@ namespace pump::core {
                 if (!op.is_end()) {
                     op_pusher<pos + 1, scope_t>::push_value(context, scope, op.poll_one());
                 } else {
-                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
                     // 迭代结束，强制释放令牌并退出
+                    // 必须在 push_done 之前释放，因为 push_done 会触发 pop_to_loop_starter 删除 scope
                     op.force_release_token();
+                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
                     return;
                 }
             } while (op.consume_and_continue());

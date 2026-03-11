@@ -102,6 +102,7 @@ namespace pump::core {
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
             auto base_scope = scope->base_scope;
+            delete scope.get();
             op_pusher<new_pos, __typ__(base_scope)>::push_value(context, base_scope, __fwd__(v)...);
         }
 
@@ -110,6 +111,7 @@ namespace pump::core {
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
             auto base_scope = scope->base_scope;
+            delete scope.get();
             op_pusher<new_pos, __typ__(base_scope)>::push_exception(context, base_scope, e);
         }
 
@@ -118,6 +120,7 @@ namespace pump::core {
         void
         push_skip(context_t& context, scope_t& scope) {
             auto base_scope = scope->base_scope;
+            delete scope.get();
             op_pusher<new_pos, __typ__(base_scope)>::push_skip(context, base_scope);
         }
 
@@ -126,6 +129,7 @@ namespace pump::core {
         void
         push_done(context_t& context, scope_t& scope) {
             auto base_scope = scope->base_scope;
+            delete scope.get();
             op_pusher<new_pos, __typ__(base_scope)>::push_done(context, base_scope);
         }
     };

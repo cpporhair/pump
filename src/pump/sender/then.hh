@@ -211,7 +211,6 @@ namespace pump::core {
         push_value(context_t& context, scope_t& scope, value_t&& ...v)
         requires std::is_void_v<__typ__(std::get<pos>(scope->get_op_tuple()).func(__fwd__(v)...))>{
             try {
-                auto b = scope.use_count();
                 auto &op = std::get<pos>(scope->get_op_tuple());
                 op.func(__fwd__(v)...);
                 op_pusher<pos + 1, scope_t>::push_value(context, scope);

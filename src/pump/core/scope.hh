@@ -2,12 +2,46 @@
 #define PUMP_CORE_SCOPE_HH
 
 #include <cstdint>
-#include <memory>
-#include <atomic>
 
 #include "./meta.hh"
 
 namespace pump::core {
+
+    // ================================================================
+    // scope_ptr: trivially copyable raw pointer wrapper (no refcount)
+    // ================================================================
+    template<typename T>
+    struct scope_ptr {
+        using element_type = T;
+        T* ptr_ = nullptr;
+
+        scope_ptr() = default;
+        explicit scope_ptr(T* p) : ptr_(p) {}
+        scope_ptr(const scope_ptr&) = default;
+        scope_ptr& operator=(const scope_ptr&) = default;
+
+        T* operator->() const { return ptr_; }
+        T& operator*() const { return *ptr_; }
+        T* get() const { return ptr_; }
+
+        static constexpr uint32_t get_scope_level_id() {
+            return T::get_scope_level_id();
+        }
+    };
+
+    // ================================================================
+    // scope_holder: type-erased ownership for await_sender / for_each
+    // ================================================================
+    struct scope_holder_base {
+        virtual ~scope_holder_base() = default;
+    };
+
+    template<typename T>
+    struct scope_holder_impl : scope_holder_base {
+        T* ptr;
+        explicit scope_holder_impl(T* p) : ptr(p) {}
+        ~scope_holder_impl() override { delete ptr; }
+    };
 
     enum struct
     runtime_scope_type {
@@ -82,16 +116,8 @@ namespace pump::core {
     template <runtime_scope_type scope_type,typename base_t, typename op_tuple_t>
     auto
     make_runtime_scope(base_t& scope, op_tuple_t&& opt) {
-        return std::make_shared<
-            runtime_scope<
-                scope_type,
-                op_tuple_t,
-                __typ__(scope)
-            >
-        > (
-            __fwd__(opt),
-            scope
-        );
+        using scope_t = runtime_scope<scope_type, op_tuple_t, std::decay_t<base_t>>;
+        return scope_ptr<scope_t>(new scope_t(__fwd__(opt), scope));
     }
 
     template <uint32_t pos, uint32_t n, typename op_t, typename prev_t, typename T0, typename ...TS>
@@ -159,6 +185,7 @@ namespace pump::core {
         }
         else if constexpr (pop_scope_t::element_type::scope_type == runtime_scope_type::stream_starter) {
             auto base = scope->base_scope;
+            delete scope.get();
             return base;
         }
         else {
