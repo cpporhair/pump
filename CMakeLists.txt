@@ -16,6 +16,9 @@ include(src/env/scheduler/net/tcp/tcp.cmake)
 
 include(src/env/scheduler/net/udp/udp.cmake)
 
+# CUDA support
+include(src/env/scheduler/cuda/cuda.cmake)
+
 # DPDK support
 pkg_check_modules(DPDK REQUIRED libdpdk)
 include_directories(${DPDK_INCLUDE_DIRS})

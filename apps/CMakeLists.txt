@@ -23,6 +23,19 @@ target_link_libraries(example.rpc PRIVATE ${URING_LIBRARY})
 target_link_libraries(example.echo PRIVATE ${URING_LIBRARY} pthread)
 add_executable(example.dpdk ./example/dpdk/main.cc)
 target_link_libraries(example.dpdk PRIVATE ${DPDK_LIBRARIES} pthread)
+
+# CUDA example: compile kernel to PTX, link host code with CUDA Driver API
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/vector_add_kernel.ptx
+    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} --ptx
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/cuda/vector_add_kernel.cu
+        -o ${CMAKE_CURRENT_BINARY_DIR}/vector_add_kernel.ptx
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/example/cuda/vector_add_kernel.cu
+)
+add_custom_target(cuda_ptx DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/vector_add_kernel.ptx)
+add_executable(example.cuda ./example/cuda/main.cc)
+add_dependencies(example.cuda cuda_ptx)
+target_link_libraries(example.cuda PRIVATE CUDA::cuda_driver)
 target_link_libraries(example.share_nothing PRIVATE numa)
 target_link_libraries(example.pump PRIVATE numa)
 target_link_libraries(example.nvme PRIVATE 
