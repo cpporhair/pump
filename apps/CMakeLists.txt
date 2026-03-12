@@ -54,3 +54,17 @@ target_link_libraries(apps.kv PRIVATE
 #        -Wl,--whole-archive  ${SPDK_LIBRARIES} -Wl,--no-whole-archive
 #        boost_program_options pthread isal ssl rt uuid crypto m aio numa dl  )
 
+# Inference example (requires llama.cpp)
+set(LLAMA_CPP_DIR "${CMAKE_SOURCE_DIR}/third_party/llama.cpp" CACHE PATH "Path to llama.cpp source")
+if(EXISTS "${LLAMA_CPP_DIR}/CMakeLists.txt")
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${LLAMA_CPP_DIR} ${CMAKE_BINARY_DIR}/llama.cpp EXCLUDE_FROM_ALL)
+
+    add_executable(example.inference ./example/inference/main.cc)
+    target_link_libraries(example.inference PRIVATE llama ggml ${URING_LIBRARY})
+    target_include_directories(example.inference PRIVATE ${LLAMA_CPP_DIR}/include)
+else()
+    message(STATUS "llama.cpp not found at ${LLAMA_CPP_DIR}, skipping example.inference")
+endif()
+
