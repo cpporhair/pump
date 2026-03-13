@@ -59,6 +59,8 @@ namespace pump::scheduler::nvme {
         void
         init(uint32_t data_page_size, uint64_t spdk_dma_pool_size) {
             global_pool = spdk_mempool_create("global", spdk_dma_pool_size, data_page_size, 4096, SPDK_ENV_SOCKET_ID_ANY);
+            if (!global_pool)
+                throw std::runtime_error("spdk_mempool_create failed: not enough hugepages or pool_size too large");
             init(global_pool, data_page_size);
         }
 

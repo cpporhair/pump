@@ -318,11 +318,13 @@ namespace apps::kv::fs {
         handle_allocate() {
             _allocate::leader_res *res = nullptr;
             _allocate::req* ldr = nullptr;
+            uint32_t dequeued = 0;
 
             while(
                 (((res == nullptr) || (res->span_list.page_count() <= runtime::max_merge_pages)) &&
                     (1 == spdk_ring_dequeue(allocate_req_queue, (void **) tmp, 1)))
                 ) {
+                dequeued++;
                 if (res == nullptr)
                     res = new _allocate::leader_res();
                 runtime::g_task_info.fs_count ++;
@@ -341,7 +343,6 @@ namespace apps::kv::fs {
                 }
             }
 
-
             if(!ldr)
                 return;
 
@@ -355,7 +356,8 @@ namespace apps::kv::fs {
             if (size > 0) {
                 _freepage::req *req = (_freepage::req *) tmp[0];
                 base_ssd->allocator->free(req->span.pos, req->span.pages.size());
-                delete (_freepage::req *) tmp[0];
+                req->cb();
+                delete req;
             }
         }
 

@@ -36,7 +36,8 @@ namespace apps::kv::nvme {
     inline auto
     put_span(data::write_span& span) {
         return pump::scheduler::nvme::put_pages(span.pages, runtime::random_nvme_scheduler(span.ssd_index))
-            >> pump::sender::then([&span](auto&& ...) -> data::write_span& {
+            >> pump::sender::then([&span](bool ok) -> data::write_span& {
+                if (ok) span.set_wrote();
                 return span;
             });
     }

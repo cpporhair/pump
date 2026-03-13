@@ -31,8 +31,8 @@ namespace apps::kv::runtime {
                 continue;
             spdk_nvme_io_qpair_opts opts{};
             spdk_nvme_ctrlr_get_default_io_qpair_opts(ssd->ctrlr, &opts, sizeof(spdk_nvme_io_qpair_opts));
-            opts.delay_cmd_submit = true;
-            opts.create_only = true;
+            opts.delay_cmd_submit = false;
+            opts.create_only = false;
 
             std::vector<spdk_nvme_qpair*> qpairs;
             qpairs.reserve(ssd->config.qpair_count);
@@ -61,7 +61,6 @@ namespace apps::kv::runtime {
                         0,
                         ssd->nvme_dev
                     };
-                    spdk_nvme_ctrlr_connect_io_qpair(ssd->ctrlr, raw_qp);
                     ssd->nvme_qpairs_by_core[core] = qpr;
                 } else {
                     spdk_nvme_ctrlr_free_io_qpair(raw_qp);
@@ -142,10 +141,10 @@ namespace apps::kv::runtime {
     init_proc_env() {
         std::string core_mask_string = init_core_mask();
 
-        spdk_env_opts opts{};
+        spdk_env_opts opts;
         spdk_env_opts_init(&opts);
         opts.name = "monism";
-        opts.core_mask =core_mask_string.c_str();
+        opts.core_mask = core_mask_string.c_str();
 
         if (spdk_env_init(&opts) < 0)
             throw data::init_env_failed("Unable to initialize SPDK in spdk_env_init");

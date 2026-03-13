@@ -54,9 +54,8 @@ namespace apps::kv::runtime {
             opts->num_io_queues = s->config.qpair_count;
             opts->io_queue_size = UINT16_MAX;
             return true;
-        } else {
-            return false;
         }
+        return false;
     }
 
     inline auto

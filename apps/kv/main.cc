@@ -28,7 +28,7 @@ using namespace pump::sender;
 using namespace apps::kv;
 using namespace apps::kv::ycsb;
 
-uint64_t max_key = 10000000;
+uint64_t max_key = 100;
 
 int
 main(int argc, char **argv){

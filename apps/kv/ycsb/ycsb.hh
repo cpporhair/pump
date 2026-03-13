@@ -93,6 +93,7 @@ namespace apps::kv::ycsb {
             >> generate_on(any_task_scheduler(), std::views::iota(uint64_t(0), max))
             >> output_statistics_per_sec()
             >> concurrent(10000)
+            >> then([](uint64_t i){ fprintf(stderr, "[ycsb] load item %lu\n", i); return i; })
             >> as_batch(make_kv() >> put() >> apply() >> statistic_put()) >> statistic_publish()
             >> count()
             >> stop_statistic()

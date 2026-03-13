@@ -54,13 +54,14 @@ namespace pump::scheduler::nvme::_scheduler {
 
         qpr->used--;
 
-        req->cb(get::res<page_t>{req->page, cpl && !spdk_nvme_cpl_is_error(cpl)});
+        req->cb(get::res<page_t>{req->page, static_cast<uint08_t>((!cpl || spdk_nvme_cpl_is_error(cpl)) ? 1 : 0)});
         delete req;
     }
 
     template <page_concept page_t>
     inline auto
     spdk_get(get::req<page_t>* req, qpair<page_t>* qp) {
+        qp->used++;
         const auto res = spdk_nvme_ns_cmd_read(
             qp->owner->ns,
             qp->impl,
@@ -96,13 +97,14 @@ namespace pump::scheduler::nvme::_scheduler {
 
         qpr->used--;
 
-        req->cb(put::res<page_t>{req->page, cpl && !spdk_nvme_cpl_is_error(cpl)});
+        req->cb(put::res<page_t>{req->page, static_cast<uint08_t>((!cpl || spdk_nvme_cpl_is_error(cpl)) ? 1 : 0)});
         delete req;
     }
 
     template <page_concept page_t>
     inline auto
     spdk_put(put::req<page_t>* req, qpair<page_t>* qp) {
+        qp->used++;
         const auto res = spdk_nvme_ns_cmd_write(
             qp->owner->ns,
             qp->impl,
@@ -111,7 +113,7 @@ namespace pump::scheduler::nvme::_scheduler {
             req->page->get_size() / qp->owner->sector_size,
             on_put_data_done<page_t>,
             new spdk_put_data_callback_arg<page_t>{req, qp},
-            SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS
+            req->io_flags
         );
 
         if (res < 0) [[unlikely]] {
@@ -208,13 +210,6 @@ namespace pump::scheduler::nvme {
 
         bool
         advance() {
-            if (!qp->busy()) {
-                poll();
-                return true;
-            }
-            handle_local_queue(local_put_q);
-            handle_local_queue(local_get_q);
-
             put_data_page_req_queue.drain([this](put::req<page_t>* r) {
                 local_put_q.enqueue(r);
             });

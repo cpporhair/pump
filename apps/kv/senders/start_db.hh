@@ -163,6 +163,7 @@ namespace apps::kv {
     inline int
     task_proc(void* arg) {
         uint32_t this_core = spdk_env_get_current_core();
+        pump::core::this_core_id = this_core;
         std::vector<std::move_only_function<void()const>> advance_list;
 
         advance_list.emplace_back([this_core]() { runtime::task_schedulers.by_core[this_core]->advance(); });
@@ -174,10 +175,11 @@ namespace apps::kv {
         if(runtime::fs_schedulers.by_core[this_core])
             advance_list.emplace_back([this_core]() { runtime::fs_schedulers.by_core[this_core]->advance(); });
 
-        for (auto &schedulers : runtime::nvme_schedulers_per_ssd)
-            if (schedulers.by_core[this_core])
-                advance_list.emplace_back([this_core, schedulers]() { schedulers.by_core[this_core]->advance(); });
-
+        for (auto &schedulers : runtime::nvme_schedulers_per_ssd) {
+            auto* nvme_sche = schedulers.by_core[this_core];
+            if (nvme_sche)
+                advance_list.emplace_back([nvme_sche]() { nvme_sche->advance(); });
+        }
         while(runtime::running)
             std::ranges::for_each(advance_list, [](auto &f) { f(); });
         return 0;
