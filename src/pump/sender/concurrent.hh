@@ -1,9 +1,6 @@
 #ifndef PUMP_SENDER_CONCURRENT_HH
 #define PUMP_SENDER_CONCURRENT_HH
 
-#include <iostream>
-#include <mutex>
-
 #include "../core/op_tuple_builder.hh"
 #include "../core/compute_sender_type.hh"
 #include "../core/bind_back.hh"
@@ -14,63 +11,45 @@
 
 namespace pump::sender {
     namespace _concurrent {
+
+        // Lock-free concurrent completion counter.
+        // Layout: high 32 bits = total+1 (0 means total unknown), low 32 bits = done count.
+        // Both set_total and add_done use single atomic fetch_add — wait-free, no CAS loop.
         struct
         __ncp__(concurrent_counter) {
-            std::atomic<uint64_t> counter;
-            bool source_done;
+            std::atomic<uint64_t> counter{0};
 
-        private:
-            inline
-            bool
-            is_wait_eq_done(uint64_t test_value) {
-                return (test_value & 0x00000000FFFFFFFF) == ((test_value >> 32) & 0x00000000FFFFFFFF);
-            }
-        public:
-            concurrent_counter()
-                : counter(0)
-                , source_done(false){
-            }
+            concurrent_counter() = default;
 
             inline
             void
             reset() {
-                source_done=false;
-                counter.store(0);
+                counter.store(0, std::memory_order_relaxed);
             }
 
+            // Called when the total element count is known (from push_stream_done).
+            // Atomically sets high 32 bits to total+1.
+            // Returns true if all elements have already completed (done == total).
             inline
             bool
-            set_source_done(uint32_t count) {
-                source_done = true;
-                return add_wait(count);
+            set_total(uint32_t total) {
+                uint64_t total_field = static_cast<uint64_t>(total + 1) << 32;
+                uint64_t old_v = counter.fetch_add(total_field, std::memory_order_acq_rel);
+                uint32_t done = static_cast<uint32_t>(old_v & 0xFFFFFFFF);
+                return done == total;
             }
 
+            // Called when one element completes.
+            // Atomically increments done count.
+            // Returns true only when total is set AND done count equals total.
             inline
             bool
-            add_wait(uint32_t count = 1) {
-                uint64_t old_v, new_v = 0;
-                bool res = 0;
-                do {
-                    old_v = counter.load();
-                    new_v = old_v + ((uint64_t) count << 32);
-                    res = is_wait_eq_done(new_v);
-                } while (!counter.compare_exchange_weak(old_v, new_v, std::memory_order_relaxed));
-
-                return source_done && res;
-            }
-
-            inline
-            bool
-            add_done(uint32_t count = 1){
-                uint64_t old_v, new_v = 0;
-                bool res = 0;
-                do {
-                    old_v = counter.load();
-                    new_v = old_v + count;
-                    res = is_wait_eq_done(new_v);
-                } while (!counter.compare_exchange_weak(old_v, new_v, std::memory_order_relaxed));
-
-                return source_done && res;;
+            add_done() {
+                uint64_t old_v = counter.fetch_add(1, std::memory_order_acq_rel);
+                uint64_t new_v = old_v + 1;
+                uint32_t total_plus_one = static_cast<uint32_t>(new_v >> 32);
+                uint32_t done = static_cast<uint32_t>(new_v & 0xFFFFFFFF);
+                return total_plus_one > 0 && done == (total_plus_one - 1);
             }
         };
 
@@ -85,7 +64,6 @@ namespace pump::sender {
             explicit
             concurrent_counter_wrapper(concurrent_counter& c)
                 : impl(c){
-
             }
 
             concurrent_counter_wrapper(const concurrent_counter_wrapper& rhs) = delete;
@@ -94,11 +72,10 @@ namespace pump::sender {
                 :impl(__fwd__(rhs.impl)){
             }
 
-
             inline
-            auto
-            set_source_done(uint32_t all_count) {
-                return impl.set_source_done(all_count);
+            bool
+            set_total(uint32_t count) {
+                return impl.set_total(count);
             }
 
             inline
@@ -117,14 +94,12 @@ namespace pump::sender {
             constexpr static bool concurrent_starter_op = true;
             stream_op_tuple_t stream_op_tuple;
             concurrent_counter counter;
-            std::atomic<uint32_t> count_of_values;
 
             std::atomic<uint64_t> pending_status;
             const uint64_t max_pending;
 
             starter(stream_op_tuple_t&& ops, uint64_t max_count)
                 : stream_op_tuple(__fwd__(ops))
-                , count_of_values(0)
                 , pending_status(0)
                 , max_pending(max_count){
                 __must_rval__(ops);
@@ -133,7 +108,6 @@ namespace pump::sender {
             starter(starter&& o) noexcept
                 : stream_op_tuple(__fwd__(o.stream_op_tuple))
                 , counter()
-                , count_of_values(0)
                 , pending_status(o.pending_status.load())
                 , max_pending(o.max_pending){
                 __must_rval__(o);
@@ -152,7 +126,6 @@ namespace pump::sender {
             void
             reset() {
                 counter.reset();
-                count_of_values.store(0);
                 pending_status.store(0);
             }
 
@@ -177,7 +150,6 @@ namespace pump::sender {
                     old_res = wait < (done + max_pending);
 
                     done ++;
-                    //std::cout << "sub_now_pending_and_check " << done << " " << wait << std::endl;
                     new_status = (static_cast<uint64_t>(wait) << 32) | done;
 
                     new_res = wait < (done + max_pending);
@@ -202,7 +174,6 @@ namespace pump::sender {
                     old_res = wait < (done + max_pending);
 
                     wait ++;
-                    //std::cout << "add_now_pending_and_check " << done << " " << wait << std::endl;
                     new_status = (static_cast<uint64_t>(wait) << 32) | done;
 
                     new_res = wait < (done + max_pending);
@@ -385,12 +356,11 @@ namespace pump::core {
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
             auto& op = std::get<pos>(scope->get_op_tuple());
+            // CRITICAL: push value downstream BEFORE add_done.
+            // This ensures all enqueues complete before any thread can trigger counter_push_done.
+            op_pusher<pos + 1, scope_t>::counter_push_value(context, scope, __fwd__(v)...);
             if (op.add_done()) {
-                op_pusher<pos + 1, scope_t>::counter_push_value(context, scope, __fwd__(v)...);
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
-            }
-            else {
-                op_pusher<pos + 1, scope_t>::counter_push_value(context, scope, __fwd__(v)...);
             }
             delete scope.get();
         }
@@ -400,39 +370,32 @@ namespace pump::core {
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
             auto& op = std::get<pos>(scope->get_op_tuple());
+            op_pusher<pos + 1, scope_t>::counter_push_exception(context, scope, e);
             if (op.add_done()) {
-                op_pusher<pos + 1, scope_t>::counter_push_exception(context, scope, e);
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
-            }
-            else {
-                op_pusher<pos + 1, scope_t>::counter_push_exception(context, scope, e);
             }
             delete scope.get();
         }
-
-
 
         template<typename context_t>
         static inline
         void
         push_skip(context_t& context, scope_t& scope) {
             auto& op = std::get<pos>(scope->get_op_tuple());
+            op_pusher<pos + 1, scope_t>::counter_push_skip(context, scope);
             if (op.add_done()) {
-                //op_pusher<pos + 1, scope_t>::push_skip(context, scope);
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
-            }
-            else {
-                op_pusher<pos + 1, scope_t>::counter_push_skip(context, scope);
             }
             delete scope.get();
         }
 
-
+        // Stream completion: set the total count on the counter.
+        // If all elements have already completed, trigger counter_push_done.
         template<typename context_t>
         static void
-        set_source_done(context_t& context, scope_t& scope, uint32_t all_count) {
-            auto& op = std::get<pos>(scope->get_op_tuple());;
-            if (op.set_source_done(all_count))
+        push_stream_done(context_t& context, scope_t& scope, uint32_t count) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            if (op.set_total(count))
                 op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
         }
 
@@ -450,12 +413,6 @@ namespace pump::core {
         using variant_value_type = get_current_op_type_t<pos, scope_t>::variant_value_type;
 
         static constexpr bool is_concurrent_controller = true;
-
-        static bool
-        can_push_next(scope_t& scope) {
-            auto& op = std::get<pos>(scope->get_op_tuple());
-            return false;
-        }
 
         template <typename op_tuple_t>
         static inline
@@ -484,22 +441,22 @@ namespace pump::core {
                 )
             );
 
-            op.count_of_values++;
             op_pusher<0, __typ__(new_scope)>::push_value(context, new_scope, __fwd__(v)...);
             if (op.unlimited()) {
                 op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
                 return;
             }
             if (auto [old_res, new_res] = op.add_now_pending_and_check(); new_res) {
-                //std::cout << "add_now_pending_and_check" << std::endl;
                 op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
             }
         }
 
+        // Stream completion from for_each: forward the count to the concurrent_counter
+        // via a helper scope containing only the counter_wrapper.
         template <typename context_t>
         static
         void
-        push_done(context_t& context, scope_t& scope) {
+        push_stream_done(context_t& context, scope_t& scope, uint32_t count) {
             auto& op = std::get<pos>(scope->get_op_tuple());
             auto new_scope = make_new_scope(
                 scope,
@@ -509,7 +466,7 @@ namespace pump::core {
                     std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
                 )
             );
-            op_pusher<0, __typ__(new_scope)>::set_source_done(context, new_scope, op.count_of_values);
+            op_pusher<0, __typ__(new_scope)>::push_stream_done(context, new_scope, count);
             delete new_scope.get();
         }
 
@@ -527,7 +484,6 @@ namespace pump::core {
                     std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
                 )
             );
-            op.count_of_values++;
             op_pusher<0, __typ__(new_scope)>::push_exception(context, new_scope, e);
             if (op.unlimited()) {
                 op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
@@ -535,7 +491,6 @@ namespace pump::core {
             }
 
             if (auto [old_res, new_res] = op.add_now_pending_and_check(); new_res) {
-                //std::cout << "add_now_pending_and_check" << std::endl;
                 op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
             }
         }
@@ -548,8 +503,6 @@ namespace pump::core {
             if (op.unlimited())
                 return;
             if (auto [old_res, new_res] = op.sub_now_pending_and_check(); !old_res && new_res) {
-                //std::cout << "sub_now_pending_and_check" << std::endl;
-                //op_pusher<pos - 1, scope_t>::poll_next(context, scope);
                 op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
             }
         }
@@ -578,8 +531,8 @@ namespace pump::core {
         template<typename context_t>
         static inline
         void
-        counter_push_skip(context_t& context, scope_t& scope, std::exception_ptr e) {
-            op_pusher<pos + 1, scope_t>::push_skip(context, scope, __fwd__(e));
+        counter_push_skip(context_t& context, scope_t& scope) {
+            op_pusher<pos + 1, scope_t>::push_skip(context, scope);
         }
     };
 

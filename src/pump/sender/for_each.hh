@@ -27,6 +27,8 @@ namespace pump::sender {
             ranges_t range;
             std::ranges::iterator_t<ranges_t> it;
 
+            uint32_t push_count{0};
+
             // 高32位: pending poll_next 请求数量
             // 低32位: token (0=空闲可获取, 1=被持有)
             std::atomic<uint64_t> poll_next_flag{0};
@@ -74,6 +76,7 @@ namespace pump::sender {
             void
             reset() {
                 it = range.begin();
+                push_count = 0;
             }
 
             // 尝试增加 pending 并获取令牌
@@ -411,12 +414,12 @@ namespace pump::core {
             // 获取到令牌，用循环处理所有 pending 请求
             do {
                 if (!op.is_end()) {
+                    op.push_count++;
                     op_pusher<pos + 1, scope_t>::push_value(context, scope, op.poll_one());
                 } else {
-                    // 迭代结束，强制释放令牌并退出
-                    // 必须在 push_done 之前释放，因为 push_done 会触发 pop_to_loop_starter 删除 scope
+                    auto count = op.push_count;
                     op.force_release_token();
-                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
+                    op_pusher<pos + 1, scope_t>::push_stream_done(context, scope, count);
                     return;
                 }
             } while (op.consume_and_continue());
@@ -435,12 +438,12 @@ namespace pump::core {
             // 用循环处理所有 pending 请求
             do {
                 if (!op.is_end()) {
+                    op.push_count++;
                     op_pusher<pos + 1, scope_t>::push_value(context, scope, op.poll_one());
                 } else {
-                    // 迭代结束，强制释放令牌并退出
-                    // 必须在 push_done 之前释放，因为 push_done 会触发 pop_to_loop_starter 删除 scope
+                    auto count = op.push_count;
                     op.force_release_token();
-                    op_pusher<pos + 1, scope_t>::push_done(context, scope);
+                    op_pusher<pos + 1, scope_t>::push_stream_done(context, scope, count);
                     return;
                 }
             } while (op.consume_and_continue());

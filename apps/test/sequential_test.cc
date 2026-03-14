@@ -86,10 +86,10 @@ void start_workers(uint32_t num_cores) {
 
     for (uint32_t i = 0; i < num_cores; ++i) {
         g_worker_threads.emplace_back([i]() {
+            this_core_id = i;
             auto* sche = g_schedulers[i];
             while (g_workers_running.load(std::memory_order_relaxed)) {
                 if (!sche->advance()) {
-                    // 短暂让出 CPU 避免空转
                     std::this_thread::yield();
                 }
             }
@@ -743,7 +743,6 @@ void test_multicore_large_stream() {
             return random_scheduler()->as_task() >> then([id]() { return id; });
         })
         >> then([](uint64_t id) {
-            // 模拟工作负载
             volatile uint64_t dummy = 0;
             for (int i = 0; i < 100; ++i) dummy += i * id;
             return id;
@@ -764,7 +763,7 @@ void test_multicore_large_stream() {
         })
         >> submit(context);
 
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!completed.load() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -1145,6 +1144,7 @@ int main() {
 
     // Multi-core concurrent tests
     uint32_t num_cores = std::min(8u, std::thread::hardware_concurrency());
+    this_core_id = num_cores;  // main thread gets unique core ID to avoid SPSC race with worker 0
     std::cout << "\n--- Multi-core Concurrent Tests (using " << num_cores << " cores) ---" << std::endl;
     start_workers(num_cores);
 

@@ -16,6 +16,10 @@ namespace pump::sender {
         constexpr uint32_t STATE_BUSY = 1;
         constexpr uint32_t STATE_DONE = 2;
 
+        // Anti-recursion drain flag bits
+        constexpr uint32_t DRAIN_ACTIVE = 1;     // drain in progress
+        constexpr uint32_t DRAIN_REQUESTED = 2;  // re-drain requested while active
+
         template <typename value_t, typename stream_op_tuple_t, size_t max_cache_size = 1024>
         struct
         source_cache {
@@ -28,10 +32,8 @@ namespace pump::sender {
             stream_op_tuple_t stream_op_tuple;
             // State machine: STATE_IDLE, STATE_BUSY, STATE_DONE
             std::atomic<uint32_t> state{STATE_IDLE};
-            // Anti-recursion flag for synchronous downstream poll_next callbacks
-            bool is_draining{false};
-            // Flag set by synchronous poll_next to request another drain iteration
-            bool drain_requested{false};
+            // Atomic anti-recursion flag: DRAIN_ACTIVE | DRAIN_REQUESTED
+            std::atomic<uint32_t> drain_flag{0};
 
             explicit
             source_cache(stream_op_tuple_t&& ops)
@@ -44,8 +46,7 @@ namespace pump::sender {
                 : cache(__fwd__(o.cache))
                 , stream_op_tuple(__fwd__(o.stream_op_tuple))
                 , state(o.state.load(std::memory_order_relaxed))
-                , is_draining(o.is_draining)
-                , drain_requested(o.drain_requested) {
+                , drain_flag(o.drain_flag.load(std::memory_order_relaxed)) {
                 __must_rval__(o);
             }
 
@@ -54,8 +55,7 @@ namespace pump::sender {
             void
             reset() {
                 state.store(STATE_IDLE, std::memory_order_relaxed);
-                is_draining = false;
-                drain_requested = false;
+                drain_flag.store(0, std::memory_order_relaxed);
             }
         };
     }
@@ -296,33 +296,38 @@ namespace pump::core {
         // Core drain logic: attempt to dequeue and push one item downstream.
         // Returns after pushing one item (non-blocking) or transitions state.
         // Anti-recursion: if downstream synchronously calls poll_next, the
-        // is_draining flag flattens the recursion into a loop.
+        // drain_flag atomic flattens the recursion into a loop.
         template<typename context_t>
         static
         void
         drain_single(context_t& context, scope_t& scope) {
             auto& op = std::get<pos>(scope->get_op_tuple());
 
-            // Anti-recursion: if already draining, set flag and return
-            if (op.is_draining) {
-                op.drain_requested = true;
-                return;
+            // Anti-recursion: if already draining, atomically set DRAIN_REQUESTED and return
+            uint32_t df = op.drain_flag.load(std::memory_order_acquire);
+            if (df & sender::_sequential::DRAIN_ACTIVE) {
+                // Another invocation is active — request re-drain via atomic CAS
+                while (df & sender::_sequential::DRAIN_ACTIVE) {
+                    if (op.drain_flag.compare_exchange_weak(
+                            df, df | sender::_sequential::DRAIN_REQUESTED,
+                            std::memory_order_acq_rel, std::memory_order_relaxed))
+                        return;
+                }
+                // DRAIN_ACTIVE cleared while we were trying — fall through to normal path
             }
 
             auto new_scope = make_new_scope(scope);
 
             // Loop to flatten synchronous recursive poll_next calls
             while (true) {
-                op.drain_requested = false;
-
                 if (auto item = op.cache->try_dequeue()) {
-                    // Got an item - push downstream
-                    op.is_draining = true;
+                    // Got an item - mark drain active, push downstream
+                    op.drain_flag.store(sender::_sequential::DRAIN_ACTIVE, std::memory_order_release);
                     push_from_storage<1>(context, new_scope, __mov__(*item));
-                    op.is_draining = false;
-                    // If downstream synchronously called poll_next (drain_requested),
-                    // continue the loop instead of recursing
-                    if (op.drain_requested) continue;
+                    // Atomically clear flags and check if re-drain was requested
+                    if (op.drain_flag.exchange(0, std::memory_order_acq_rel)
+                        & sender::_sequential::DRAIN_REQUESTED)
+                        continue;
                     // Async path: downstream did not call poll_next synchronously.
                     // Return and wait for async poll_next callback.
                     // DON'T delete new_scope — async pipeline still using it.
@@ -335,10 +340,11 @@ namespace pump::core {
                 if (s >= sender::_sequential::STATE_DONE) {
                     // DONE signal received - check if queue truly empty (recheck for race)
                     if (auto late_item = op.cache->try_dequeue()) {
-                        op.is_draining = true;
+                        op.drain_flag.store(sender::_sequential::DRAIN_ACTIVE, std::memory_order_release);
                         push_from_storage<1>(context, new_scope, __mov__(*late_item));
-                        op.is_draining = false;
-                        if (op.drain_requested) continue;
+                        if (op.drain_flag.exchange(0, std::memory_order_acq_rel)
+                            & sender::_sequential::DRAIN_REQUESTED)
+                            continue;
                         // Async path: don't delete new_scope
                         return;
                     }
@@ -348,7 +354,6 @@ namespace pump::core {
                     if (op.state.compare_exchange_strong(expected,
                         sender::_sequential::STATE_DONE | sender::_sequential::STATE_BUSY,
                         std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                        op.is_draining = true;
                         op_pusher<1, __typ__(new_scope)>::push_done(context, new_scope);
                         // After push_done, stream scope may be deleted by pop_to_loop_starter.
                         // op is a reference into stream scope — don't access it anymore.
@@ -444,11 +449,22 @@ namespace pump::core {
             // Signal DONE. No more values will be enqueued after this.
             uint32_t prev = op.state.exchange(sender::_sequential::STATE_DONE, std::memory_order_acq_rel);
             if (prev == sender::_sequential::STATE_IDLE) {
-                // Was idle - we need to acquire BUSY to drain the DONE signal
-                // Since we just set DONE, try DONE -> DONE (act as busy)
+                // Was idle - we need to drain the DONE signal
                 drain_single(context, scope);
             }
             // If prev was BUSY, the current drainer will detect DONE and push it.
+        }
+
+        template<typename context_t>
+        static
+        void
+        push_stream_done(context_t& context, scope_t& scope, uint32_t) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            // Stream ended — same as push_done: no more values will arrive.
+            uint32_t prev = op.state.exchange(sender::_sequential::STATE_DONE, std::memory_order_acq_rel);
+            if (prev == sender::_sequential::STATE_IDLE) {
+                drain_single(context, scope);
+            }
         }
 
         template<typename context_t>

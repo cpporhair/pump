@@ -77,6 +77,13 @@ namespace pump::core {
         template <typename context_t>
         static inline
         void
+        push_stream_done(context_t& context, scope_t& scope, uint32_t count) {
+            op_pusher<pos + 1, scope_t>::push_stream_done(context, scope, count);
+        }
+
+        template <typename context_t>
+        static inline
+        void
         poll_next(context_t& context, scope_t& scope) {
             op_pusher<pos - 1, scope_t>::poll_next(context, scope);
         }
