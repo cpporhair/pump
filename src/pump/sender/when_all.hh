@@ -205,6 +205,8 @@ namespace pump::sender {
             set_skip(){
                 wrapper->template set_skip<index>();
             }
+
+            void reset() {}
         };
 
         template <typename result_t, typename ...op_list_t>
@@ -249,6 +251,8 @@ namespace pump::sender {
                 );
                 submit_senders<0>(context, scope, collector);
             }
+
+            void reset() {}
         };
 
         template <typename prev_t, typename ...sender_t>

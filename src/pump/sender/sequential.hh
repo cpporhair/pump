@@ -50,6 +50,13 @@ namespace pump::sender {
             }
 
             source_cache(const source_cache&) = delete;
+
+            void
+            reset() {
+                state.store(STATE_IDLE, std::memory_order_relaxed);
+                is_draining = false;
+                drain_requested = false;
+            }
         };
     }
 

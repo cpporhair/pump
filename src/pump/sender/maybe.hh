@@ -19,6 +19,7 @@ namespace pump::sender {
         op {
             constexpr static bool maybe_op = true;
             constexpr static bool need_val = need_value;
+            void reset() {}
         };
 
         template <bool has_value, typename prev_t>

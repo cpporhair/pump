@@ -18,6 +18,7 @@ namespace pump::sender {
         op {
             constexpr static uint32_t context_compile_id = matching_compile_id;
             constexpr static bool pop_context_op = true;
+            void reset() {}
         };
 
         template <uint32_t matching_compile_id, typename prev_t>

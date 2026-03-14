@@ -11,6 +11,7 @@ namespace pump::sender {
         struct
         op {
             constexpr static bool get_op_flow_op = true;
+            void reset() {}
         };
 
         template <typename prev_t>

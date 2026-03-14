@@ -7,6 +7,7 @@ namespace pump::sender {
     struct
     null_receiver {
         constexpr static bool null_receiver_op = true;
+        void reset() {}
     };
 
     inline constexpr null_receiver the_null_receiver{};

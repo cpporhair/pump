@@ -246,6 +246,8 @@ namespace pump::sender {
             set_skip() {
                 wrapper->template set_skip<index>();
             }
+
+            void reset() {}
         };
 
         // ================================================================
@@ -305,6 +307,8 @@ namespace pump::sender {
                 submit_senders<0>(context, scope, wrapper);
                 wrapper->complete_submit();
             }
+
+            void reset() {}
         };
 
         // ================================================================

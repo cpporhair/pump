@@ -169,6 +169,7 @@ namespace pump::sender {
                 );
             }
 
+            void reset() {}
         };
 
         template <typename range_t>
@@ -255,6 +256,7 @@ namespace pump::sender {
                 return runner(core::concurrent_copy(stream_op_tuple));
             }
 
+            void reset() {}
         };
         struct
         op_maker {
@@ -462,6 +464,7 @@ namespace pump::core {
         void
         push_value(context_t& context, scope_t& scope) {
             auto& op = std::get<pos>(scope->get_op_tuple());
+            reset_stream_ops(op.stream_op_tuple);
             start_stream(
                 context,
                 make_runtime_scope<runtime_scope_type::stream_starter>(
@@ -495,6 +498,7 @@ namespace pump::core {
         push_value(context_t& context, scope_t& scope, value_t&& v) {
             static_assert(std::ranges::viewable_range<value_t>);
             auto& op = std::get<pos>(scope->get_op_tuple());
+            reset_stream_ops(op.stream_op_tuple);
             start_stream(
                 context,
                 make_runtime_scope<runtime_scope_type::stream_starter>(
@@ -516,6 +520,7 @@ namespace pump::core {
         requires std::is_lvalue_reference_v<value_t> {
             static_assert(std::ranges::viewable_range<value_t>);
             auto& op = std::get<pos>(scope->get_op_tuple());
+            reset_stream_ops(op.stream_op_tuple);
             start_stream(
                 context,
                 make_runtime_scope<runtime_scope_type::stream_starter>(

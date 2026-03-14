@@ -160,6 +160,7 @@ namespace pump::sender {
     await_receiver {
         constexpr static bool await_receiver_op = true;
         state_t* state = nullptr;
+        void reset() {}
     };
 
     namespace detail {

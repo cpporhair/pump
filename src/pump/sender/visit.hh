@@ -9,6 +9,7 @@ namespace pump::sender {
             struct
             op {
                 constexpr static bool visit_op_not_value = true;
+                void reset() {}
             };
 
             template <typename prev_t>
@@ -57,6 +58,8 @@ namespace pump::sender {
                 concurrent_copy() const {
                     return op(core::concurrent_copy(value));
                 }
+
+                void reset() {}
             };
 
             template <typename prev_t, typename value_t>

@@ -106,6 +106,8 @@ namespace pump::sender {
             add_done(){
                 return impl.add_done();
             }
+
+            void reset() {}
         };
 
         template <typename stream_op_tuple_t, typename variant_value_t>
@@ -145,6 +147,13 @@ namespace pump::sender {
                     core::concurrent_copy(stream_op_tuple),
                     max_pending
                 );
+            }
+
+            void
+            reset() {
+                counter.reset();
+                count_of_values.store(0);
+                pending_status.store(0);
             }
 
             [[nodiscard]]
@@ -549,7 +558,6 @@ namespace pump::core {
         static inline
         void
         counter_push_done(context_t& context, scope_t& scope) {
-            auto& op = std::get<pos>(scope->get_op_tuple());
             op_pusher<pos + 1, scope_t>::push_done(context, scope);
         }
 

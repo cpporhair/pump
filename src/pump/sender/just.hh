@@ -33,6 +33,8 @@ namespace pump::sender {
             }
 
             op(const op&) = delete;
+
+            void reset() {}
         };
 
         template <typename ...value_t>

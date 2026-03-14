@@ -16,6 +16,7 @@ namespace pump::sender {
         struct
         op {
             constexpr static bool flat_op = true;
+            void reset() {}
         };
 
         template <typename prev_t>

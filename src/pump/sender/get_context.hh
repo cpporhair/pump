@@ -21,6 +21,8 @@ namespace pump::sender {
             get_from_context(context_t& context) {
                 return get_all_from_context<context_t, env_t...>(context);
             }
+
+            void reset() {}
         };
 
         template <typename prev_t,typename ...env_t>

@@ -58,6 +58,8 @@ namespace pump::sender {
             run(value_t&& ...v) {
                 do_run(__fwd__(v)...);
             }
+
+            void reset() {}
         };
 
 

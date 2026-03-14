@@ -53,6 +53,8 @@ namespace pump::sender {
                     std::make_tuple(__fwd__(v)...)
                 );
             }
+
+            void reset() {}
         };
 
         template <uint32_t compile_id, typename prev_t, typename ...content_t>

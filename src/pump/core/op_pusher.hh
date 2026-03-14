@@ -88,6 +88,7 @@ namespace pump::core {
     pop_pusher_scope_op {
         constexpr static bool pop_pusher_scope_op_flag = true;
         constexpr static uint32_t base_scope_runner_pos = pos;
+        void reset() {}
     };
 
     template<uint32_t pos, typename scope_t>

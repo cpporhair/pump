@@ -35,6 +35,8 @@ namespace pump::sender {
             concurrent_copy() const {
                 return op(core::concurrent_copy(func));
             }
+
+            void reset() {}
         };
 
         template <typename prev_t,typename func_t>
