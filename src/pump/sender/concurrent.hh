@@ -1,0 +1,557 @@
+#ifndef PUMP_SENDER_CONCURRENT_HH
+#define PUMP_SENDER_CONCURRENT_HH
+
+#include "../core/op_tuple_builder.hh"
+#include "../core/compute_sender_type.hh"
+#include "../core/bind_back.hh"
+#include "../core/meta.hh"
+#include "../core/op_pusher.hh"
+#include "./submit.hh"
+#include "./then.hh"
+
+namespace pump::sender {
+    namespace _concurrent {
+
+        // Lock-free concurrent completion counter.
+        // Layout: high 32 bits = total+1 (0 means total unknown), low 32 bits = done count.
+        // Both set_total and add_done use single atomic fetch_add — wait-free, no CAS loop.
+        struct
+        __ncp__(concurrent_counter) {
+            std::atomic<uint64_t> counter{0};
+
+            concurrent_counter() = default;
+
+            inline
+            void
+            reset() {
+                counter.store(0, std::memory_order_relaxed);
+            }
+
+            // Called when the total element count is known (from push_stream_done).
+            // Atomically sets high 32 bits to total+1.
+            // Returns true if all elements have already completed (done == total).
+            inline
+            bool
+            set_total(uint32_t total) {
+                uint64_t total_field = static_cast<uint64_t>(total + 1) << 32;
+                uint64_t old_v = counter.fetch_add(total_field, std::memory_order_acq_rel);
+                uint32_t done = static_cast<uint32_t>(old_v & 0xFFFFFFFF);
+                return done == total;
+            }
+
+            // Called when one element completes.
+            // Atomically increments done count.
+            // Returns true only when total is set AND done count equals total.
+            inline
+            bool
+            add_done() {
+                uint64_t old_v = counter.fetch_add(1, std::memory_order_acq_rel);
+                uint64_t new_v = old_v + 1;
+                uint32_t total_plus_one = static_cast<uint32_t>(new_v >> 32);
+                uint32_t done = static_cast<uint32_t>(new_v & 0xFFFFFFFF);
+                return total_plus_one > 0 && done == (total_plus_one - 1);
+            }
+        };
+
+        template <uint32_t pos, typename variant_value_t>
+        struct
+        concurrent_counter_wrapper {
+            using variant_value_type = variant_value_t;
+            constexpr static bool concurrent_counter_op = true;
+            constexpr static uint32_t parent_pusher_pos = pos;
+            concurrent_counter& impl;
+
+            explicit
+            concurrent_counter_wrapper(concurrent_counter& c)
+                : impl(c){
+            }
+
+            concurrent_counter_wrapper(const concurrent_counter_wrapper& rhs) = delete;
+
+            concurrent_counter_wrapper(concurrent_counter_wrapper&& rhs) noexcept
+                :impl(__fwd__(rhs.impl)){
+            }
+
+            inline
+            bool
+            set_total(uint32_t count) {
+                return impl.set_total(count);
+            }
+
+            inline
+            bool
+            add_done(){
+                return impl.add_done();
+            }
+
+            void reset() {}
+        };
+
+        template <typename stream_op_tuple_t, typename variant_value_t>
+        struct
+        starter {
+            using variant_value_type = variant_value_t;
+            constexpr static bool concurrent_starter_op = true;
+            stream_op_tuple_t stream_op_tuple;
+            concurrent_counter counter;
+
+            std::atomic<uint64_t> pending_status;
+            const uint64_t max_pending;
+
+            starter(stream_op_tuple_t&& ops, uint64_t max_count)
+                : stream_op_tuple(__fwd__(ops))
+                , pending_status(0)
+                , max_pending(max_count){
+                __must_rval__(ops);
+            }
+
+            starter(starter&& o) noexcept
+                : stream_op_tuple(__fwd__(o.stream_op_tuple))
+                , counter()
+                , pending_status(o.pending_status.load())
+                , max_pending(o.max_pending){
+                __must_rval__(o);
+            }
+
+            starter(const starter& o) = delete;
+
+            auto
+            concurrent_copy() const {
+                return starter(
+                    core::concurrent_copy(stream_op_tuple),
+                    max_pending
+                );
+            }
+
+            void
+            reset() {
+                counter.reset();
+                pending_status.store(0);
+            }
+
+            [[nodiscard]]
+            bool
+            unlimited() const {
+                return max_pending == 0;
+            }
+
+            auto
+            sub_now_pending_and_check() {
+                bool old_res = false, new_res = false;
+                uint64_t old_status = 0 , new_status = 0;
+                do {
+                    old_status = pending_status.load();
+                    auto done = static_cast<uint32_t>(old_status & 0xFFFFFFFF);
+                    auto wait = static_cast<uint32_t>((old_status >> 32) & 0xFFFFFFFF);
+                    auto temp = std::min(done, wait);
+                    done -= temp;
+                    wait -= temp;
+
+                    old_res = wait < (done + max_pending);
+
+                    done ++;
+                    new_status = (static_cast<uint64_t>(wait) << 32) | done;
+
+                    new_res = wait < (done + max_pending);
+
+                } while (!pending_status.compare_exchange_weak(old_status, new_status, std::memory_order_relaxed));
+
+                return std::make_tuple(old_res , new_res);
+            }
+
+            auto
+            add_now_pending_and_check() {
+                bool old_res = false, new_res = false;
+                uint64_t old_status = 0 , new_status = 0;
+                do {
+                    old_status = pending_status.load();
+                    auto done = static_cast<uint32_t>(old_status & 0xFFFFFFFF);
+                    auto wait = static_cast<uint32_t>((old_status >> 32) & 0xFFFFFFFF);
+                    auto temp = std::min(done, wait);
+                    done -= temp;
+                    wait -= temp;
+
+                    old_res = wait < (done + max_pending);
+
+                    wait ++;
+                    new_status = (static_cast<uint64_t>(wait) << 32) | done;
+
+                    new_res = wait < (done + max_pending);
+
+                } while (!pending_status.compare_exchange_weak(old_status, new_status, std::memory_order_relaxed));
+
+                return std::make_tuple(old_res , new_res);
+            }
+        };
+    }
+
+    namespace _concurrent {
+        template <uint32_t pos, typename variant_value_t, typename parent_builder_t, typename stream_builder_t>
+        struct
+        concurrent_starter_builder {
+
+            constexpr static uint32_t cur_pos = pos;
+
+            parent_builder_t parent_builder;
+            stream_builder_t stream_builder;
+            uint64_t max;
+
+            concurrent_starter_builder(parent_builder_t&& p, stream_builder_t&& s, uint64_t max_count)
+                : parent_builder(__fwd__(p))
+                , stream_builder(__fwd__(s))
+                , max(max_count){
+                __must_rval__(p);
+                __must_rval__(s);
+            }
+
+            concurrent_starter_builder(concurrent_starter_builder &&rhs) noexcept
+                : parent_builder(__fwd__(rhs.parent_builder))
+                , stream_builder(__fwd__(rhs.stream_builder))
+                , max(rhs.max) {
+            }
+
+            concurrent_starter_builder(const concurrent_starter_builder& rhs) = delete;
+
+            template<typename pushed_op_t>
+            auto
+            push_back(pushed_op_t&& op) {
+                return
+                    concurrent_starter_builder
+                        <
+                            pos + 1,
+                            variant_value_t,
+                            __typ__(parent_builder),
+                            __typ__(stream_builder.push_back(__fwd__(op)))
+                        >
+                        (
+                            __mov__(parent_builder),
+                            stream_builder.push_back(__fwd__(op)),
+                            max
+                        );
+            }
+
+            template<typename ctrl_op_t>
+            auto
+            push_ctrl_op(ctrl_op_t&& op) {
+                return parent_builder.push_ctrl_op(
+                        _concurrent::starter<
+                            __typ__(stream_builder.take()),
+                            variant_value_t
+                        >(
+                            __raw__(stream_builder.take()),
+                            max
+                        )
+                    )
+                    .push_ctrl_op(__fwd__(op));
+            }
+
+            template<typename reduce_op_t>
+            auto
+            push_reduce_op(reduce_op_t&& op) {
+                return parent_builder.push_ctrl_op(
+                        _concurrent::starter<
+                            __typ__(stream_builder.take()),
+                            variant_value_t
+                        >(
+                            __raw__(stream_builder.take()),
+                            max
+                        )
+                    )
+                    .push_reduce_op(__fwd__(op));
+            }
+
+            constexpr static uint32_t
+            get_reduce_op_next_pos() {
+                return parent_builder_t::get_reduce_op_next_pos();
+            }
+        };
+
+        template <typename prev_t>
+        struct
+        __ncp__(sender) {
+            using prev_type = prev_t;
+            prev_t prev;
+            uint64_t max;
+            explicit
+            sender(prev_t&& p, uint64_t max_count)
+                : prev(__fwd__(p))
+                , max(max_count){
+                __must_rval__(p);
+            }
+
+            sender(sender&& o)
+                : prev(__fwd__(o.prev))
+                , max(o.max){
+            }
+
+            template<typename context_t>
+            auto
+            connect(){
+                if constexpr (core::compute_sender_type<context_t, prev_t>::count_value() == 0) {
+                    using variant_value_type = std::variant<std::monostate, std::exception_ptr, nullptr_t>;
+                    return concurrent_starter_builder <
+                        0,
+                        variant_value_type,
+                        __typ__(prev.template connect<context_t>()),
+                        ::pump::core::builder::op_list_builder<0>
+                    > (
+                        prev.template connect<context_t>(),
+                        ::pump::core::builder::op_list_builder<0>(),
+                        max
+                    );
+                }
+                else {
+                    using variant_value_type = std::variant<
+                        std::monostate,
+                        std::exception_ptr,
+                        typename decltype(core::compute_sender_type<context_t, prev_t>::get_value_type_identity())::type
+                    >;
+
+                    return concurrent_starter_builder<
+                        0,
+                        variant_value_type,
+                        __typ__(prev.template connect<context_t>()),
+                        ::pump::core::builder::op_list_builder<0>
+                    >(
+                        prev.template connect<context_t>(),
+                        ::pump::core::builder::op_list_builder<0>(),
+                        max
+                    );
+                }
+            }
+        };
+
+        struct
+        fn {
+            template <typename sender_t>
+            constexpr
+            decltype(auto)
+            operator ()(sender_t&& s, uint64_t max) const {
+                __must_rval__(s);
+                return _concurrent::sender<sender_t>{__fwd__(s), max};
+            }
+
+
+            decltype(auto)
+            operator ()(uint64_t max = 0) const {
+                return ::pump::core::bind_back<fn, uint64_t>(fn{}, max);
+            }
+        };
+    }
+
+    inline constexpr _concurrent::fn concurrent{};
+}
+
+namespace pump::core {
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+    && (get_current_op_type_t<pos, scope_t>::concurrent_counter_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        using variant_value_type = get_current_op_type_t<pos, scope_t>::variant_value_type;
+
+        template<typename context_t, typename ...value_t>
+        static inline
+        void
+        push_value(context_t& context, scope_t& scope, value_t&& ...v) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            // CRITICAL: push value downstream BEFORE add_done.
+            // This ensures all enqueues complete before any thread can trigger counter_push_done.
+            op_pusher<pos + 1, scope_t>::counter_push_value(context, scope, __fwd__(v)...);
+            if (op.add_done()) {
+                op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
+            }
+            delete scope.get();
+        }
+
+        template<typename context_t>
+        static inline
+        void
+        push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            op_pusher<pos + 1, scope_t>::counter_push_exception(context, scope, e);
+            if (op.add_done()) {
+                op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
+            }
+            delete scope.get();
+        }
+
+        template<typename context_t>
+        static inline
+        void
+        push_skip(context_t& context, scope_t& scope) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            op_pusher<pos + 1, scope_t>::counter_push_skip(context, scope);
+            if (op.add_done()) {
+                op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
+            }
+            delete scope.get();
+        }
+
+        // Stream completion: set the total count on the counter.
+        // If all elements have already completed, trigger counter_push_done.
+        template<typename context_t>
+        static void
+        push_stream_done(context_t& context, scope_t& scope, uint32_t count) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            if (op.set_total(count))
+                op_pusher<pos + 1, scope_t>::counter_push_done(context, scope);
+        }
+
+        template<typename context_t>
+        static void
+        poll_next(context_t& context, scope_t& scope) {
+        }
+    };
+
+    template<uint32_t pos, typename scope_t>
+    requires (pos < std::tuple_size_v<typename scope_t::element_type::op_tuple_type>)
+    && (get_current_op_type_t<pos, scope_t>::concurrent_starter_op)
+    struct
+    op_pusher<pos, scope_t> : op_pusher_base<pos, scope_t> {
+        using variant_value_type = get_current_op_type_t<pos, scope_t>::variant_value_type;
+
+        static constexpr bool is_concurrent_controller = true;
+
+        template <typename op_tuple_t>
+        static inline
+        auto
+        make_new_scope(scope_t& scope, op_tuple_t&& t){
+            return make_runtime_scope<runtime_scope_type::other>(
+                scope,
+                __fwd__(t)
+            );
+        }
+
+        template<typename context_t, typename ...value_t>
+        static
+        void
+        push_value(context_t& context, scope_t& scope, value_t&& ...v) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            auto new_scope = make_new_scope(
+                scope,
+                std::tuple_cat(
+                    core::concurrent_copy(op.stream_op_tuple),
+                    std::make_tuple(
+                        sender::_concurrent::concurrent_counter_wrapper<pos, variant_value_type>(op.counter)
+                    ),
+                    std::tie(op),
+                    std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
+                )
+            );
+
+            op_pusher<0, __typ__(new_scope)>::push_value(context, new_scope, __fwd__(v)...);
+            if (op.unlimited()) {
+                op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
+                return;
+            }
+            if (auto [old_res, new_res] = op.add_now_pending_and_check(); new_res) {
+                op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
+            }
+        }
+
+        // Stream completion from for_each: forward the count to the concurrent_counter
+        // via a helper scope containing only the counter_wrapper.
+        template <typename context_t>
+        static
+        void
+        push_stream_done(context_t& context, scope_t& scope, uint32_t count) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            auto new_scope = make_new_scope(
+                scope,
+                std::tuple_cat(
+                    std::make_tuple(::pump::sender::_concurrent::concurrent_counter_wrapper<pos, variant_value_type>(op.counter)),
+                    std::tie(op),
+                    std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
+                )
+            );
+            op_pusher<0, __typ__(new_scope)>::push_stream_done(context, new_scope, count);
+            delete new_scope.get();
+        }
+
+        template <typename context_t>
+        static inline
+        void
+        push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            auto new_scope = make_new_scope(
+                scope,
+                std::tuple_cat(
+                    __typ__(op.stream_op_tuple)(op.stream_op_tuple),
+                    std::make_tuple(::pump::sender::_concurrent::concurrent_counter_wrapper<pos, variant_value_type>(op.counter)),
+                    std::tie(op),
+                    std::tie(std::get<__typ__(op)::pos + 1>(find_stream_starter(scope)->get_op_tuple()))
+                )
+            );
+            op_pusher<0, __typ__(new_scope)>::push_exception(context, new_scope, e);
+            if (op.unlimited()) {
+                op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
+                return;
+            }
+
+            if (auto [old_res, new_res] = op.add_now_pending_and_check(); new_res) {
+                op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
+            }
+        }
+
+        template <typename context_t>
+        static inline
+        void
+        poll_next(context_t& context, scope_t& scope) {
+            auto& op = std::get<pos>(scope->get_op_tuple());
+            if (op.unlimited())
+                return;
+            if (auto [old_res, new_res] = op.sub_now_pending_and_check(); !old_res && new_res) {
+                op_pusher<0, __typ__(find_stream_starter(scope)) >::poll_next(context, find_stream_starter(scope));
+            }
+        }
+
+        template <typename context_t>
+        static inline
+        void
+        counter_push_done(context_t& context, scope_t& scope) {
+            op_pusher<pos + 1, scope_t>::push_done(context, scope);
+        }
+
+        template<typename context_t, typename ...value_t>
+        static inline
+        void
+        counter_push_value(context_t& context, scope_t& scope, value_t&& ...v) {
+            op_pusher<pos + 1, scope_t>::push_value(context, scope, __fwd__(v)...);
+        }
+
+        template<typename context_t>
+        static inline
+        void
+        counter_push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
+            op_pusher<pos + 1, scope_t>::push_exception(context, scope, __fwd__(e));
+        }
+
+        template<typename context_t>
+        static inline
+        void
+        counter_push_skip(context_t& context, scope_t& scope) {
+            op_pusher<pos + 1, scope_t>::push_skip(context, scope);
+        }
+    };
+
+    template <typename context_t, typename sender_t>
+    struct
+    compute_sender_type<context_t, pump::sender::_concurrent::sender<sender_t>> {
+        using sender_value_class = compute_sender_type<context_t, sender_t>;
+
+        consteval static uint32_t
+        count_value() {
+            return sender_value_class::count_value();
+        }
+
+        consteval static auto
+        get_value_type_identity() {
+            return sender_value_class::get_value_type_identity();
+        }
+    };
+}
+
+
+#endif //PUMP_SENDER_CONCURRENT_HH
