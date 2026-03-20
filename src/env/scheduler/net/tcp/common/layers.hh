@@ -65,7 +65,13 @@ namespace pump::scheduler::tcp::common {
                 net_frame(static_cast<char*>(req->data), req->len),
                 std::move(req->cb)
             };
-            owner.invoke(prepare_send, send);
+            if (req->send_cnt > 0) {
+                for (uint8_t i = 0; i < req->send_cnt; i++)
+                    send->_send_vec[i] = req->send_vec[i];
+                send->_send_cnt = req->send_cnt;
+            } else {
+                owner.invoke(prepare_send, send);
+            }
             scheduler->schedule_send(send);
             delete req;
         }

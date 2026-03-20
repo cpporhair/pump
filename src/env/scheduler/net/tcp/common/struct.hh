@@ -176,7 +176,7 @@ namespace pump::scheduler::tcp::common {
         net_frame frame;
         std::move_only_function<void(bool)> cb;
 
-        iovec _send_vec[2] = {};
+        iovec _send_vec[4] = {};
         size_t _send_cnt = 0;
         char _hdr[8] = {};  // stable storage for prepare_send (e.g., length prefix)
     };

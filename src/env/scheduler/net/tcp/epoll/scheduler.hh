@@ -172,10 +172,10 @@ namespace pump::scheduler::tcp::epoll {
             });
         }
 
-        // EPOLLET requires reading until EAGAIN
-        auto
-        handle_read_event(epoll_event* e) {
-            auto* s = static_cast<session_t*>(e->data.ptr);
+        // EPOLLET requires reading until EAGAIN.
+        // Returns false if session was closed/error.
+        bool
+        try_read_session(session_t* s) {
             while (true) {
                 auto [iov, iovcnt] = s->invoke(common::get_read_iov);
                 auto fd = s->invoke(common::get_fd);
@@ -184,23 +184,27 @@ namespace pump::scheduler::tcp::epoll {
                     s->invoke(common::on_recv, static_cast<int>(res));
                     if (s->invoke(common::get_status) != common::session_status::normal) [[unlikely]] {
                         s->invoke(::pump::scheduler::net::do_close);
-                        e->data.ptr = nullptr;
-                        return;
+                        return false;
                     }
                     continue;
                 }
                 if (res == 0) {
                     handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
-                    e->data.ptr = nullptr;
-                    return;
+                    return false;
                 }
                 // res < 0
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    return;
+                    return true;
                 handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
-                e->data.ptr = nullptr;
-                return;
+                return false;
             }
+        }
+
+        auto
+        handle_read_event(epoll_event* e) {
+            auto* s = static_cast<session_t*>(e->data.ptr);
+            if (!try_read_session(s))
+                e->data.ptr = nullptr;
         }
 
         // Send: try writev immediately; if EAGAIN, keep in send_list for retry

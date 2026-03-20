@@ -20,6 +20,12 @@ namespace pump::scheduler::net {
         void* data;
         uint32_t len;
         std::move_only_function<void(bool)> cb;
+
+        // Optional pre-built scatter-gather. When send_cnt > 0,
+        // tcp_bind uses these directly and skips prepare_send.
+        // data/len still goes into net_frame for ownership (freed on completion).
+        iovec send_vec[4] = {};
+        uint8_t send_cnt = 0;
     };
 
     struct
