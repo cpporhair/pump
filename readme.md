@@ -1,6 +1,6 @@
 # Pump
 
-用 `>>` 把异步操作串成线性管道的 C++26 框架。编译期展平为 `std::tuple`，运行期零分配。
+用 `>>` 把异步操作串成线性管道的 C++26 框架。编译期展平为 `std::tuple`，运行期零分配，全链路无锁。
 
 ```cpp
 just(10)
@@ -60,7 +60,12 @@ auto apply() {
 - **结构化异常安全** — `ignore_all_exception()` + cache 构成类 RAII 保证，异常路径编译期可见
 - **Scheduler = 单线程状态容器** — Leader/Follower 合并写在 `handle()` 中，就是普通顺序代码
 
-完整的 KV 存储引擎和基于 DiskANN 的 NVMe 向量搜索引擎见 [nitro](https://github.com/cpporhair/nitro)。
+## 基于 Pump 构建的应用
+
+[Nitro](https://github.com/cpporhair/nitro) 是基于 Pump 构建的高性能存储引擎集合：
+
+- **KV** — 快照隔离 KV 存储引擎。五类 Scheduler 协作，MVCC 多版本并发，Leader/Follower 批量合并写入。上面的 `apply()` 即出自此项目。
+- **AiSAQ** — NVMe 向量搜索引擎。DiskANN/Vamana 图索引 + 内联 PQ 编码，SPDK 直读 NVMe 搜索十亿级向量，对比基线 DiskANN 11.6×–13.1× 加速。
 
 ## 核心思路
 
