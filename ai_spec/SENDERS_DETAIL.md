@@ -104,6 +104,8 @@ just() >> when_any(
 - **输入**: 流式元素
 - **输出**: 累积结果
 - `reduce()` 无参数时等待所有流元素完成（等价于 `all()`）
+- **异常语义**: reduce 不因流元素异常终止流。流元素的异常不会阻止后续元素的产生和处理。流的终止由生产者控制（`for_each` 的 range/协程结束）
+- **流内异常正确处理模式**: 在 reduce 前用 `any_exception` 捕获异常 → 标记状态 → `just_exception(e)` 重新抛出。流生产者（协程）在下次迭代检查状态 → 返回 false → 流结束。参考 `rpc::server::serv_proc`
 
 ### to_container\<C\>() / to_vector\<T\>()
 - 将流式元素收集进容器
