@@ -20,6 +20,7 @@
 #include "../senders/stop.hh"
 #include "./epoll.hh"
 #include "env/scheduler/net/common/session_tags.hh"
+#include "env/scheduler/net/common/session_lifecycle.hh"
 #include "env/scheduler/net/common/send_sender.hh"
 
 namespace pump::scheduler::tcp::epoll {
@@ -167,6 +168,7 @@ namespace pump::scheduler::tcp::epoll {
                     return;
                 }
                 handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
+                s->broadcast(::pump::scheduler::net::read_end);
                 req->cb(true);
                 delete req;
             });
@@ -183,7 +185,7 @@ namespace pump::scheduler::tcp::epoll {
                 if (res > 0) {
                     s->invoke(common::on_recv, static_cast<int>(res));
                     if (s->invoke(common::get_status) != common::session_status::normal) [[unlikely]] {
-                        s->invoke(::pump::scheduler::net::do_close);
+                        handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
                         return false;
                     }
                     continue;
@@ -203,8 +205,10 @@ namespace pump::scheduler::tcp::epoll {
         auto
         handle_read_event(epoll_event* e) {
             auto* s = static_cast<session_t*>(e->data.ptr);
-            if (!try_read_session(s))
+            if (!try_read_session(s)) {
                 e->data.ptr = nullptr;
+                s->broadcast(::pump::scheduler::net::read_end);
+            }
         }
 
         // Send: try writev immediately; if EAGAIN, keep in send_list for retry
@@ -245,6 +249,8 @@ namespace pump::scheduler::tcp::epoll {
                 if (poller.events[i].events & (EPOLLERR | EPOLLHUP)) {
                     auto* s = static_cast<session_t*>(poller.events[i].data.ptr);
                     handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
+                    poller.events[i].data.ptr = nullptr;
+                    s->broadcast(::pump::scheduler::net::read_end);
                 }
                 else {
                     if (poller.events[i].events & EPOLLIN)

@@ -21,6 +21,7 @@
 #include "../senders/join.hh"
 #include "../senders/stop.hh"
 #include "env/scheduler/net/common/session_tags.hh"
+#include "env/scheduler/net/common/session_lifecycle.hh"
 #include "env/scheduler/net/common/send_sender.hh"
 
 namespace pump::scheduler::tcp::io_uring {
@@ -354,6 +355,7 @@ namespace pump::scheduler::tcp::io_uring {
                 case uring_event_type::read: {
                     auto s = static_cast<session_t*>(uring_req->user_data);
                     handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
+                    s->broadcast(::pump::scheduler::net::read_end);
                     delete uring_req;
                     break;
                 }
@@ -377,6 +379,7 @@ namespace pump::scheduler::tcp::io_uring {
                     auto s = static_cast<session_t*>(uring_req->user_data);
                     if (cqe->res == 0) [[unlikely]] {
                         handle_session_error(s, std::make_exception_ptr(common::session_closed_error()));
+                        s->broadcast(::pump::scheduler::net::read_end);
                         delete uring_req;
                         break;
                     }
@@ -385,6 +388,7 @@ namespace pump::scheduler::tcp::io_uring {
                         submit_read(uring_req, s);
                     }
                     else {
+                        s->broadcast(::pump::scheduler::net::read_end);
                         delete uring_req;
                     }
                     break;
