@@ -240,10 +240,10 @@ namespace pump::sender {
                     if constexpr (std::is_same_v<x, std::monostate> || std::is_same_v<x, std::exception_ptr>)
                         b = false;
                     else
-                        b = f(__fwd__(v)...);
+                        b &= static_cast<bool>(f(__fwd__(v)...));
                 }
                 else {
-                    b = f(__fwd__(v)...);
+                    b &= static_cast<bool>(f(__fwd__(v)...));
                 }
                 /*
                 if constexpr (sizeof...(v) > 0) {
@@ -263,7 +263,32 @@ namespace pump::sender {
     inline
     auto
     all() {
-        return all([](bool b) { return b; });
+        return reduce(
+            bool(true),
+            [](bool& b, auto&& ...v){
+                if constexpr (sizeof...(v) == 1) {
+                    using x = std::tuple_element_t<
+                        0,
+                        std::tuple<std::remove_cvref_t<__typ__(v)>...>
+                    >;
+                    if constexpr (std::is_same_v<x, std::monostate> || std::is_same_v<x, std::exception_ptr>) {
+                        b = false;
+                    }
+                    else if constexpr (std::is_same_v<x, bool>) {
+                        b &= static_cast<bool>(std::get<0>(std::forward_as_tuple(__fwd__(v)...)));
+                    }
+                }
+                else {
+                    if constexpr (((std::is_same_v<std::remove_cvref_t<__typ__(v)>, std::monostate> ||
+                                    std::is_same_v<std::remove_cvref_t<__typ__(v)>, std::exception_ptr>) || ...)) {
+                        b = false;
+                    }
+                    else if constexpr (((std::is_same_v<std::remove_cvref_t<__typ__(v)>, bool>) && ...)) {
+                        b &= (... && static_cast<bool>(v));
+                    }
+                }
+            }
+        );
     }
 
     static

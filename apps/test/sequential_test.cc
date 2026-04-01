@@ -198,7 +198,39 @@ void test_exception_path() {
 }
 
 // ============================================================================
-// Test 4: Sequential ordering with concurrent (synchronous path)
+// Test 4: all() accumulates failures across the full stream
+// Pattern: false followed by true must still reduce to false
+// ============================================================================
+void test_all_accumulates_false() {
+    TEST("all() accumulates false across stream");
+
+    auto context = make_root_context();
+    bool completed = false;
+    bool all_result = true;
+
+    just()
+        >> for_each(std::views::iota(uint64_t(0), uint64_t(2)))
+        >> then([](uint64_t id) {
+            return id == 1;
+        })
+        >> all([](bool ok) {
+            return ok;
+        })
+        >> then([&](bool succeed) {
+            completed = true;
+            all_result = succeed;
+        })
+        >> submit(context);
+
+    if (completed && !all_result) {
+        PASS();
+    } else {
+        FAIL("all() incorrectly overwrote an earlier false result");
+    }
+}
+
+// ============================================================================
+// Test 5: Sequential ordering with concurrent (synchronous path)
 // Pattern: for_each >> concurrent >> then >> sequential >> then >> all
 // This exercises the source_cache with the new state machine
 // ============================================================================
@@ -1129,6 +1161,7 @@ int main() {
     test_transparent_sequential();
     test_empty_stream();
     test_exception_path();
+    test_all_accumulates_false();
 
     // Concurrent + Sequential tests (exercises source_cache, single-thread)
     std::cout << "\n--- Concurrent + Sequential Tests ---" << std::endl;
