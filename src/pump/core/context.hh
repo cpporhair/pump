@@ -28,6 +28,11 @@ namespace pump::core {
         T* operator->() const { return ptr_; }
         T& operator*() const { return *ptr_; }
         T* get() const { return ptr_; }
+        T* release() {
+            auto* raw = ptr_;
+            ptr_ = nullptr;
+            return raw;
+        }
     };
 
     template <typename ...content_t>

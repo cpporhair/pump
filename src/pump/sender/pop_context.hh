@@ -112,7 +112,7 @@ namespace pump::core {
             static_assert(context_t::element_type::template has_id<context_compile_id>());
             static_assert(context_t::element_type::pop_able,"context is root");
             auto base = context->base_context;
-            delete context.get();
+            auto keep_alive = std::unique_ptr<typename context_t::element_type>(context.release());
             op_pusher<pos + 1, __typ__(scope)>::push_value(base, scope, __fwd__(v)...);
 
         }
@@ -127,7 +127,7 @@ namespace pump::core {
             else {
                 static_assert(context_t::element_type::pop_able,"context is root");
                 auto base = context->base_context;
-                delete context.get();
+                auto keep_alive = std::unique_ptr<typename context_t::element_type>(context.release());
                 op_pusher<pos + 1, __typ__(scope)>::push_exception(base, scope, e);
             }
 
@@ -142,7 +142,7 @@ namespace pump::core {
             }
             else {
                 auto base = context->base_context;
-                delete context.get();
+                auto keep_alive = std::unique_ptr<typename context_t::element_type>(context.release());
                 op_pusher<pos + 1, scope_t>::push_skip(base, scope);
             }
         }
@@ -157,7 +157,7 @@ namespace pump::core {
             else {
                 static_assert(context_t::element_type::pop_able,"context is root");
                 auto base = context->base_context;
-                delete context.get();
+                auto keep_alive = std::unique_ptr<typename context_t::element_type>(context.release());
                 op_pusher<pos + 1, scope_t>::push_done(base, scope);
             }
         }

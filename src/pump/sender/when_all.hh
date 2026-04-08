@@ -1,6 +1,7 @@
 #ifndef PUMP_SENDER_WHEN_ALL_HH
 #define PUMP_SENDER_WHEN_ALL_HH
 
+#include <memory>
 #include <variant>
 
 #include "../core/context.hh"
@@ -349,7 +350,7 @@ namespace pump::core {
         void
         push_value(context_t& context, scope_t& scope, value_t&& ...v) {
             auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
-            delete scope.get();
+            auto keep_alive = std::unique_ptr<typename scope_t::element_type>(scope.release());
             wrapper->template set_value<get_current_op_type_t<pos, scope_t>::pos>(__fwd__(v)...);
         }
 
@@ -358,7 +359,7 @@ namespace pump::core {
         void
         push_exception(context_t& context, scope_t& scope, std::exception_ptr e) {
             auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
-            delete scope.get();
+            auto keep_alive = std::unique_ptr<typename scope_t::element_type>(scope.release());
             wrapper->template set_error<get_current_op_type_t<pos, scope_t>::pos>(e);
         }
 
@@ -367,7 +368,7 @@ namespace pump::core {
         void
         push_skip(context_t& context, scope_t& scope) {
             auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
-            delete scope.get();
+            auto keep_alive = std::unique_ptr<typename scope_t::element_type>(scope.release());
             wrapper->template set_skip<get_current_op_type_t<pos, scope_t>::pos>();
         }
 
@@ -376,7 +377,7 @@ namespace pump::core {
         void
         push_done(context_t& context, scope_t& scope) {
             auto* wrapper = std::get<pos>(scope->get_op_tuple()).wrapper;
-            delete scope.get();
+            auto keep_alive = std::unique_ptr<typename scope_t::element_type>(scope.release());
             wrapper->template set_done<get_current_op_type_t<pos, scope_t>::pos>();
         }
     };

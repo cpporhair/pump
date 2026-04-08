@@ -92,6 +92,11 @@ namespace pump::core {
         T* operator->() const { return ptr_; }
         T& operator*() const { return *ptr_; }
         T* get() const { return ptr_; }
+        T* release() {
+            auto* raw = ptr_;
+            ptr_ = nullptr;
+            return raw;
+        }
 
         static constexpr uint32_t get_scope_level_id() {
             return T::get_scope_level_id();
