@@ -179,6 +179,18 @@ namespace pump::core {
         template <typename context_t, typename ...values_t>
         static inline
         auto
+        do_push_value(context_t& context, scope_t& scope, std::variant<values_t...>& v) {
+            std::visit(
+                [&context, &scope](auto &v) {
+                    op_pusher<pos + 1, scope_t>::push_value(context, scope, __fwd__(v));
+                },
+                __fwd__(v)
+            );
+        }
+
+        template <typename context_t, typename ...values_t>
+        static inline
+        auto
         do_push_value(context_t& context, scope_t& scope, values_t&& ...v) {
             static_assert(false);
         }
