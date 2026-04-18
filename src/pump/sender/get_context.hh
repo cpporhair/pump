@@ -140,8 +140,7 @@ namespace pump::core {
 
             if constexpr (count_prev_value() == 0)
                 return std::type_identity<t0>{};
-
-            if constexpr (core::is_tuple<t0>::value)
+            else if constexpr (core::is_tuple<t0>::value)
                 return std::type_identity<
                     decltype(
                         std::tuple_cat<
