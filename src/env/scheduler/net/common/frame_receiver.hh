@@ -2,7 +2,7 @@
 #ifndef ENV_COMMON_FRAME_RECEIVER_HH
 #define ENV_COMMON_FRAME_RECEIVER_HH
 
-#include <bits/move_only_function.h>
+#include <functional>
 
 #include "pump/core/lock_free_queue.hh"
 #include "env/scheduler/net/common/frame.hh"

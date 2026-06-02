@@ -2,7 +2,7 @@
 #ifndef PUMP_ENV_SCHEDULER_RPC_COMMON_RPC_STATE_HH
 #define PUMP_ENV_SCHEDULER_RPC_COMMON_RPC_STATE_HH
 
-#include <bits/move_only_function.h>
+#include <functional>
 #include "env/scheduler/net/common/frame.hh"
 
 

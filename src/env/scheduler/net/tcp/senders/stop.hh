@@ -3,7 +3,7 @@
 #define ENV_SCHEDULER_TCP_SENDER_STOP_HH
 
 #include <cstdint>
-#include <bits/move_only_function.h>
+#include <functional>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/compute_sender_type.hh"

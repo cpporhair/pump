@@ -5,7 +5,7 @@
 #ifndef ENV_SCHEDULER_NVME_PUT_PAGE_HH
 #define ENV_SCHEDULER_NVME_PUT_PAGE_HH
 
-#include <bits/move_only_function.h>
+#include <functional>
 
 #include "pump/core/op_pusher.hh"
 #include "pump/core/op_tuple_builder.hh"

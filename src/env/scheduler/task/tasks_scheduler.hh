@@ -2,7 +2,6 @@
 #define ENV_SCHEDULER_TASKS_SCHEDULER_HH
 
 #include <cstdint>
-#include <bits/move_only_function.h>
 #include <functional>
 #include <set>
 #include <vector>

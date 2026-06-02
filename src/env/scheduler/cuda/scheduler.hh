@@ -2,7 +2,7 @@
 #define ENV_SCHEDULER_CUDA_SCHEDULER_HH
 
 #include <cstdint>
-#include <bits/move_only_function.h>
+#include <functional>
 #include <vector>
 #include <stdexcept>
 
