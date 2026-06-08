@@ -14,6 +14,8 @@
 
 #include "./get_page.hh"
 #include "./put_page.hh"
+#include "./flush.hh"
+#include "./trim.hh"
 #include "./ssd.hh"
 #include "pump/core/ring_queue.hh"
 #include "pump/core/lock_free_queue.hh"
@@ -225,6 +227,89 @@ namespace pump::scheduler::nvme::_scheduler {
 
     template <page_concept page_t>
     struct
+    spdk_flush_callback_arg {
+        flush::req* raw_req;
+        qpair<page_t>* qp;
+    };
+
+    template <page_concept page_t>
+    inline auto
+    on_flush_done(void *cb_arg, const spdk_nvme_cpl *cpl) {
+        auto *arg = static_cast<spdk_flush_callback_arg<page_t> *>(cb_arg);
+        auto *req = arg->raw_req;
+        auto *qpr = arg->qp;
+
+        delete arg;
+
+        qpr->used--;
+
+        req->cb(flush::res{static_cast<uint08_t>((!cpl || spdk_nvme_cpl_is_error(cpl)) ? 1 : 0)});
+        delete req;
+    }
+
+    template <page_concept page_t>
+    inline auto
+    spdk_flush(flush::req* req, qpair<page_t>* qp) {
+        qp->used++;
+        auto* cb_arg = new spdk_flush_callback_arg<page_t>{req, qp};
+        const auto res = spdk_nvme_ns_cmd_flush(
+            qp->owner->ns,
+            qp->impl,
+            on_flush_done<page_t>,
+            cb_arg
+        );
+
+        if (res < 0) [[unlikely]] {
+            SPDK_ERRLOG("error,%d", res);
+            on_flush_done<page_t>(cb_arg, nullptr);
+        }
+    }
+
+    template <page_concept page_t>
+    struct
+    spdk_trim_callback_arg {
+        trim::req* raw_req;
+        qpair<page_t>* qp;
+    };
+
+    template <page_concept page_t>
+    inline auto
+    on_trim_done(void *cb_arg, const spdk_nvme_cpl *cpl) {
+        auto *arg = static_cast<spdk_trim_callback_arg<page_t> *>(cb_arg);
+        auto *req = arg->raw_req;
+        auto *qpr = arg->qp;
+
+        delete arg;
+
+        qpr->used--;
+
+        req->cb(trim::res{static_cast<uint08_t>((!cpl || spdk_nvme_cpl_is_error(cpl)) ? 1 : 0)});
+        delete req;
+    }
+
+    template <page_concept page_t>
+    inline auto
+    spdk_trim(trim::req* req, qpair<page_t>* qp) {
+        qp->used++;
+        auto* cb_arg = new spdk_trim_callback_arg<page_t>{req, qp};
+        const auto res = spdk_nvme_ns_cmd_dataset_management(
+            qp->owner->ns,
+            qp->impl,
+            SPDK_NVME_DSM_ATTR_DEALLOCATE,
+            &req->range,
+            1,
+            on_trim_done<page_t>,
+            cb_arg
+        );
+
+        if (res < 0) [[unlikely]] {
+            SPDK_ERRLOG("error,%d", res);
+            on_trim_done<page_t>(cb_arg, nullptr);
+        }
+    }
+
+    template <page_concept page_t>
+    struct
     ssd_handler {
         ssd<page_t> *dev;
         qpair<page_t> *get_qp;
@@ -239,12 +324,18 @@ namespace pump::scheduler::nvme {
     scheduler {
         friend struct get::op<scheduler<page_t>, page_t>;
         friend struct put::op<scheduler<page_t>, page_t>;
+        friend struct flush::op<scheduler<page_t>>;
+        friend struct trim::op<scheduler<page_t>>;
     private:
         qpair<page_t>* qp;
         core::per_core::queue<put::req<page_t>*> put_data_page_req_queue;
         core::per_core::queue<get::req<page_t>*> get_data_page_req_queue;
+        core::per_core::queue<flush::req*> flush_req_queue;
+        core::per_core::queue<trim::req*> trim_req_queue;
         core::ring_queue<put::req<page_t>*> local_put_q;
         core::ring_queue<get::req<page_t>*> local_get_q;
+        core::ring_queue<flush::req*> local_flush_q;
+        core::ring_queue<trim::req*> local_trim_q;
 
     public:
         // Page merge: zero-allocation in-flight read dedup
@@ -259,6 +350,16 @@ namespace pump::scheduler::nvme {
         auto
         schedule(get::req<page_t>* r) {
             return get_data_page_req_queue.try_enqueue(r);
+        }
+
+        auto
+        schedule(flush::req* r) {
+            return flush_req_queue.try_enqueue(r);
+        }
+
+        auto
+        schedule(trim::req* r) {
+            return trim_req_queue.try_enqueue(r);
         }
 
         void
@@ -278,6 +379,32 @@ namespace pump::scheduler::nvme {
                     put::req<page_t>* r;
                     local_put_q.dequeue(r);
                     _scheduler::spdk_put(r, qp);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        void
+        handle_flush_queue() {
+            while (!local_flush_q.empty()) [[unlikely]] {
+                if (!qp->busy()) {
+                    flush::req* r;
+                    local_flush_q.dequeue(r);
+                    _scheduler::spdk_flush(r, qp);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        void
+        handle_trim_queue() {
+            while (!local_trim_q.empty()) [[unlikely]] {
+                if (!qp->busy()) {
+                    trim::req* r;
+                    local_trim_q.dequeue(r);
+                    _scheduler::spdk_trim(r, qp);
                 } else {
                     break;
                 }
@@ -331,18 +458,32 @@ namespace pump::scheduler::nvme {
             : qp(qpair)
             , put_data_page_req_queue(queue_depth)
             , get_data_page_req_queue(queue_depth)
+            , flush_req_queue(queue_depth)
+            , trim_req_queue(queue_depth)
             , local_put_q(local_depth)
-            , local_get_q(local_depth) {
+            , local_get_q(local_depth)
+            , local_flush_q(local_depth)
+            , local_trim_q(local_depth) {
         }
 
         auto
-        put(page_t* p) {
-            return put::sender<scheduler<page_t>, page_t>(this, p);
+        put(page_t* p, uint32_t flags = 0) {
+            return put::sender<scheduler<page_t>, page_t>(this, p, flags);
         }
 
         auto
-        get(page_t* p) {
-            return get::sender<scheduler<page_t>, page_t>(this, p);
+        get(page_t* p, uint32_t flags = 0) {
+            return get::sender<scheduler<page_t>, page_t>(this, p, flags);
+        }
+
+        auto
+        flush() {
+            return flush::sender<scheduler<page_t>>(this);
+        }
+
+        auto
+        trim_ns_lba(uint64_t ns_lba, uint32_t ns_lba_count) {
+            return trim::sender<scheduler<page_t>>(this, ns_lba, ns_lba_count);
         }
 
         bool
@@ -359,8 +500,22 @@ namespace pump::scheduler::nvme {
                 local_get_q.enqueue(std::move(*item));
             }
 
+            while (local_flush_q.size() < local_flush_q.capacity()) {
+                auto item = flush_req_queue.try_dequeue();
+                if (!item) break;
+                local_flush_q.enqueue(std::move(*item));
+            }
+
+            while (local_trim_q.size() < local_trim_q.capacity()) {
+                auto item = trim_req_queue.try_dequeue();
+                if (!item) break;
+                local_trim_q.enqueue(std::move(*item));
+            }
+
             handle_put_queue();
             handle_get_queue();
+            handle_flush_queue();
+            handle_trim_queue();
 
             if (qp->empty())
                 return false;

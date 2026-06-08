@@ -47,15 +47,18 @@ namespace pump::scheduler::nvme::put {
         constexpr static bool nvme_put_data_op = true;
         scheduler_t *scheduler;
         page_t *page;
+        uint32_t flags;
 
-        op(scheduler_t *s, page_t *p)
+        op(scheduler_t *s, page_t *p, uint32_t f)
             : scheduler(s)
-              , page(p) {
+              , page(p)
+              , flags(f) {
         }
 
         op(op &&rhs) noexcept
             : scheduler(rhs.scheduler)
-              , page(rhs.page) {
+              , page(rhs.page)
+              , flags(rhs.flags) {
         }
 
         template<uint32_t pos, typename context_t, typename scope_t>
@@ -63,7 +66,7 @@ namespace pump::scheduler::nvme::put {
         start(context_t &context, scope_t &scope) {
             return scheduler->schedule(
                 new req<page_t>{
-                    0,
+                    flags,
                     page,
                     [context = context, scope = scope](res<page_t>&& r) mutable {
                         core::op_pusher<pos + 1, scope_t>::push_value(
@@ -83,20 +86,23 @@ namespace pump::scheduler::nvme::put {
     sender {
         scheduler_t* scheduler;
         page_t* page;
+        uint32_t flags;
 
-        sender(scheduler_t* s, page_t* p)
+        sender(scheduler_t* s, page_t* p, uint32_t f = 0)
             : scheduler(s)
-            , page(p){
+            , page(p)
+            , flags(f){
         }
 
         sender(sender&& rhs) noexcept
             : scheduler(rhs.scheduler)
-              , page(rhs.page){
+              , page(rhs.page)
+              , flags(rhs.flags){
         }
 
         auto
         make_op(){
-            return op<scheduler_t, page_t> (scheduler, page);
+            return op<scheduler_t, page_t> (scheduler, page, flags);
         }
 
         template<typename context_t>
